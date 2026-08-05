@@ -52,6 +52,19 @@ func (d *DB) checkSchema(ctx context.Context) error {
 		return fmt.Errorf("database schema out of date: run migrations 0001-0004 " +
 			"(internal/storage/migrations/) against this database before starting")
 	}
+	// 0004 的唯一索引必须存在（只查列无法证明 0004 已应用）
+	var idx bool
+	err = d.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_indexes WHERE indexname = 'uq_opportunities_group_selected'
+		)`).Scan(&idx)
+	if err != nil {
+		return fmt.Errorf("schema check: %w", err)
+	}
+	if !idx {
+		return fmt.Errorf("database schema out of date: migration 0004 " +
+			"(uq_opportunities_group_selected) not applied")
+	}
 	return nil
 }
 

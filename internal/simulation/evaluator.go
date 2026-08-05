@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/common"
+
 	"github.com/auren23/rh-searcher/internal/arbitrage"
 )
 
@@ -22,6 +24,11 @@ type SimulationEvaluator struct {
 
 func NewSimulationEvaluator(sim *ExecutorSimulator, chainID uint64, safetyMarginWei *big.Int) *SimulationEvaluator {
 	return &SimulationEvaluator{sim: sim, chainID: chainID, safetyMarginWei: safetyMarginWei}
+}
+
+// VerifyBlockHash 转发到模拟器（Engine 通过接口断言调用；必须有此转发否则校验被静默跳过）。
+func (e *SimulationEvaluator) VerifyBlockHash(ctx context.Context, block uint64, want common.Hash) error {
+	return e.sim.VerifyBlockHash(ctx, block, want)
 }
 
 func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candidate, cfg arbitrage.Config) (string, string, *big.Int) {

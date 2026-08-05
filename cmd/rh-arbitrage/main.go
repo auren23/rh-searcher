@@ -84,10 +84,13 @@ func main() {
 	graph := dex.NewGraph()
 	ckpt := storage.NewCheckpoint("deployments/checkpoint.json")
 	heights, _ := ckpt.Load()
+	// PG 可用时用 PGCheckpoint（跨进程安全；JSON 文件仅本地 fallback）——在 sink 初始化后接入
+	var pgCkpt *storage.PGCheckpoint
 	fromBlock := heights["pools"]
 	if fromBlock < d.FactoryBlock {
 		fromBlock = d.FactoryBlock
 	}
+
 	// 启动时读链头再引导（已完成的从 checkpoint 续跑；未完成的补全到链头）
 	headNum, err := readCli.BlockNumber(ctx)
 	if err != nil {
@@ -110,6 +113,15 @@ func main() {
 			os.Exit(1)
 		}
 		defer sink.Close()
+		// PG 可用时切换为 PGCheckpoint（跨进程安全；JSON 仅本地 fallback）
+		pgCkpt = storage.NewPGCheckpoint(sink)
+		if pgHeights, err := pgCkpt.Load(ctx); err == nil && len(pgHeights) > 0 {
+			heights = pgHeights
+			fromBlock = heights["pools"]
+			if fromBlock < d.FactoryBlock {
+				fromBlock = d.FactoryBlock
+			}
+		}
 		// 从数据库恢复全部池（重建 Registry/Graph），再补扫增量
 		if _, err := storage.RestorePools(ctx, sink, reg, graph); err != nil {
 			slog.Error("restore pools", "err", err)
@@ -233,9 +245,28 @@ func main() {
 		common.HexToHash("0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde"), // Mint
 		common.HexToHash("0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c"), // Burn
 	}}
+	saveCheckpoint := func(strategy string, number uint64) error {
+		if pgCkpt != nil {
+			return pgCkpt.Save(ctx, strategy, number)
+		}
+		return ckpt.Save(strategy, number)
+	}
+	// 游标：高度 + 区块 hash（reorg 检测：新 head 必须 parent 衔接）
 	var lastApplied uint64
+	var lastAppliedHash common.Hash
 	if h, ok := heights["blocks"]; ok {
 		lastApplied = h
+		if hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(h)); err == nil {
+			lastAppliedHash = hdr.Hash()
+		}
+	} else {
+		// 首次实时 Shadow：从当前链头开始，只处理启动后的新块。
+		// 历史回放（--from-block/--to-block）是独立模式，不与实时 Shadow 混用。
+		lastApplied = startHead
+		if hdr, err := readCli.HeaderByNumber(ctx, nil); err == nil {
+			lastAppliedHash = hdr.Hash()
+		}
+		_ = saveCheckpoint("blocks", startHead)
 	}
 
 	processBlock := func(h chain.BlockEvent) error {
@@ -309,7 +340,17 @@ func main() {
 				ReceivedAt:  time.Now().UnixMilli(),
 			}, pools)
 		}
-		_ = ckpt.Save("blocks", h.Number)
+		return nil
+	}
+
+	processAndCommit := func(h chain.BlockEvent) error {
+		if err := processBlock(h); err != nil {
+			return err
+		}
+		if err := saveCheckpoint("blocks", h.Number); err != nil {
+			return err
+		}
+		lastApplied = h.Number
 		return nil
 	}
 
@@ -320,18 +361,16 @@ func main() {
 		}
 	}()
 
-	// 启动窗口补扫：lastApplied+1 → 当前链头（订阅建立前发生的 Swap 不漏）
-	if startHead > lastApplied {
-		for bn := lastApplied + 1; bn <= startHead; bn++ {
-			hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
-			if err != nil {
-				slog.Warn("startup backfill header", "block", bn, "err", err)
-				break
-			}
-			if err := processBlock(chain.BlockEvent{Number: bn, Hash: hdr.Hash()}); err != nil {
-				slog.Warn("startup backfill", "block", bn, "err", err)
-				break
-			}
+	// 启动窗口补扫：从 lastApplied+1 顺序处理，任一区块失败即停止推进（不跳块）
+	for bn := lastApplied + 1; bn <= startHead; bn++ {
+		hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
+		if err != nil {
+			slog.Error("startup backfill header, stopping cursor", "block", bn, "err", err)
+			break
+		}
+		if err := processAndCommit(chain.BlockEvent{Number: bn, Hash: hdr.Hash()}); err != nil {
+			slog.Error("startup backfill failed, cursor stays at", "block", lastApplied, "err", err)
+			break
 		}
 	}
 
@@ -347,27 +386,30 @@ func main() {
 			if h.Number <= lastApplied {
 				continue // 已处理（含轮询源补块重复）
 			}
-			// 缺口补块（轮询源可能跳块）
+			// reorg 检测：新 head 必须与游标 parent 衔接；断裂则从 lastApplied+1 起重新处理
+			if lastAppliedHash != (common.Hash{}) && h.Number == lastApplied+1 && h.Parent != lastAppliedHash {
+				slog.Warn("reorg detected, reprocessing from", "block", lastApplied+1,
+					"parent", h.Parent.Hex(), "expected", lastAppliedHash.Hex())
+			}
+			// 顺序处理 lastApplied+1 → h.Number；任一失败即停止推进（失败区块不被跳过）
 			for bn := lastApplied + 1; bn <= h.Number; bn++ {
+				var ev chain.BlockEvent
 				if bn == h.Number {
-					if err := processBlock(h); err != nil {
-						slog.Warn("process block", "block", bn, "err", err)
-						continue
-					}
+					ev = h
 				} else {
 					hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
 					if err != nil {
-						slog.Warn("gap header", "block", bn, "err", err)
-						continue
+						slog.Error("gap header, cursor stays at", "block", lastApplied, "err", err)
+						break
 					}
-					if err := processBlock(chain.BlockEvent{Number: bn, Hash: hdr.Hash()}); err != nil {
-						slog.Warn("gap block", "block", bn, "err", err)
-						continue
-					}
+					ev = chain.BlockEvent{Number: bn, Hash: hdr.Hash()}
 				}
-				lastApplied = bn
+				if err := processAndCommit(ev); err != nil {
+					slog.Error("block processing failed, cursor stays at", "block", lastApplied, "err", err)
+					break
+				}
+				lastAppliedHash = ev.Hash
 			}
-			lastApplied = h.Number
 		}
 	}
 }

@@ -167,3 +167,35 @@ type rejectEvaluator struct{}
 func (r *rejectEvaluator) Evaluate(ctx context.Context, c *Candidate, cfg Config) (string, string, *big.Int) {
 	return "simulation_rejected", "revert: test", big.NewInt(0)
 }
+
+// Engine 的 read/sim hash 校验必须真实执行（接口断言 + 转发）。
+type verifyingEvaluator struct {
+	checked bool
+}
+
+func (v *verifyingEvaluator) Evaluate(ctx context.Context, c *Candidate, cfg Config) (string, string, *big.Int) {
+	return SimulationAccepted, "", big.NewInt(100)
+}
+func (v *verifyingEvaluator) VerifyBlockHash(ctx context.Context, block uint64, want common.Hash) error {
+	v.checked = true
+	return nil
+}
+
+func TestEngineHashVerificationRuns(t *testing.T) {
+	eval := &verifyingEvaluator{}
+	sink := &fakeSink{}
+	eng := NewEngine(
+		Config{ChainID: 4663, MinProfitWei: big.NewInt(1), TopK: 1},
+		sink,
+		&fakeSearcher{cands: []*Candidate{{InputAmount: big.NewInt(1), GrossProfit: big.NewInt(1), Route: []Hop{{}}, RouteJSON: "[]"}}},
+		eval,
+		&fakeExecutor{},
+	)
+	eng.OnSwap(context.Background(), SwapEvent{
+		Pool: common.Address{1}, BlockNumber: 100,
+		BlockHash: common.Hash{1}, TxHash: common.Hash{2}, LogIndex: 3,
+	})
+	if !eval.checked {
+		t.Errorf("VerifyBlockHash never invoked (interface assertion must match)")
+	}
+}

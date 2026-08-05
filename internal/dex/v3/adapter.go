@@ -125,27 +125,34 @@ func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock u
 
 // loadSlot0 读取池的 slot0（sqrtPriceX96/tick）与 liquidity。
 // block 为 nil 时读 latest；指定时全部读取固定在同一高度（区块原子性）。
+// 失败关闭：任一读取失败或响应过短都返回错误，绝不保留旧值（防止混合状态）。
 func (a *Adapter) loadSlot0(ctx context.Context, p *Pool, block *big.Int) error {
 	data := crypto.Keccak256([]byte("slot0()"))[:4]
 	res, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &p.Address, Data: data}, block)
 	if err != nil {
 		return err
 	}
-	if len(res) >= 32+32 {
-		p.SqrtPriceX96 = new(big.Int).SetBytes(res[0:32])
-		// tick 是 int24，编码在第二个 32 字节槽的末尾
-		raw := new(big.Int).SetBytes(res[61:64])
-		t := raw.Int64()
-		if t >= 1<<23 {
-			t -= 1 << 24
-		}
-		p.Tick = int(t)
+	if len(res) < 64 {
+		return fmt.Errorf("short slot0 response %d bytes", len(res))
+	}
+	sqrtPrice := new(big.Int).SetBytes(res[0:32])
+	raw := new(big.Int).SetBytes(res[61:64])
+	t := raw.Int64()
+	if t >= 1<<23 {
+		t -= 1 << 24
 	}
 	liqData := crypto.Keccak256([]byte("liquidity()"))[:4]
 	liqRes, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &p.Address, Data: liqData}, block)
-	if err == nil && len(liqRes) >= 32 {
-		p.Liquidity = new(big.Int).SetBytes(liqRes[:32])
+	if err != nil {
+		return err
 	}
+	if len(liqRes) < 32 {
+		return fmt.Errorf("short liquidity response %d bytes", len(liqRes))
+	}
+	// 全部成功后才原子更新（任一步失败不污染状态）
+	p.SqrtPriceX96 = sqrtPrice
+	p.Tick = int(t)
+	p.Liquidity = new(big.Int).SetBytes(liqRes[:32])
 	return nil
 }
 
@@ -230,7 +237,7 @@ func (a *Adapter) LoadBitmapWordAt(ctx context.Context, p *Pool, wordPos int64, 
 	}
 	sel := crypto.Keccak256([]byte("tickBitmap(int16)"))[:4]
 	data := append(sel, encoded...)
-	res, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &p.Address, Data: data}, nil)
+	res, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &p.Address, Data: data}, block)
 	if err != nil {
 		return err
 	}
@@ -250,7 +257,10 @@ func (a *Adapter) LoadBitmapWordAt(ctx context.Context, p *Pool, wordPos int64, 
 
 // RefreshPoolStateAt 执行 Shadow 模式的状态刷新：路由中所有池统一读取指定高度的状态
 // （slot0/liquidity/当前 bitmap word 全部固定在同一 block），消除混合状态。
+// 先清空 bitmap 缓存再按固定区块重载（缓存不带区块版本，旧高度的 word 不得被复用）。
 func (a *Adapter) RefreshPoolStateAt(ctx context.Context, p *Pool, block *big.Int) error {
+	p.bitmap = make(map[int64]*big.Int)
+	p.bitmapLoaded = make(map[int64]bool)
 	if err := a.loadSlot0(ctx, p, block); err != nil {
 		return err
 	}

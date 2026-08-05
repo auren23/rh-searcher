@@ -113,7 +113,13 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 			}
 		}
 	}
-	simBlock, _ := s.cli.BlockNumber(ctx)
+	// SimulationBlock = eth_call 实际使用的区块（block 非 nil 时就是它，不是调用完成时的 latest）
+	var simBlock uint64
+	if block != nil {
+		simBlock = block.Uint64()
+	} else {
+		simBlock, _ = s.cli.BlockNumber(ctx)
+	}
 	return &SimResult{Profit: profit, GasUsed: gas, GasPriceWei: gasPrice,
 		CalldataHash: hashHex(calldata), SimulationBlock: simBlock,
 		L1GasUnits: l1GasUnits, L2BaseFeeWei: l2BaseFee, L1BaseFeeEstimateWei: l1BaseFeeEstimate}, nil
