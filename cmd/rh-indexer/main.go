@@ -42,19 +42,24 @@ func main() {
 
 	readURL := cfg.RPC.Groups.Read[0]
 	var src chain.Source
-	var cli *ethclient.Client
 	ws, wsErr := chain.NewWSClient(ctx, readURL)
 	if wsErr != nil {
 		slog.Warn("WS unavailable, falling back to polling", "url", readURL, "err", wsErr)
-		cli, err = ethclient.Dial(cfg.RPC.Groups.Archive[0])
-		if err != nil {
-			slog.Error("dial http rpc", "err", err)
+		httpCli, dialErr := ethclient.Dial(cfg.RPC.Groups.Archive[0])
+		if dialErr != nil {
+			slog.Error("dial http rpc", "err", dialErr)
 			os.Exit(1)
 		}
-		src = chain.NewPollingSource(cli)
+		src = chain.NewPollingSource(httpCli)
 	} else {
-		cli = ws.Client()
 		src = ws
+	}
+
+	// Adapter 用独立 HTTP Read RPC（连接池），不复用 WS 客户端（重连后旧指针失效）
+	readCli, dialErr := ethclient.Dial(cfg.RPC.Groups.Archive[0])
+	if dialErr != nil {
+		slog.Error("dial read rpc for adapter", "err", dialErr)
+		os.Exit(1)
 	}
 
 	// 池 registry + V3 adapter
@@ -64,7 +69,7 @@ func main() {
 	if len(cfg.Dexes.V3) > 0 {
 		d := cfg.Dexes.V3[0]
 		adapter, err = v3.NewAdapter(
-			cli, d.Name,
+			readCli, d.Name,
 			common.HexToAddress(d.Factory),
 			common.HexToAddress(d.Router),
 			d.RouterKind,
@@ -111,7 +116,7 @@ func main() {
 	}
 
 	// 启动时先读链头：Bootstrap 只扫到当前链头，不查询未来区块
-	headNum, err := cli.BlockNumber(ctx)
+	headNum, err := readCli.BlockNumber(ctx)
 	if err != nil {
 		slog.Error("read chain head", "err", err)
 		os.Exit(1)

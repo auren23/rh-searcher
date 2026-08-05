@@ -23,6 +23,7 @@ func (f *fakeSearcher) Optimize(ctx context.Context, r Route, block uint64, ts i
 func (f *fakeSearcher) TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate {
 	return f.cands
 }
+func (f *fakeSearcher) RefreshRoute(ctx context.Context, r Route) (uint64, error) { return 100, nil }
 
 // 假 Evaluator：全部 simulation_accepted
 type fakeEvaluator struct{}
@@ -130,4 +131,39 @@ func (c *countingSearcher) Optimize(ctx context.Context, r Route, block uint64, 
 func (c *countingSearcher) TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate {
 	c.count++
 	return []*Candidate{{InputAmount: big.NewInt(1), Route: r.Hops, RouteJSON: "[]"}}
+}
+func (c *countingSearcher) RefreshRoute(ctx context.Context, r Route) (uint64, error) { return 100, nil }
+
+// 全部 rejected 时：不得有任何 selected=true（best 必须来自 simulation_accepted）。
+func TestEngineNoSelectedWhenAllRejected(t *testing.T) {
+	sink := &fakeSink{}
+	eng := NewEngine(
+		Config{ChainID: 4663, MinProfitWei: big.NewInt(1), TopK: 3},
+		sink,
+		&fakeSearcher{cands: []*Candidate{
+			{InputAmount: big.NewInt(1), GrossProfit: big.NewInt(1), Route: []Hop{{}}, RouteJSON: "[]"},
+			{InputAmount: big.NewInt(2), GrossProfit: big.NewInt(1), Route: []Hop{{}}, RouteJSON: "[]"},
+		}},
+		&rejectEvaluator{},
+		&fakeExecutor{},
+	)
+	eng.OnSwap(context.Background(), SwapEvent{
+		Pool: common.Address{1}, BlockNumber: 100,
+		BlockHash: common.Hash{1}, TxHash: common.Hash{2}, LogIndex: 3,
+	})
+	for _, c := range sink.saved {
+		if c.Selected {
+			t.Errorf("candidate %s selected=true but decision=%s (must never select rejected)",
+				c.ID, c.Decision)
+		}
+		if c.Decision == SimulationAccepted {
+			t.Errorf("decision=%s with rejecting evaluator", c.Decision)
+		}
+	}
+}
+
+type rejectEvaluator struct{}
+
+func (r *rejectEvaluator) Evaluate(ctx context.Context, c *Candidate, cfg Config) (string, string, *big.Int) {
+	return "simulation_rejected", "revert: test", big.NewInt(0)
 }

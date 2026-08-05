@@ -55,7 +55,10 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 	c.GasCostWei = new(big.Int).Set(gasCostWei)
 	c.CalldataHash = res.CalldataHash
 	c.SimulationBlock = res.SimulationBlock
-	// Arbitrum L1 组件仅记录分析（总费仍按 gasUsed×gasPrice 近似；避免重复扣费）
+	// Arbitrum L1 组件持久化（总费仍按 gasUsed×gasPrice 近似；避免重复扣费）
+	c.L1GasUnits = res.L1GasUnits
+	c.L2BaseFeeWei = res.L2BaseFeeWei
+	c.L1BaseFeeEstimateWei = res.L1BaseFeeEstimateWei
 	if res.L1GasUnits > 0 {
 		slog.Debug("l1 component",
 			"l1_gas_units", res.L1GasUnits,

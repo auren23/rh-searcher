@@ -87,6 +87,9 @@ CREATE TABLE IF NOT EXISTS opportunities (
     calldata_hash   TEXT,
     state_block     BIGINT,
     simulation_block BIGINT,
+    opportunity_group_id TEXT,
+    rank            INT,
+    selected        BOOLEAN NOT NULL DEFAULT FALSE,
     actual_net_profit NUMERIC,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

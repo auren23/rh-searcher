@@ -242,6 +242,26 @@ func (a *Adapter) LoadBitmapWord(ctx context.Context, p *Pool, wordPos int64) er
 	return nil
 }
 
+// RefreshPoolState 执行 Shadow 模式的状态刷新：路由中所有池统一读取当前 latest
+// （slot0/liquidity/当前 bitmap word），消除"事件状态 + latest 状态"混合。
+// 返回当前链头作为 StateBlock。
+func (a *Adapter) RefreshPoolState(ctx context.Context, p *Pool) (uint64, error) {
+	if err := a.loadSlot0(ctx, p); err != nil {
+		return 0, err
+	}
+	if p.TickSpacing <= 0 {
+		ts, err := a.readTickSpacing(ctx, p.Address)
+		if err != nil {
+			return 0, err
+		}
+		p.TickSpacing = ts
+	}
+	if err := a.LoadBitmapWord(ctx, p, p.WordPos()); err != nil {
+		return 0, err
+	}
+	return a.cli.BlockNumber(ctx)
+}
+
 // EnsureQuoteState 报价前统一确保池状态就绪：
 //   tickSpacing → 读取 tickSpacing()
 //   slot0/liquidity → 读取 slot0() 与 liquidity()

@@ -35,16 +35,21 @@ type Candidate struct {
 	SlippageCost      *big.Int
 	ExpectedNetProfit *big.Int
 	// 以下为链上验证结果（模拟后）
-	SimulationResult  string
-	Decision          string // local_candidate | simulation_accepted | simulation_rejected
-	RejectReason      string
+	SimulationResult   string
+	Decision           string // local_candidate | simulation_accepted | simulation_rejected
+	RejectReason       string
 	SimulatedProfitWei *big.Int // eth_call 返回的 WETH 净利（未扣 gas）
-	GasUsed           uint64
-	GasPriceWei       *big.Int
-	GasCostWei        *big.Int
-	CalldataHash      string
-	StateBlock        uint64 // 池状态对应区块（0 = 混合/未知）
-	SimulationBlock   uint64 // eth_call 执行时的链头（0 = 未知）
+	GasUsed            uint64
+	GasPriceWei        *big.Int
+	GasCostWei         *big.Int
+	CalldataHash       string
+	StateBlock         uint64 // 池状态对应区块（0 = 混合/未知）
+	SimulationBlock    uint64 // eth_call 执行时的链头（0 = 未知）
+
+	// Arbitrum 费用组件（仅分析，不参与净利扣减）
+	L1GasUnits         uint64
+	L2BaseFeeWei       *big.Int
+	L1BaseFeeEstimateWei *big.Int
 
 	// 同一机会（事件+路由）的 Top-K 分组：仅 Selected 候选可发送
 	OpportunityGroupID string // = 事件 ID + 路由（不含金额）
@@ -83,7 +88,7 @@ type Config struct {
 	MinProfitWei    *big.Int
 	SafetyMarginWei *big.Int
 	MaxHops         int
-	TopK            int // 本地 Top-K 输入量逐个链上模拟
+	TopK            int    // 本地 Top-K 输入量逐个链上模拟
 	Mode            string // dry | shadow | live
 }
 
@@ -101,18 +106,23 @@ type SwapEvent struct {
 	ReceivedAt  int64 // unix ms
 }
 
-// OnBlockBatch 区块级评估：应用完整区块的日志后，对每个受影响池评估一次。
-// 消除"交易中间状态"机会（同区块多条 Swap 不得产生虚假候选）。
+// OnBlockBatch 区块级评估：应用完整区块的日志后，收集所有受影响池的路由，
+// 按池序列全局去重，每条 route 只评估一次（避免两池同区块 Swap 时重复模拟）。
 func (e *Engine) OnBlockBatch(ctx context.Context, ev SwapEvent, affectedPools []common.Address) {
-	seen := make(map[common.Address]struct{}, len(affectedPools))
+	allRoutes := make([]Route, 0, len(affectedPools)*2)
+	seenRoutes := make(map[string]struct{})
 	for _, pool := range affectedPools {
-		if _, dup := seen[pool]; dup {
-			continue
+		for _, r := range e.searcher.FindRoutes(ctx, pool, e.cfg.WETH, e.cfg.MaxHops) {
+			key := routeID(r)
+			if _, dup := seenRoutes[key]; dup {
+				continue
+			}
+			seenRoutes[key] = struct{}{}
+			allRoutes = append(allRoutes, r)
 		}
-		seen[pool] = struct{}{}
-		poolEv := ev
-		poolEv.Pool = pool
-		e.OnSwap(ctx, poolEv)
+	}
+	for _, r := range allRoutes {
+		e.evaluateRoute(ctx, ev, r)
 	}
 }
 
@@ -120,66 +130,81 @@ func (e *Engine) OnBlockBatch(ctx context.Context, ev SwapEvent, affectedPools [
 func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 	routes := e.searcher.FindRoutes(ctx, ev.Pool, e.cfg.WETH, e.cfg.MaxHops)
 	for _, r := range routes {
-		// Top-K 输入量逐个链上模拟，选模拟净利最高者；先全部模拟，再统一落盘
-		cands := e.searcher.TopKOptimize(ctx, r, e.cfg.TopK, ev.BlockNumber, ev.ReceivedAt)
-		groupID := fmt.Sprintf("%d/%s", ev.BlockNumber, routeID(r))
-		var best *Candidate
-		for rank, c := range cands {
-			if c == nil || c.InputAmount == nil {
-				slog.Error("searcher returned incomplete candidate", "route", routeID(r))
-				continue // 记录并跳过，绝不 panic
-			}
-			c.BlockHash = ev.BlockHash
-			c.TxHash = ev.TxHash
-			c.LogIndex = ev.LogIndex
-			c.RouteJSON = MarshalRoute(c.Route) // 用候选自己的路由（含每跳金额）
-			c.OpportunityGroupID = groupID
-			c.Rank = rank
-			c.ID = CandidateID(e.cfg.ChainID, ev.BlockHash, ev.TxHash, ev.LogIndex, c.RouteJSON, c.InputAmount)
-			if c.RejectReason != "" {
-				// searcher 已判定（state-incomplete / route quote failed）：不再交给模拟器覆盖
-				c.Decision = "local_rejected"
-				c.ExpectedNetProfit = new(big.Int)
-				continue
-			}
-			verdict, reason, profit := e.evaluator.Evaluate(ctx, c, e.cfg)
-			c.Decision = verdict
-			c.RejectReason = reason
-			c.ExpectedNetProfit = profit
-			if best == nil || (verdict == SimulationAccepted && c.ExpectedNetProfit.Cmp(best.ExpectedNetProfit) > 0) {
-				best = c
-			}
-		}
-		// 统一落盘：best 标记 selected=true；其他通过模拟的降级为 simulation_valid
-		for _, c := range cands {
-			if c.ID == "" {
-				continue // 未进入评估流程（searcher 异常）
-			}
-			if best != nil && c.ID == best.ID {
-				c.Selected = true
-			} else if c.Decision == SimulationAccepted {
-				c.Decision = "simulation_valid"
-				c.RejectReason = "not selected (lower net profit in group)"
-			}
-			if e.sink != nil {
-				if err := e.sink.SaveCandidate(ctx, c); err != nil {
-					slog.Error("candidate persist failed", "err", err, "id", c.ID)
-				}
-			}
-		}
-		if best == nil {
-			continue
-		}
-		// 仅 Selected 候选可发送
-		if best.Decision == SimulationAccepted && e.cfg.Mode == "live" {
-			e.executor.Execute(ctx, best)
-		}
-		slog.Info("route evaluated", "block", ev.BlockNumber, "best", best.Decision,
-			"net_profit_wei", best.ExpectedNetProfit.String(), "amount_in", best.InputAmount.String(),
-			"route", routeID(r))
+		e.evaluateRoute(ctx, ev, r)
 	}
 }
 
+// evaluateRoute 单条路由的 Top-K 模拟与统一落盘。
+func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route) {
+	// 执行 Shadow 模式：路由所有池统一刷新到 latest，禁止事件/latest 混合状态
+	stateHead, err := e.searcher.RefreshRoute(ctx, r)
+	if err != nil {
+		slog.Warn("route state refresh failed", "route", routeID(r), "err", err)
+		return // 状态不可用：本区块不评估（下一事件再试），不产生伪造候选
+	}
+	// Top-K 输入量逐个链上模拟，选模拟净利最高者；先全部模拟，再统一落盘
+	cands := e.searcher.TopKOptimize(ctx, r, e.cfg.TopK, ev.BlockNumber, ev.ReceivedAt)
+	groupID := fmt.Sprintf("%d/%s", ev.BlockNumber, routeID(r))
+	var best *Candidate
+	for rank, c := range cands {
+		if c == nil || c.InputAmount == nil {
+			slog.Error("searcher returned incomplete candidate", "route", routeID(r))
+			continue // 记录并跳过，绝不 panic
+		}
+		c.BlockHash = ev.BlockHash
+		c.TxHash = ev.TxHash
+		c.LogIndex = ev.LogIndex
+		c.SourceEvent = "block_swap_batch"
+		c.StateBlock = stateHead
+		c.RouteJSON = MarshalRoute(c.Route) // 用候选自己的路由（含每跳金额）
+		c.OpportunityGroupID = groupID
+		c.Rank = rank + 1 // 1 起（存储层 0 视为 NULL）
+		c.ID = CandidateID(e.cfg.ChainID, ev.BlockHash, ev.TxHash, ev.LogIndex, c.RouteJSON, c.InputAmount)
+		if c.RejectReason != "" {
+			// searcher 已判定（state-incomplete / route quote failed）：不再交给模拟器覆盖
+			c.Decision = "local_rejected"
+			c.ExpectedNetProfit = new(big.Int)
+			continue
+		}
+		verdict, reason, profit := e.evaluator.Evaluate(ctx, c, e.cfg)
+		c.Decision = verdict
+		c.RejectReason = reason
+		c.ExpectedNetProfit = profit
+		// 只有通过链上模拟的候选才能成为 best（rejected 永远不 selected）
+		if verdict == SimulationAccepted {
+			if best == nil || c.ExpectedNetProfit.Cmp(best.ExpectedNetProfit) > 0 {
+				best = c
+			}
+		}
+	}
+	// 统一落盘：best 标记 selected=true；其他通过模拟的降级为 simulation_valid
+	for _, c := range cands {
+		if c.ID == "" {
+			continue // 未进入评估流程（searcher 异常）
+		}
+		if best != nil && c.ID == best.ID {
+			c.Selected = true
+		} else if c.Decision == SimulationAccepted {
+			c.Decision = "simulation_valid"
+			c.RejectReason = "not selected (lower net profit in group)"
+		}
+		if e.sink != nil {
+			if err := e.sink.SaveCandidate(ctx, c); err != nil {
+				slog.Error("candidate persist failed", "err", err, "id", c.ID)
+			}
+		}
+	}
+	if best == nil {
+		return
+	}
+	// 仅 Selected 候选可发送
+	if best.Decision == SimulationAccepted && e.cfg.Mode == "live" {
+		e.executor.Execute(ctx, best)
+	}
+	slog.Info("route evaluated", "block", ev.BlockNumber, "best", best.Decision,
+		"net_profit_wei", best.ExpectedNetProfit.String(), "amount_in", best.InputAmount.String(),
+		"route", routeID(r))
+}
 func routeID(r Route) string {
 	out := ""
 	for _, h := range r.Hops {
@@ -220,6 +245,8 @@ type Searcher interface {
 	Optimize(ctx context.Context, r Route, block uint64, ts int64) *Candidate
 	// TopKOptimize 返回本地毛利最高的 k 个输入量候选（供逐个链上模拟后选优）。
 	TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate
+	// RefreshRoute 执行 Shadow 模式：路由所有池统一读取 latest 状态，返回链头（StateBlock）。
+	RefreshRoute(ctx context.Context, r Route) (uint64, error)
 }
 
 // Evaluator 评估：模拟验证 + 成本核算。

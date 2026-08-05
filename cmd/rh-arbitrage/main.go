@@ -240,14 +240,18 @@ func main() {
 	}()
 
 	slog.Info("arbitrage engine started", "mode", cfg.Mode.Run, "pools", len(reg.AllPools()))
-	// 区块聚合：收集同一区块全部 Swap/Mint/Burn → 按 TxIndex/LogIndex 排序 → 应用完整区块状态
-	// → 区块结束时汇总受影响池评估一次（消除交易中间状态机会）
+	// 区块聚合：newHeads 驱动（只有确认链头越过某区块才 flush），
+	// 日志按 (blockHash, txHash, logIndex) 身份去重，pending 区块按高度排序 flush。
+	type logKey = struct {
+		blockHash common.Hash
+		txHash    common.Hash
+		index     uint
+	}
 	type pendingBlock struct {
-		hash  common.Hash
-		logs  []types.Log
+		hash common.Hash
+		logs map[logKey]types.Log
 	}
 	pending := map[uint64]*pendingBlock{}
-	var currentHead uint64
 
 	flushBlock := func(number uint64) {
 		pb, ok := pending[number]
@@ -255,18 +259,33 @@ func main() {
 			return
 		}
 		delete(pending, number)
+		logList := make([]types.Log, 0, len(pb.logs))
+		for _, l := range pb.logs {
+			logList = append(logList, l)
+		}
 		// 按 (txIndex, logIndex) 排序，保证同区块内事件顺序正确
-		sort.Slice(pb.logs, func(i, j int) bool {
-			if pb.logs[i].TxIndex != pb.logs[j].TxIndex {
-				return pb.logs[i].TxIndex < pb.logs[j].TxIndex
+		sort.Slice(logList, func(i, j int) bool {
+			if logList[i].TxIndex != logList[j].TxIndex {
+				return logList[i].TxIndex < logList[j].TxIndex
 			}
-			return pb.logs[i].Index < pb.logs[j].Index
+			return logList[i].Index < logList[j].Index
 		})
 		affected := map[common.Address]struct{}{}
-		for _, l := range pb.logs {
+		for _, l := range logList {
 			state := reg.Pool(l.Address)
 			if state == nil {
-				continue
+				// 启动后新创建的池：动态验证并加入（不再被忽略）
+				pool, derr := adapter.PoolByAddress(ctx, l.Address)
+				if derr != nil {
+					slog.Debug("unknown pool skipped", "addr", l.Address.Hex(), "err", derr)
+					continue
+				}
+				reg.UpsertPool(v3.State(pool))
+				graph.AddPool(pool.Pool(), pool.Address)
+				if sink != nil {
+					_ = sink.SavePool(ctx, pool.Address.Hex(), pool.Exchange, "v3", pool.Token0, pool.Token1, pool.Fee, pool.TickSpacing)
+				}
+				state = reg.Pool(l.Address)
 			}
 			pool := state.(*v3.Pool)
 			apply, derr := adapter.DecodeLog(pool, l)
@@ -302,40 +321,45 @@ func main() {
 		}
 	}
 
+	// newHeads：区块完结的唯一判据（链头越过 pending 区块才 flush）
+	heads, headErrs := src.SubscribeBlocks(ctx)
+	go func() {
+		for err := range headErrs {
+			slog.Warn("head subscription error", "err", err)
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("arbitrage stopped")
 			return
+		case h, ok := <-heads:
+			if !ok {
+				continue
+			}
+			// 按高度排序 flush（不能遍历 Go map 随机处理）
+			nums := make([]uint64, 0, len(pending))
+			for bn := range pending {
+				if bn < h.Number {
+					nums = append(nums, bn)
+				}
+			}
+			sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
+			for _, bn := range nums {
+				flushBlock(bn)
+			}
 		case l, ok := <-logs:
 			if !ok {
 				continue
 			}
 			pb, exists := pending[l.BlockNumber]
 			if !exists {
-				pb = &pendingBlock{hash: l.BlockHash}
+				pb = &pendingBlock{hash: l.BlockHash, logs: make(map[logKey]types.Log)}
 				pending[l.BlockNumber] = pb
 			}
-			pb.logs = append(pb.logs, l)
-			// 区块完结判定：日志高度落后于当前处理头（或出现更高区块日志）
-			if l.BlockNumber > currentHead {
-				currentHead = l.BlockNumber
-			}
-			// 收到更高区块的日志时，flush 之前的区块（保证完整区块状态）
-			for bn := range pending {
-				if bn < currentHead {
-					flushBlock(bn)
-				}
-			}
-			// 链头推进检查由心跳完成；这里也处理同高度全部到达的情况
-			if l.BlockNumber == currentHead && len(pending) == 1 {
-				// 等待：同区块可能还有更多日志（由下一个区块触发 flush）
-			}
-		case <-time.After(3 * time.Second):
-			// 心跳：flush 所有未完结区块（链头已推进但无新日志）
-			for bn := range pending {
-				flushBlock(bn)
-			}
+			key := logKey{blockHash: l.BlockHash, txHash: l.TxHash, index: l.Index}
+			pb.logs[key] = l // 身份去重：同一条日志重复投递只保留一份
 		}
 	}
 }

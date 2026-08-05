@@ -33,13 +33,17 @@ jobs:
         run: go vet ./...
       - name: Test (unit)
         run: go test ./...
+      - name: Test (race)
+        run: go test -race ./...
       - name: Test fresh migrations
         env:
           RH_TEST_PG_URL: postgres://rh:rh@localhost:5432/rh
         run: |
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0001_init.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0002_shadow_schema_fix.sql
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0003_opportunity_grouping.sql
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q route_json
+          psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q opportunity_group_id
           psql "$RH_TEST_PG_URL" -c "\d dex_pools" | grep -q tick_spacing
       - name: Test legacy migration
         env:
@@ -47,6 +51,7 @@ jobs:
         run: |
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/testdata/legacy_schema.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0002_shadow_schema_fix.sql
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0003_opportunity_grouping.sql
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q route_json
           psql "$RH_TEST_PG_URL" -c "SELECT 1 FROM information_schema.table_constraints WHERE constraint_name='execution_attempts_opportunity_id_fkey'" | grep -q 1
 
