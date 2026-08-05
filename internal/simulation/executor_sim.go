@@ -51,8 +51,22 @@ type SimResult struct {
 	RevertMsg          string
 }
 
+// VerifyBlockHash 校验 sim RPC 在指定高度的区块 hash 与 read RPC 一致
+// （状态与模拟必须在同一链上同一区块；不一致 → 整组拒绝）。
+func (s *ExecutorSimulator) VerifyBlockHash(ctx context.Context, block uint64, want common.Hash) error {
+	hdr, err := s.cli.HeaderByNumber(ctx, new(big.Int).SetUint64(block))
+	if err != nil {
+		return fmt.Errorf("sim header %d: %w", block, err)
+	}
+	if hdr.Hash() != want {
+		return fmt.Errorf("block hash mismatch at %d: sim=%s read=%s", block, hdr.Hash().Hex(), want.Hex())
+	}
+	return nil
+}
+
 // Simulate 构建并模拟 executeV3Cycle 调用。
-func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate, chainID uint64) (*SimResult, error) {
+// block 非 nil 时 eth_call 固定在该高度（与状态读取同一区块，区块原子性）。
+func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate, chainID uint64, block *big.Int) (*SimResult, error) {
 	calldata, err := BuildExecuteV3CycleCalldata(c, chainID)
 	if err != nil {
 		return nil, err
@@ -63,7 +77,7 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 		Gas:  s.maxGas,
 		Data: calldata,
 	}
-	out, err := s.cli.CallContract(ctx, msg, nil)
+	out, err := s.cli.CallContract(ctx, msg, block)
 	if err != nil {
 		return &SimResult{RevertMsg: err.Error(), CalldataHash: hashHex(calldata)}, nil
 	}

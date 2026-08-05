@@ -30,8 +30,8 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 		return DecisionLocalCandidate, "non-positive gross profit", big.NewInt(0)
 	}
 
-	// 第二层：真实链上模拟
-	res, err := e.sim.Simulate(ctx, c, e.chainID)
+	// 第二层：真实链上模拟（固定到 cfg.StateBlock，与状态读取同一区块）
+	res, err := e.sim.Simulate(ctx, c, e.chainID, cfg.StateBlock)
 	if err != nil {
 		slog.Warn("simulate error", "err", err)
 		return DecisionSimulationRejected, "simulate error: " + err.Error(), big.NewInt(0)

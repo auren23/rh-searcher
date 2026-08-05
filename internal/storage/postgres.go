@@ -6,6 +6,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,7 +28,31 @@ func New(ctx context.Context, url string) (*DB, error) {
 	if err := p.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	return &DB{pool: p}, nil
+	db := &DB{pool: p}
+	if err := db.checkSchema(ctx); err != nil {
+		p.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// checkSchema 版本检查：确认 opportunities 已含 shadow 运行所需列。
+// 旧库需手动执行 migrations/0001..0004（代码不会自动迁移）。
+func (d *DB) checkSchema(ctx context.Context) error {
+	var has bool
+	err := d.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'opportunities' AND column_name = 'opportunity_group_id'
+		)`).Scan(&has)
+	if err != nil {
+		return fmt.Errorf("schema check: %w", err)
+	}
+	if !has {
+		return fmt.Errorf("database schema out of date: run migrations 0001-0004 " +
+			"(internal/storage/migrations/) against this database before starting")
+	}
+	return nil
 }
 
 func (d *DB) Close() { d.pool.Close() }
@@ -51,12 +76,12 @@ func (d *DB) SaveCandidate(ctx context.Context, c *arbitrage.Candidate) error {
 		c.BlockHash.Hex(), c.TxHash.Hex(), c.LogIndex, c.RouteJSON,
 		c.InputAsset.Hex(), c.InputAmount.String(), c.GrossProfit.String(),
 		c.GasEstimate.String(), c.SwapCost.String(), c.SlippageCost.String(),
-		nullableWei(c.ExpectedNetProfit), c.SimulationResult, c.Decision, c.RejectReason,
-		nullableWei(c.SimulatedProfitWei), nullableUint64(c.GasUsed),
-		nullableWei(c.GasPriceWei), nullableWei(c.GasCostWei),
+		nullableBigInt(c.ExpectedNetProfit), c.SimulationResult, c.Decision, c.RejectReason,
+		nullableBigInt(c.SimulatedProfitWei), nullableUint64(c.GasUsed),
+		nullableBigInt(c.GasPriceWei), nullableBigInt(c.GasCostWei),
 		nullableStr(c.CalldataHash), nullableUint64(c.StateBlock), nullableUint64(c.SimulationBlock),
 		nullableStr(c.OpportunityGroupID), nullableInt(c.Rank), c.Selected,
-		nullableUint64(c.L1GasUnits), nullableWei(c.L2BaseFeeWei), nullableWei(c.L1BaseFeeEstimateWei),
+		nullableUint64(c.L1GasUnits), nullableBigInt(c.L2BaseFeeWei), nullableBigInt(c.L1BaseFeeEstimateWei),
 	)
 	return err
 }
@@ -70,7 +95,7 @@ func (d *DB) SaveLiquidationCandidate(ctx context.Context, c *liquidation.Candid
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		c.MarketID.Hex(), c.User.Hex(), c.ObservedBlock,
 		c.RepayAssets.String(), c.SeizedCollateral.String(),
-		nullableWei(c.ExpectedNetProfit), c.Decision, c.RejectReason,
+		nullableBigInt(c.ExpectedNetProfit), c.Decision, c.RejectReason,
 	)
 	return err
 }
@@ -153,7 +178,9 @@ func nullableStr(v string) *string {
 	return &v
 }
 
-func nullableWei(v interface{ String() string }) *string {
+// nullableBigInt 显式 *big.Int：nil 指针返回 NULL。
+// 不能用 interface{}（*big.Int(nil) 装箱后接口非 nil，String() 输出 "<nil>" 会破坏 NUMERIC 列）。
+func nullableBigInt(v *big.Int) *string {
 	if v == nil {
 		return nil
 	}

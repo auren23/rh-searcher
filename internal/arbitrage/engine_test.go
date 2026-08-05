@@ -23,7 +23,7 @@ func (f *fakeSearcher) Optimize(ctx context.Context, r Route, block uint64, ts i
 func (f *fakeSearcher) TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate {
 	return f.cands
 }
-func (f *fakeSearcher) RefreshRoute(ctx context.Context, r Route) (uint64, error) { return 100, nil }
+func (f *fakeSearcher) RefreshRoute(ctx context.Context, r Route) (uint64, common.Hash, error) { return 100, common.Hash{}, nil }
 
 // 假 Evaluator：全部 simulation_accepted
 type fakeEvaluator struct{}
@@ -132,7 +132,7 @@ func (c *countingSearcher) TopKOptimize(ctx context.Context, r Route, k int, blo
 	c.count++
 	return []*Candidate{{InputAmount: big.NewInt(1), Route: r.Hops, RouteJSON: "[]"}}
 }
-func (c *countingSearcher) RefreshRoute(ctx context.Context, r Route) (uint64, error) { return 100, nil }
+func (c *countingSearcher) RefreshRoute(ctx context.Context, r Route) (uint64, common.Hash, error) { return 100, common.Hash{}, nil }
 
 // 全部 rejected 时：不得有任何 selected=true（best 必须来自 simulation_accepted）。
 func TestEngineNoSelectedWhenAllRejected(t *testing.T) {

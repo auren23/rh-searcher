@@ -124,9 +124,10 @@ func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock u
 }
 
 // loadSlot0 读取池的 slot0（sqrtPriceX96/tick）与 liquidity。
-func (a *Adapter) loadSlot0(ctx context.Context, p *Pool) error {
+// block 为 nil 时读 latest；指定时全部读取固定在同一高度（区块原子性）。
+func (a *Adapter) loadSlot0(ctx context.Context, p *Pool, block *big.Int) error {
 	data := crypto.Keccak256([]byte("slot0()"))[:4]
-	res, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &p.Address, Data: data}, nil)
+	res, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &p.Address, Data: data}, block)
 	if err != nil {
 		return err
 	}
@@ -141,7 +142,7 @@ func (a *Adapter) loadSlot0(ctx context.Context, p *Pool) error {
 		p.Tick = int(t)
 	}
 	liqData := crypto.Keccak256([]byte("liquidity()"))[:4]
-	liqRes, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &p.Address, Data: liqData}, nil)
+	liqRes, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &p.Address, Data: liqData}, block)
 	if err == nil && len(liqRes) >= 32 {
 		p.Liquidity = new(big.Int).SetBytes(liqRes[:32])
 	}
@@ -214,6 +215,11 @@ func decodeInt24(topic common.Hash) int {
 // 注意：wordPos 可能为负（负 tick 池），必须用 ABI 编码 int16 二补码，
 // 不能用 big.Int.Bytes()（负数返回绝对值）。
 func (a *Adapter) LoadBitmapWord(ctx context.Context, p *Pool, wordPos int64) error {
+	return a.LoadBitmapWordAt(ctx, p, wordPos, nil)
+}
+
+// LoadBitmapWordAt 指定高度的 tickBitmap 读取（区块原子性）。
+func (a *Adapter) LoadBitmapWordAt(ctx context.Context, p *Pool, wordPos int64, block *big.Int) error {
 	int16Type, err := abi.NewType("int16", "", nil)
 	if err != nil {
 		return err
@@ -242,24 +248,23 @@ func (a *Adapter) LoadBitmapWord(ctx context.Context, p *Pool, wordPos int64) er
 	return nil
 }
 
-// RefreshPoolState 执行 Shadow 模式的状态刷新：路由中所有池统一读取当前 latest
-// （slot0/liquidity/当前 bitmap word），消除"事件状态 + latest 状态"混合。
-// 返回当前链头作为 StateBlock。
-func (a *Adapter) RefreshPoolState(ctx context.Context, p *Pool) (uint64, error) {
-	if err := a.loadSlot0(ctx, p); err != nil {
-		return 0, err
+// RefreshPoolStateAt 执行 Shadow 模式的状态刷新：路由中所有池统一读取指定高度的状态
+// （slot0/liquidity/当前 bitmap word 全部固定在同一 block），消除混合状态。
+func (a *Adapter) RefreshPoolStateAt(ctx context.Context, p *Pool, block *big.Int) error {
+	if err := a.loadSlot0(ctx, p, block); err != nil {
+		return err
 	}
 	if p.TickSpacing <= 0 {
 		ts, err := a.readTickSpacing(ctx, p.Address)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		p.TickSpacing = ts
 	}
-	if err := a.LoadBitmapWord(ctx, p, p.WordPos()); err != nil {
-		return 0, err
+	if err := a.LoadBitmapWordAt(ctx, p, p.WordPos(), block); err != nil {
+		return err
 	}
-	return a.cli.BlockNumber(ctx)
+	return nil
 }
 
 // EnsureQuoteState 报价前统一确保池状态就绪：
@@ -276,7 +281,7 @@ func (a *Adapter) EnsureQuoteState(ctx context.Context, p *Pool) error {
 		p.TickSpacing = ts
 	}
 	if p.SqrtPriceX96 == nil || p.Liquidity == nil {
-		if err := a.loadSlot0(ctx, p); err != nil {
+		if err := a.loadSlot0(ctx, p, nil); err != nil {
 			return err
 		}
 	}
@@ -323,7 +328,7 @@ func (a *Adapter) ResyncMintBurn(ctx context.Context, p *Pool, tickLower, tickUp
 		}
 	}
 	// active liquidity 重读
-	if err := a.loadSlot0(ctx, p); err != nil {
+	if err := a.loadSlot0(ctx, p, nil); err != nil {
 		return err
 	}
 	return nil
@@ -481,7 +486,7 @@ func (a *Adapter) PoolByAddress(ctx context.Context, addr common.Address) (*Pool
 		bitmap:      make(map[int64]*big.Int),
 		bitmapLoaded: make(map[int64]bool),
 	}
-	_ = a.loadSlot0(ctx, p)
+	_ = a.loadSlot0(ctx, p, nil)
 	return p, nil
 }
 
@@ -565,4 +570,9 @@ func leftPad(b []byte) []byte {
 func leftPadUint(v uint64, bits int) []byte {
 	b := big.NewInt(int64(v)).Bytes()
 	return leftPad(b)
+}
+
+// HeaderAt 读取区块头（nil = latest）。供状态固定与 hash 校验。
+func (a *Adapter) HeaderAt(ctx context.Context, block *big.Int) (*types.Header, error) {
+	return a.cli.HeaderByNumber(ctx, block)
 }

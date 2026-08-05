@@ -188,27 +188,29 @@ func (s *LocalSearcher) prepareRoute(ctx context.Context, r Route) error {
 	return nil
 }
 
-// RefreshRoute 执行 Shadow 模式：路由所有池统一读取 latest 状态，返回链头（StateBlock）。
-func (s *LocalSearcher) RefreshRoute(ctx context.Context, r Route) (uint64, error) {
-	var head uint64
+// RefreshRoute 执行 Shadow 模式：先固定一个状态区块（blockNumber + blockHash），
+// 路由所有池的状态读取（slot0/liquidity/bitmap）全部固定在该高度。
+// 返回 (stateBlock, stateHash, err)。调用方需将 stateBlock 用于 eth_call 与 hash 校验。
+func (s *LocalSearcher) RefreshRoute(ctx context.Context, r Route) (uint64, common.Hash, error) {
+	header, err := s.v3.HeaderAt(ctx, nil)
+	if err != nil {
+		return 0, common.Hash{}, fmt.Errorf("header: %w", err)
+	}
+	block := new(big.Int).Set(header.Number)
 	for _, h := range r.Hops {
 		state := s.registry.Pool(h.Pool)
 		if state == nil {
-			return 0, fmt.Errorf("pool %s missing", h.Pool.Hex())
+			return 0, common.Hash{}, fmt.Errorf("pool %s missing", h.Pool.Hex())
 		}
 		p, ok := state.(*v3.Pool)
 		if !ok {
-			return 0, fmt.Errorf("pool %s unsupported", h.Pool.Hex())
+			return 0, common.Hash{}, fmt.Errorf("pool %s unsupported", h.Pool.Hex())
 		}
-		h2, err := s.v3.RefreshPoolState(ctx, p)
-		if err != nil {
-			return 0, fmt.Errorf("pool %s refresh: %w", h.Pool.Hex(), err)
-		}
-		if h2 > head {
-			head = h2
+		if err := s.v3.RefreshPoolStateAt(ctx, p, block); err != nil {
+			return 0, common.Hash{}, fmt.Errorf("pool %s refresh: %w", h.Pool.Hex(), err)
 		}
 	}
-	return head, nil
+	return header.Number.Uint64(), header.Hash(), nil
 }
 
 // TopKOptimize 本地毛利最高的 k 个输入量（供逐个 eth_call 后选优）。

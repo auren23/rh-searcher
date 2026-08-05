@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"golang.org/x/crypto/sha3"
@@ -90,6 +92,7 @@ type Config struct {
 	MaxHops         int
 	TopK            int    // 本地 Top-K 输入量逐个链上模拟
 	Mode            string // dry | shadow | live
+	StateBlock      *big.Int // 评估固定区块（eth_call 与该高度对齐；nil = latest）
 }
 
 func NewEngine(cfg Config, sink Sink, searcher Searcher, evaluator Evaluator, executor Executor) *Engine {
@@ -136,15 +139,58 @@ func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 
 // evaluateRoute 单条路由的 Top-K 模拟与统一落盘。
 func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route) {
-	// 执行 Shadow 模式：路由所有池统一刷新到 latest，禁止事件/latest 混合状态
-	stateHead, err := e.searcher.RefreshRoute(ctx, r)
+	// 执行 Shadow 模式：固定状态区块，路由所有池的状态读取都在该高度
+	stateHead, stateHash, err := e.searcher.RefreshRoute(ctx, r)
 	if err != nil {
+		// 状态不可用：打指标并记录 group 级拒绝（不静默从漏斗消失）
+		routeRefreshFailures.Inc()
 		slog.Warn("route state refresh failed", "route", routeID(r), "err", err)
-		return // 状态不可用：本区块不评估（下一事件再试），不产生伪造候选
+		if e.sink != nil {
+			_ = e.sink.SaveCandidate(ctx, &Candidate{
+				ID:            CandidateID(e.cfg.ChainID, ev.BlockHash, ev.TxHash, ev.LogIndex, MarshalRoute(r.Hops), big.NewInt(0)),
+				ObservedBlock: ev.BlockNumber,
+				ObservedAt:    ev.ReceivedAt,
+				Route:         cloneHops(r.Hops),
+				RouteJSON:     MarshalRoute(r.Hops),
+				InputAmount:   new(big.Int),
+				GrossProfit:   new(big.Int),
+				GasEstimate:   new(big.Int),
+				SwapCost:      new(big.Int),
+				SlippageCost:  new(big.Int),
+				ExpectedNetProfit: new(big.Int),
+				Decision:      "local_rejected",
+				RejectReason:  "state-incomplete: " + err.Error(),
+			})
+		}
+		return
+	}
+	// read RPC 与 sim RPC 的区块 hash 一致性校验（不一致 → 整组拒绝）
+	if v, ok := e.evaluator.(interface {
+		VerifyBlockHash(ctx context.Context, block uint64, want common.Hash) error
+	}); ok {
+		if err := v.VerifyBlockHash(ctx, stateHead, stateHash); err != nil {
+			slog.Warn("read/sim block hash mismatch", "route", routeID(r), "err", err)
+			return // 状态与模拟不在同一区块：不产生候选
+		}
 	}
 	// Top-K 输入量逐个链上模拟，选模拟净利最高者；先全部模拟，再统一落盘
 	cands := e.searcher.TopKOptimize(ctx, r, e.cfg.TopK, ev.BlockNumber, ev.ReceivedAt)
-	groupID := fmt.Sprintf("%d/%s", ev.BlockNumber, routeID(r))
+	// Rank 必须是真实利润排名：按本地毛利降序
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i] == nil || cands[j] == nil {
+			return false
+		}
+		gi, gj := cands[i].GrossProfit, cands[j].GrossProfit
+		if gi == nil {
+			return false
+		}
+		if gj == nil {
+			return true
+		}
+		return gi.Cmp(gj) > 0
+	})
+	// GroupID：chainID + blockHash + route（重组后同高度新块不会与旧块同组）
+	groupID := fmt.Sprintf("%d/%s/%s", e.cfg.ChainID, ev.BlockHash.Hex(), routeID(r))
 	var best *Candidate
 	for rank, c := range cands {
 		if c == nil || c.InputAmount == nil {
@@ -166,7 +212,9 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route) {
 			c.ExpectedNetProfit = new(big.Int)
 			continue
 		}
-		verdict, reason, profit := e.evaluator.Evaluate(ctx, c, e.cfg)
+		simCfg := e.cfg
+		simCfg.StateBlock = new(big.Int).SetUint64(stateHead)
+		verdict, reason, profit := e.evaluator.Evaluate(ctx, c, simCfg)
 		c.Decision = verdict
 		c.RejectReason = reason
 		c.ExpectedNetProfit = profit
@@ -225,6 +273,18 @@ func CandidateID(chainID uint64, blockHash, txHash common.Hash, logIndex uint, r
 	return "0x" + hex.EncodeToString(h.Sum(nil))
 }
 
+type atomicCounter struct {
+	mu sync.Mutex
+	n  uint64
+}
+
+func newAtomicCounter() *atomicCounter { return &atomicCounter{} }
+func (c *atomicCounter) Inc() {
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+}
+
 // MarshalRoute 序列化路由（完整可重放）。
 func MarshalRoute(hops []Hop) string {
 	raw, _ := json.Marshal(hops)
@@ -233,6 +293,9 @@ func MarshalRoute(hops []Hop) string {
 
 // SimulationAccepted 通过链上模拟的决策值（live 发送门槛）。
 const SimulationAccepted = "simulation_accepted"
+
+// routeRefreshFailures 状态刷新失败计数（轻量指标，无 Prometheus 依赖）。
+var routeRefreshFailures = newAtomicCounter()
 
 // Route 从 searcher 返回的候选路径。
 type Route struct {
@@ -245,8 +308,9 @@ type Searcher interface {
 	Optimize(ctx context.Context, r Route, block uint64, ts int64) *Candidate
 	// TopKOptimize 返回本地毛利最高的 k 个输入量候选（供逐个链上模拟后选优）。
 	TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate
-	// RefreshRoute 执行 Shadow 模式：路由所有池统一读取 latest 状态，返回链头（StateBlock）。
-	RefreshRoute(ctx context.Context, r Route) (uint64, error)
+	// RefreshRoute 执行 Shadow 模式：固定一个状态区块，路由所有池的状态读取都在该高度。
+	// 返回 (stateBlock, stateHash, err)。
+	RefreshRoute(ctx context.Context, r Route) (uint64, common.Hash, error)
 }
 
 // Evaluator 评估：模拟验证 + 成本核算。

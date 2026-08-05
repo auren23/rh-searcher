@@ -17,7 +17,6 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
@@ -219,62 +218,53 @@ func main() {
 		arbitrage.NewExecutor(),
 	)
 
-	// 订阅 Swap（触发套利）+ Mint/Burn（仅更新状态）。
-	// FromBlock = 启动时链头 + 1：初始化期间发生的 Swap 会被补回（封闭漏日志窗口）
-	swapTopic := v3.SwapTopic()
-	mintTopic := common.HexToHash("0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde")
-	burnTopic := common.HexToHash("0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c")
+	slog.Info("arbitrage engine started", "mode", cfg.Mode.Run, "pools", len(reg.AllPools()))
+	slog.Info("arbitrage engine started", "mode", cfg.Mode.Run, "pools", len(reg.AllPools()))
+	// 区块原子摄取：head 驱动，日志以 HTTP FilterLogs 精确取整块（唯一事实源）。
+	// 每个区块：取日志 → 验证 log.BlockHash == header.Hash → 排序应用 → 评估 → 前进。
+	// 启动时链头（订阅建立前发生的 Swap 由窗口补扫覆盖）
 	startHead, err := readCli.BlockNumber(ctx)
 	if err != nil {
-		slog.Error("read chain head for log subscription", "err", err)
+		slog.Error("read chain head", "err", err)
 		os.Exit(1)
 	}
-	logs, logErrs := src.SubscribeLogs(ctx, ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(startHead) + 1),
-		Topics:    [][]common.Hash{{swapTopic, mintTopic, burnTopic}},
-	})
-	go func() {
-		for err := range logErrs {
-			slog.Warn("log subscription error", "err", err)
-		}
-	}()
-
-	slog.Info("arbitrage engine started", "mode", cfg.Mode.Run, "pools", len(reg.AllPools()))
-	// 区块聚合：newHeads 驱动（只有确认链头越过某区块才 flush），
-	// 日志按 (blockHash, txHash, logIndex) 身份去重，pending 区块按高度排序 flush。
-	type logKey = struct {
-		blockHash common.Hash
-		txHash    common.Hash
-		index     uint
+	eventTopics := [][]common.Hash{{
+		v3.SwapTopic(),
+		common.HexToHash("0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde"), // Mint
+		common.HexToHash("0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c"), // Burn
+	}}
+	var lastApplied uint64
+	if h, ok := heights["blocks"]; ok {
+		lastApplied = h
 	}
-	type pendingBlock struct {
-		hash common.Hash
-		logs map[logKey]types.Log
-	}
-	pending := map[uint64]*pendingBlock{}
 
-	flushBlock := func(number uint64) {
-		pb, ok := pending[number]
-		if !ok {
-			return
+	processBlock := func(h chain.BlockEvent) error {
+		logs, err := readCli.FilterLogs(ctx, ethereum.FilterQuery{
+			FromBlock: new(big.Int).SetUint64(h.Number),
+			ToBlock:   new(big.Int).SetUint64(h.Number),
+			Topics:    eventTopics,
+		})
+		if err != nil {
+			return fmt.Errorf("block %d getLogs: %w", h.Number, err)
 		}
-		delete(pending, number)
-		logList := make([]types.Log, 0, len(pb.logs))
-		for _, l := range pb.logs {
-			logList = append(logList, l)
-		}
-		// 按 (txIndex, logIndex) 排序，保证同区块内事件顺序正确
-		sort.Slice(logList, func(i, j int) bool {
-			if logList[i].TxIndex != logList[j].TxIndex {
-				return logList[i].TxIndex < logList[j].TxIndex
+		// 验证区块一致性（日志必须属于该 header）
+		for _, l := range logs {
+			if l.BlockHash != h.Hash {
+				return fmt.Errorf("block %d hash mismatch: log=%s header=%s", h.Number, l.BlockHash.Hex(), h.Hash.Hex())
 			}
-			return logList[i].Index < logList[j].Index
+		}
+		// 排序 + 应用 + 评估（复用区块聚合逻辑）
+		sort.Slice(logs, func(i, j int) bool {
+			if logs[i].TxIndex != logs[j].TxIndex {
+				return logs[i].TxIndex < logs[j].TxIndex
+			}
+			return logs[i].Index < logs[j].Index
 		})
 		affected := map[common.Address]struct{}{}
-		for _, l := range logList {
+		for _, l := range logs {
 			state := reg.Pool(l.Address)
 			if state == nil {
-				// 启动后新创建的池：动态验证并加入（不再被忽略）
+				// 启动后新创建的池：动态验证并加入
 				pool, derr := adapter.PoolByAddress(ctx, l.Address)
 				if derr != nil {
 					slog.Debug("unknown pool skipped", "addr", l.Address.Hex(), "err", derr)
@@ -296,8 +286,8 @@ func main() {
 			if apply != nil {
 				apply()
 			}
-			// Mint/Burn：重读链上 bitmap word 与 active liquidity（本地历史 gross 不可信）
-			if l.Topics[0] == mintTopic || l.Topics[0] == burnTopic {
+			// Mint/Burn：重读链上 bitmap word 与 active liquidity
+			if l.Topics[0] == eventTopics[0][1] || l.Topics[0] == eventTopics[0][2] {
 				if tl, tu, terr := v3.DecodeTickBounds(l); terr == nil {
 					if err := adapter.ResyncMintBurn(ctx, pool, tl, tu); err != nil {
 						slog.Warn("resync mint/burn", "pool", pool.Address.Hex(), "err", err)
@@ -314,20 +304,36 @@ func main() {
 		}
 		if len(pools) > 0 {
 			engine.OnBlockBatch(ctx, arbitrage.SwapEvent{
-				BlockNumber: number,
-				BlockHash:   pb.hash,
+				BlockNumber: h.Number,
+				BlockHash:   h.Hash,
 				ReceivedAt:  time.Now().UnixMilli(),
 			}, pools)
 		}
+		_ = ckpt.Save("blocks", h.Number)
+		return nil
 	}
 
-	// newHeads：区块完结的唯一判据（链头越过 pending 区块才 flush）
 	heads, headErrs := src.SubscribeBlocks(ctx)
 	go func() {
 		for err := range headErrs {
 			slog.Warn("head subscription error", "err", err)
 		}
 	}()
+
+	// 启动窗口补扫：lastApplied+1 → 当前链头（订阅建立前发生的 Swap 不漏）
+	if startHead > lastApplied {
+		for bn := lastApplied + 1; bn <= startHead; bn++ {
+			hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
+			if err != nil {
+				slog.Warn("startup backfill header", "block", bn, "err", err)
+				break
+			}
+			if err := processBlock(chain.BlockEvent{Number: bn, Hash: hdr.Hash()}); err != nil {
+				slog.Warn("startup backfill", "block", bn, "err", err)
+				break
+			}
+		}
+	}
 
 	for {
 		select {
@@ -338,28 +344,30 @@ func main() {
 			if !ok {
 				continue
 			}
-			// 按高度排序 flush（不能遍历 Go map 随机处理）
-			nums := make([]uint64, 0, len(pending))
-			for bn := range pending {
-				if bn < h.Number {
-					nums = append(nums, bn)
+			if h.Number <= lastApplied {
+				continue // 已处理（含轮询源补块重复）
+			}
+			// 缺口补块（轮询源可能跳块）
+			for bn := lastApplied + 1; bn <= h.Number; bn++ {
+				if bn == h.Number {
+					if err := processBlock(h); err != nil {
+						slog.Warn("process block", "block", bn, "err", err)
+						continue
+					}
+				} else {
+					hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
+					if err != nil {
+						slog.Warn("gap header", "block", bn, "err", err)
+						continue
+					}
+					if err := processBlock(chain.BlockEvent{Number: bn, Hash: hdr.Hash()}); err != nil {
+						slog.Warn("gap block", "block", bn, "err", err)
+						continue
+					}
 				}
+				lastApplied = bn
 			}
-			sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
-			for _, bn := range nums {
-				flushBlock(bn)
-			}
-		case l, ok := <-logs:
-			if !ok {
-				continue
-			}
-			pb, exists := pending[l.BlockNumber]
-			if !exists {
-				pb = &pendingBlock{hash: l.BlockHash, logs: make(map[logKey]types.Log)}
-				pending[l.BlockNumber] = pb
-			}
-			key := logKey{blockHash: l.BlockHash, txHash: l.TxHash, index: l.Index}
-			pb.logs[key] = l // 身份去重：同一条日志重复投递只保留一份
+			lastApplied = h.Number
 		}
 	}
 }
