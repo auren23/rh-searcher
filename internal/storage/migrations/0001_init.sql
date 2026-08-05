@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS dex_pools (
     token0      TEXT NOT NULL,
     token1      TEXT NOT NULL,
     fee         INT,
+    tick_spacing INT NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

@@ -88,19 +88,25 @@ func main() {
 			slog.Warn("postgres unavailable, pool persistence disabled", "err", err)
 		} else {
 			defer db.Close()
-			saved, err := db.LoadPools(ctx)
+			restored, err := storage.RestorePools(ctx, db, reg, graph)
 			if err != nil {
-				slog.Error("load pools from db", "err", err)
-				os.Exit(1) // 不允许忽略恢复错误继续运行（漏池）
+				slog.Error("restore pools", "err", err)
+				os.Exit(1)
 			}
-			for _, sp := range saved {
-				p := v3.NewPoolFromMeta(
-					common.HexToAddress(sp.Address), sp.Exchange,
-					common.HexToAddress(sp.Token0), common.HexToAddress(sp.Token1), sp.Fee)
-				reg.UpsertPool(v3.State(p))
-				graph.AddPool(p.Pool(), p.Address)
+			_ = restored
+			// 旧数据 tick_spacing 为 0：按需补查
+			for _, st := range reg.AllPools() {
+				pool := st.(*v3.Pool)
+				if pool.TickSpacing <= 0 {
+					fresh, err := adapter.PoolByAddress(ctx, pool.Address)
+					if err == nil {
+						reg.UpsertPool(v3.State(fresh))
+						graph.AddPool(fresh.Pool(), fresh.Address)
+					} else {
+						slog.Warn("backfill tickSpacing failed", "pool", pool.Address.Hex(), "err", err)
+					}
+				}
 			}
-			slog.Info("restored pools from db", "count", len(saved))
 		}
 	}
 
@@ -132,7 +138,8 @@ func main() {
 	if db != nil {
 		for _, st := range reg.AllPools() {
 			p := st.Pool()
-			if err := db.SavePool(ctx, p.ID, p.Exchange, p.Protocol, p.Token0, p.Token1, p.Fee); err != nil {
+			sp := st.(*v3.Pool) // TickSpacing 在 v3 状态上
+			if err := db.SavePool(ctx, p.ID, p.Exchange, p.Protocol, p.Token0, p.Token1, p.Fee, sp.TickSpacing); err != nil {
 				slog.Warn("save pool", "err", err)
 			}
 		}
@@ -171,16 +178,21 @@ func main() {
 			}
 			slog.Debug("head", "block", h.Number, "hash", h.Hash.Hex())
 		case l := <-createdLogs:
-			// 新池：从链上初始化并注册
-			p, err := adapter.PoolByAddress(ctx, l.Address)
+			// PoolCreated 由 Factory 发出：l.Address 是 Factory，新池地址在 data 中
+			meta, err := adapter.DecodePoolCreated(l)
 			if err != nil {
-				slog.Warn("new pool init", "addr", l.Address.Hex(), "err", err)
+				slog.Warn("decode pool created", "err", err)
+				continue
+			}
+			p, err := adapter.PoolByAddress(ctx, meta.Pool)
+			if err != nil {
+				slog.Warn("new pool init", "addr", meta.Pool.Hex(), "err", err)
 				continue
 			}
 			reg.UpsertPool(v3.State(p))
 			graph.AddPool(p.Pool(), p.Address)
 			if db != nil {
-				_ = db.SavePool(ctx, p.Address.Hex(), p.Exchange, "v3", p.Token0, p.Token1, p.Fee)
+				_ = db.SavePool(ctx, p.Address.Hex(), p.Exchange, "v3", p.Token0, p.Token1, p.Fee, p.TickSpacing)
 			}
 			slog.Info("new pool", "addr", p.Address.Hex(), "t0", p.Token0.Hex(), "t1", p.Token1.Hex(), "fee", p.Fee)
 		}

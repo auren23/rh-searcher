@@ -57,12 +57,14 @@ contract MockPool {
         external
         returns (int256, int256)
     {
+        // 真实 V3 语义：amountSpecified > 0 = exact input（方向无关）
         uint256 amountIn = uint256(amountSpecified < 0 ? -amountSpecified : amountSpecified);
         MockToken inTok = zeroForOne ? token0 : token1;
         MockToken outTok = zeroForOne ? token1 : token0;
         uint256 amountOut = amountIn * exchangeRate / 1e4;
 
-        // 模拟 V3：先回调（池要求付款），再拉款、转出
+        // 模拟真实 V3：回调前记录余额，回调（回调方主动付款）后检查余额增加
+        uint256 balBefore = inTok.balanceOf(address(this));
         (bool ok,) = recipient.call(
             abi.encodeWithSignature("uniswapV3SwapCallback(int256,int256,bytes)",
                 zeroForOne ? int256(uint256(amountIn)) : int256(0),
@@ -70,7 +72,8 @@ contract MockPool {
                 data)
         );
         require(ok, "callback failed");
-        inTok.transferFrom(recipient, address(this), amountIn);
+        // IIA 检查：回调后池必须收到全额输入（V3 余额检查模型，不做 transferFrom）
+        require(inTok.balanceOf(address(this)) >= balBefore + amountIn, "IIA");
         outTok.transfer(recipient, amountOut);
         return (
             zeroForOne ? int256(uint256(amountIn)) : -int256(amountOut),
@@ -122,11 +125,7 @@ contract ArbitrageExecutorV3CycleTest is Test {
         token.mint(address(poolA), 1000e18);
         weth.mint(address(poolB), 1000e18);
         token.mint(address(poolB), 1000e18);
-        // 池需要 approve（模拟池从合约拉款）
-        vm.startPrank(address(exec));
-        weth.approve(address(poolA), type(uint256).max);
-        token.approve(address(poolB), type(uint256).max);
-        vm.stopPrank();
+        // V3 回调付款模型：无需 approve
     }
 
     function hopsWethToken() internal view returns (ArbitrageExecutor.Hop[] memory) {

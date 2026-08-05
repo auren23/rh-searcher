@@ -102,14 +102,20 @@ func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock u
 			continue
 		}
 		poolAddr := v[1].(common.Address)
+		tickSpacing := int(v[0].(*big.Int).Int64())
+		if tickSpacing <= 0 {
+			continue // 非法 spacing（防御）
+		}
 		p := &Pool{
 			Address: poolAddr, Exchange: a.exchange,
 			Token0:        common.BytesToAddress(l.Topics[1][12:]),
 			Token1:        common.BytesToAddress(l.Topics[2][12:]),
 			Fee:           uint32(new(big.Int).SetBytes(l.Topics[3][29:]).Uint64()),
+			TickSpacing:   tickSpacing,
 			ObservedBlock: l.BlockNumber,
 			ticks:         make(map[int]*Tick),
 			bitmap:        make(map[int64]*big.Int),
+			bitmapLoaded:  make(map[int64]bool),
 		}
 		// 惰性状态：slot0/liquidity 首次事件时加载，避免全量发现的 RPC 开销
 		out = append(out, p)
@@ -196,6 +202,66 @@ func decodeInt24(topic common.Hash) int {
 	return int(n)
 }
 
+// LoadBitmapWord 按需读取池 tickBitmap 的一个 word（区分"未加载"与"真实为 0"）。
+func (a *Adapter) LoadBitmapWord(ctx context.Context, p *Pool, wordPos int64) error {
+	sel := crypto.Keccak256([]byte("tickBitmap(int16)"))[:4]
+	arg := new(big.Int).SetInt64(wordPos)
+	argB := leftPad(arg.Bytes())
+	data := append(sel, argB...)
+	res, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &p.Address, Data: data}, nil)
+	if err != nil {
+		return err
+	}
+	if len(res) < 32 {
+		return fmt.Errorf("short tickBitmap response %d bytes", len(res))
+	}
+	if p.bitmap == nil {
+		p.bitmap = make(map[int64]*big.Int)
+	}
+	if p.bitmapLoaded == nil {
+		p.bitmapLoaded = make(map[int64]bool)
+	}
+	p.bitmap[wordPos] = new(big.Int).SetBytes(res[:32])
+	p.bitmapLoaded[wordPos] = true
+	return nil
+}
+
+// PoolMeta PoolCreated 事件解码出的池元数据。
+type PoolMeta struct {
+	Pool        common.Address
+	Token0      common.Address
+	Token1      common.Address
+	Fee         uint32
+	TickSpacing int
+}
+
+// DecodePoolCreated 从 PoolCreated 日志解码池地址与元数据。
+// 注意：l.Address 是 Factory 地址，新池地址在 data 中（tickSpacing, pool）。
+func (a *Adapter) DecodePoolCreated(log types.Log) (*PoolMeta, error) {
+	if len(log.Topics) < 4 {
+		return nil, fmt.Errorf("PoolCreated: %d topics, want 4", len(log.Topics))
+	}
+	ev, ok := a.events[log.Topics[0]]
+	if !ok || ev.Name != "PoolCreated" {
+		return nil, fmt.Errorf("not a PoolCreated event")
+	}
+	v, err := ev.Inputs.Unpack(log.Data)
+	if err != nil || len(v) < 2 {
+		return nil, fmt.Errorf("unpack PoolCreated: %w", err)
+	}
+	tickSpacing := int(v[0].(*big.Int).Int64())
+	if tickSpacing <= 0 {
+		return nil, fmt.Errorf("invalid tickSpacing %d", tickSpacing)
+	}
+	return &PoolMeta{
+		Pool:        v[1].(common.Address),
+		Token0:      common.BytesToAddress(log.Topics[1][12:]),
+		Token1:      common.BytesToAddress(log.Topics[2][12:]),
+		Fee:         uint32(new(big.Int).SetBytes(log.Topics[3][29:]).Uint64()),
+		TickSpacing: tickSpacing,
+	}, nil
+}
+
 // QuoteExactIn 本地精确报价（严格单 tick 模式）。
 // - 双向公式与官方 SqrtPriceMath 一致（token0 输入走 getNextSqrtPriceFromAmount0RoundingUp(add=false)，
 //   token1 输入走 getNextSqrtPriceFromAmount1RoundingDown(add=true)）
@@ -205,7 +271,7 @@ func (a *Adapter) QuoteExactIn(p *Pool, tokenIn common.Address, amountIn *big.In
 	if amountIn.Sign() <= 0 {
 		return big.NewInt(0), nil
 	}
-	if p.SqrtPriceX96 == nil || p.Liquidity == nil || p.Liquidity.Sign() <= 0 {
+	if p.SqrtPriceX96 == nil || p.Liquidity == nil || p.Liquidity.Sign() <= 0 || p.TickSpacing <= 0 {
 		return nil, ErrStateIncomplete
 	}
 	zeroForOne := tokenIn == p.Token0
@@ -298,14 +364,19 @@ func (a *Adapter) PoolByAddress(ctx context.Context, addr common.Address) (*Pool
 	if err != nil || len(got) < 32 || common.BytesToAddress(got[12:32]) != addr {
 		return nil, fmt.Errorf("pool %s not verified by factory %s", addr.Hex(), a.factory.Hex())
 	}
+	ts := int(new(big.Int).SetBytes(tsraw[29:32]).Int64())
+	if ts <= 0 {
+		return nil, fmt.Errorf("pool %s invalid tickSpacing %d", addr.Hex(), ts)
+	}
 	p := &Pool{
 		Address: addr, Exchange: a.exchange,
 		Token0:      common.BytesToAddress(t0raw[12:32]),
 		Token1:      common.BytesToAddress(t1raw[12:32]),
 		Fee:         uint32(new(big.Int).SetBytes(feeraw[29:32]).Uint64()),
-		TickSpacing: int(new(big.Int).SetBytes(tsraw[29:32]).Int64()),
+		TickSpacing: ts,
 		ticks:       make(map[int]*Tick),
 		bitmap:      make(map[int64]*big.Int),
+		bitmapLoaded: make(map[int64]bool),
 	}
 	_ = a.loadSlot0(ctx, p)
 	return p, nil

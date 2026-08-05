@@ -97,9 +97,9 @@ make run-arbitrage
 |---|---|---|
 | M0 | 链上事实确认 | ✅ **完成**（见 `deployments/M0-chain-facts.md`）：Chain ID 4663、aeWETH、Uniswap V3/V2 全家桶、Morpho Blue 地址全部实测确认；发现 Morpho 链上 0 市场 |
 | M1 | 多 RPC 池、WS 重连、补块、签名、Nonce、Receipt 确认 | ✅ 骨架完成（轮询源 + 429 退避 + 自适应批次） |
-| M2 | V3 Factory/Pool 索引 + 本地 Quote 验收 | ✅ 事件解码修正（真实日志 fixture 测试）+ 双向精确报价（官方 SqrtPriceMath 移植，TickMath 金标准测试） |
-| M3 | WETH→TOKEN→WETH 两池 Shadow 搜索 | ✅ 引擎 + 完整候选落盘（可重放 ID/路由 JSON） |
-| M4 | ArbitrageExecutor + Foundry 测试 | ✅ **重写为直接调 V3 Pool**（executeV3Cycle），14/14 测试通过（两跳成功/权限/minProfit/回调验证/重入/重复池） |
+| M2 | V3 Factory/Pool 索引 + 本地 Quote 验收 | 🔶 数学实现完成（双向精确报价 + TickMath 金标准）；真实状态恢复（bitmap 按需加载/gross 跟踪）完成，待长跑验证 |
+| M3 | WETH→TOKEN→WETH 两池 Shadow 搜索 | 🔶 本地候选落盘完成（对数网格优化器 + 每跳记录）；链上模拟已接入（executeV3Cycle eth_call，分层 local_candidate/simulation_accepted），待积累数据 |
+| M4 | ArbitrageExecutor + Foundry 测试 | 🔶 合约结构完成，真实 V3 Callback 语义已修（主动付款 + amountSpecified 恒正），14/14 测试通过；真链 fork 测试待接入 |
 | M5 | Replay → Shadow → Canary → Live 上线门槛 | 未开始 |
 | M6 | Morpho 市场/仓位索引 | ⏸ 推迟：链上 0 市场（见 M0 报告），等 CreateMarket 事件 |
 | M7 | 清算机会计算 | ⏸ 推迟（依赖 M6） |

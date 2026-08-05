@@ -17,8 +17,9 @@ type Config struct {
 	RPC     RPCConfig     `yaml:"rpc"`
 	Dexes   DexesConfig   `yaml:"dexes"`
 	Morpho  MorphoConfig  `yaml:"morpho"`
-	Storage StorageConfig `yaml:"storage"`
-	Mode    ModeConfig    `yaml:"mode"`
+	Storage  StorageConfig  `yaml:"storage"`
+	Mode     ModeConfig     `yaml:"mode"`
+	Executor ExecutorConfig `yaml:"executor"`
 }
 
 type ChainConfig struct {
@@ -69,6 +70,12 @@ type StorageConfig struct {
 type ModeConfig struct {
 	// dry: 只发现和记录；shadow: 模拟但不发送；live: 真实发送
 	Run string `yaml:"run"`
+}
+
+// ExecutorConfig 执行合约与热钱包（模拟/发送用）。
+type ExecutorConfig struct {
+	Contract string `yaml:"contract"`
+	Wallet   string `yaml:"wallet"`
 }
 
 // LoadMerged 顺序加载多个配置并合并（后者覆盖前者）。
@@ -198,6 +205,12 @@ func (c *Config) applyEnv() {
 	}
 	if v := os.Getenv("RH_SIM_RPCS"); v != "" {
 		c.RPC.Groups.Sim = splitCSV(v)
+	}
+	if v := os.Getenv("RH_EXECUTOR_CONTRACT"); v != "" {
+		c.Executor.Contract = v
+	}
+	if v := os.Getenv("RH_HOT_WALLET"); v != "" {
+		c.Executor.Wallet = v
 	}
 }
 

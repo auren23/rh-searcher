@@ -2,6 +2,7 @@ package arbitrage
 
 import (
 	"context"
+	"math"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -23,26 +24,21 @@ func NewLocalSearcher(g *dex.Graph, reg *dex.Registry, a *v3.Adapter, weth commo
 	return &LocalSearcher{graph: g, registry: reg, v3: a, weth: weth}
 }
 
-// FindRoutes 找包含触发池的 WETH 循环。
+// FindRoutes 找包含触发池（第一跳或第二跳）的 WETH 循环。
 func (s *LocalSearcher) FindRoutes(ctx context.Context, pool common.Address, weth common.Address, maxHops int) []Route {
 	cycles := s.graph.FindCycles(weth, pool)
 	out := make([]Route, 0, len(cycles))
 	for _, cyc := range cycles {
 		hops := make([]Hop, 0, len(cyc.Pools))
 		for i, ref := range cyc.Pools {
-			state := s.registry.Pool(ref.Address)
-			if state == nil {
-				continue
-			}
 			tokenIn := weth
 			if i == 1 {
 				tokenIn = midToken(cyc.Pools[0])
 			}
-			hop := Hop{
+			hops = append(hops, Hop{
 				Pool: ref.Address, Exchange: ref.Exchange, Fee: ref.Fee,
 				TokenIn: tokenIn, TokenOut: otherSide(ref, tokenIn),
-			}
-			hops = append(hops, hop)
+			})
 		}
 		if len(hops) == 2 {
 			out = append(out, Route{Hops: hops})
@@ -52,68 +48,151 @@ func (s *LocalSearcher) FindRoutes(ctx context.Context, pool common.Address, wet
 	return out
 }
 
-// Optimize 对每条路由二分搜索最优 amountIn（最大化净 WETH 差）。
+// Optimize 最大化净利润的输入量搜索：
+//   1. 由第一跳池的单 tick 可承载量决定搜索上限（深度自适应）
+//   2. 对数网格粗搜（32 点）
+//   3. 最佳点邻域三分搜索细化
+//   4. 记录每跳输入输出
 func (s *LocalSearcher) Optimize(ctx context.Context, r Route, block uint64, ts int64) *Candidate {
-	// 简化二分：扫描 amountIn 对数网格（100 点），取 WETH-out - WETH-in 最大者。
-	bestAmount := big.NewInt(0)
-	bestOut := big.NewInt(0)
-	// 采样区间假设：0.01 .. 10 WETH（MVP 固定值，生产应从池深度推导）
-	low := big.NewInt(0)
-	high := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
-	high.Mul(high, big.NewInt(10))
-	for i := 0; i < 30; i++ { // 30 轮二分
-		mid := new(big.Int).Add(low, high)
-		mid.Div(mid, big.NewInt(2))
-		out, ok := s.quoteRoute(ctx, r, mid)
-		if !ok {
-			high = mid
-			continue
+	profitOf := func(amount *big.Int) *big.Int {
+		outs, ok := s.quoteRoute(ctx, r, amount)
+		if !ok || outs == nil || len(outs) != 2 {
+			return big.NewInt(0)
 		}
-		if out.Cmp(mid) > 0 {
-			bestAmount = new(big.Int).Set(mid)
-			bestOut = new(big.Int).Set(out)
-			low = mid
-		} else {
-			high = mid
+		return new(big.Int).Sub(outs[1], amount) // 最终 WETH - 初始 WETH
+	}
+
+	// 搜索上限：第一跳池单 tick 可承载量（由池深度决定）
+	hi := s.maxInputBound(ctx, r)
+	if hi == nil || hi.Sign() <= 0 {
+		return &Candidate{ObservedBlock: block, ObservedAt: ts, GrossProfit: big.NewInt(0)}
+	}
+	lo := big.NewInt(1e15) // 0.001 WETH 起
+
+	// 1. 对数网格粗搜（32 点，几何分布 lo..hi）
+	best := big.NewInt(0)
+	bestProfit := big.NewInt(0)
+	loF := float64FromBig(lo)
+	hiF := float64FromBig(hi)
+	ratioF := hiF / loF // 通常 1e3~1e9 内，float64 精度足够做粗搜
+	for i := 0; i < 32; i++ {
+		amtF := loF * powf(ratioF, float64(i)/31)
+		amt := big.NewInt(int64(amtF))
+		if amt.Sign() <= 0 {
+			amt = big.NewInt(1)
+		}
+		profit := profitOf(amt)
+		if profit.Cmp(bestProfit) > 0 {
+			bestProfit = profit
+			best = amt
 		}
 	}
-	gross := new(big.Int).Sub(bestOut, bestAmount)
+
+	// 2. 局部三分搜索（best 邻域 [best/2, best*2]）
+	span := new(big.Int).Set(best)
+	if span.Sign() <= 0 {
+		span = big.NewInt(1e15)
+	}
+	lo3 := new(big.Int).Div(span, big.NewInt(2))
+	hi3 := new(big.Int).Mul(span, big.NewInt(2))
+	if hi3.Cmp(hi) > 0 {
+		hi3 = hi
+	}
+	for i := 0; i < 24; i++ {
+		m1 := new(big.Int).Add(lo3, new(big.Int).Div(new(big.Int).Sub(hi3, lo3), big.NewInt(3)))
+		m2 := new(big.Int).Add(lo3, new(big.Int).Div(new(big.Int).Mul(new(big.Int).Sub(hi3, lo3), big.NewInt(2)), big.NewInt(3)))
+		p1 := profitOf(m1)
+		p2 := profitOf(m2)
+		if p1.Cmp(p2) >= 0 {
+			hi3 = m2
+			if p1.Cmp(bestProfit) > 0 {
+				bestProfit = p1
+				best = m1
+			}
+		} else {
+			lo3 = m1
+			if p2.Cmp(bestProfit) > 0 {
+				bestProfit = p2
+				best = m2
+			}
+		}
+	}
+
 	c := &Candidate{
-		ID:            common.Hash{}.Hex() + "-" + itoa(block),
 		ObservedBlock: block,
 		ObservedAt:    ts,
 		SourceEvent:   "swap",
 		Route:         r.Hops,
 		InputAsset:    s.weth,
-		InputAmount:   bestAmount,
-		GrossProfit:   gross,
+		InputAmount:   best,
+		GrossProfit:   bestProfit,
 		GasEstimate:   big.NewInt(0),
 		SwapCost:      big.NewInt(0),
 		SlippageCost:  big.NewInt(0),
 	}
-	if gross.Sign() > 0 {
-		c.ExpectedNetProfit = new(big.Int).Set(gross)
+	// 记录每跳输入输出（完整复盘）
+	if outs, ok := s.quoteRoute(ctx, r, best); ok && len(outs) == 2 {
+		c.Route[0].AmountIn = best
+		c.Route[0].AmountOut = outs[0]
+		c.Route[1].AmountIn = outs[0]
+		c.Route[1].AmountOut = outs[1]
 	}
 	return c
 }
 
-// quoteRoute 本地报价整条路由。
-func (s *LocalSearcher) quoteRoute(ctx context.Context, r Route, amountIn *big.Int) (*big.Int, bool) {
+// maxInputBound 第一跳池的单 tick 可承载量（深度自适应上限）。
+// 简化：用池 token0 reserve 的 5% 与单 tick 边界输入量取小者。
+func (s *LocalSearcher) maxInputBound(ctx context.Context, r Route) *big.Int {
+	if len(r.Hops) == 0 {
+		return nil
+	}
+	state := s.registry.Pool(r.Hops[0].Pool)
+	if state == nil {
+		return nil
+	}
+	p := state.(*v3.Pool)
+	if p.SqrtPriceX96 == nil || p.SqrtPriceX96.Sign() <= 0 || p.Liquidity == nil || p.Liquidity.Sign() <= 0 {
+		return nil
+	}
+	// token0 reserve = L * 2^96 / Q；token1 reserve = L * Q / 2^96
+	zeroForOne := r.Hops[0].TokenIn == p.Token0
+	reserve := new(big.Int).Lsh(p.Liquidity, 96)
+	if zeroForOne {
+		reserve.Div(reserve, p.SqrtPriceX96)
+	} else {
+		reserve.Mul(reserve, p.SqrtPriceX96)
+		reserve.Rsh(reserve, 96)
+	}
+	bound := new(big.Int).Div(reserve, big.NewInt(20)) // 5% 深度
+	if bound.Sign() <= 0 {
+		return nil
+	}
+	return bound
+}
+
+// quoteRoute 本地报价整条路由，返回每跳输出（含中间跳）。
+func (s *LocalSearcher) quoteRoute(ctx context.Context, r Route, amountIn *big.Int) ([]*big.Int, bool) {
+	outs := make([]*big.Int, 0, len(r.Hops))
 	cur := amountIn
-	for i, h := range r.Hops {
+	for _, h := range r.Hops {
 		state := s.registry.Pool(h.Pool)
 		if state == nil {
 			return nil, false
 		}
 		p := state.(*v3.Pool)
+		if !p.BitmapLoaded(p.WordPos()) {
+			if err := s.v3.LoadBitmapWord(ctx, p, p.WordPos()); err != nil {
+				return nil, false
+			}
+		}
 		out, err := s.v3.QuoteExactIn(p, h.TokenIn, cur)
 		if err != nil || out.Sign() <= 0 {
 			return nil, false
 		}
+		outs = append(outs, out)
 		cur = out
-		_ = i
 	}
-	return cur, true
+	return outs, true
 }
 
 func midToken(ref dex.PoolRef) common.Address {
@@ -136,6 +215,13 @@ func otherSide(ref dex.PoolRef, tokenIn common.Address) common.Address {
 	return ref.Token1
 }
 
-func itoa(v uint64) string {
-	return new(big.Int).SetUint64(v).String()
+// 数学辅助（避免引入 math 包冲突）
+func powf(base, exp float64) float64 {
+	// base^exp = e^(exp*ln(base))；ln/exp 用标准库 math
+	return math.Pow(base, exp)
+}
+
+func float64FromBig(b *big.Int) float64 {
+	f, _ := new(big.Float).SetInt(b).Float64()
+	return f
 }

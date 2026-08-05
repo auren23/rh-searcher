@@ -14,13 +14,14 @@ import (
 var (
 	// ErrTickCrossed 输入量会跨过下一 initialized tick（MVP 严格单 tick 模式）。
 	ErrTickCrossed = errors.New("quote crosses initialized tick")
-	// ErrStateIncomplete 池状态不完整（无 slot0/流动性），无法报价。
+	// ErrStateIncomplete 池状态不完整（无 slot0/流动性/tickSpacing/bitmap 未知），无法报价。
 	ErrStateIncomplete = errors.New("pool state incomplete")
 )
 
-// Tick 一个 initialized tick 的流动性净变化。
+// Tick 一个 initialized tick 的流动性。
 type Tick struct {
-	LiquidityNet *big.Int // 跨过该 tick（向更高价）时流动性变化
+	LiquidityGross *big.Int // 该 tick 的总流动性（跨零时才翻转 initialized 位）
+	LiquidityNet   *big.Int // 跨过该 tick（向更高价）时流动性变化
 }
 
 // Pool 内存中的 V3 池状态。
@@ -35,18 +36,20 @@ type Pool struct {
 	Liquidity    *big.Int
 	SqrtPriceX96 *big.Int
 
-	ticks         map[int]*Tick      // tick -> net liquidity（事件流增量维护）
-	bitmap        map[int64]*big.Int // wordPos -> 256bit 位图
+	ticks        map[int]*Tick     // tick -> 流动性数据
+	bitmap       map[int64]*big.Int // wordPos -> 256bit 位图（仅已加载的 word）
+	bitmapLoaded map[int64]bool    // 区分"未加载"与"真实为 0"；未加载的 word 不得当作空
 	ObservedBlock uint64
 }
 
 // NewPoolFromMeta 从持久化元数据构造池（ticks/bitmap 惰性初始化）。
-func NewPoolFromMeta(address common.Address, exchange string, token0, token1 common.Address, fee uint32) *Pool {
+func NewPoolFromMeta(address common.Address, exchange string, token0, token1 common.Address, fee uint32, tickSpacing int) *Pool {
 	return &Pool{
 		Address: address, Exchange: exchange,
-		Token0: token0, Token1: token1, Fee: fee,
-		ticks:  make(map[int]*Tick),
-		bitmap: make(map[int64]*big.Int),
+		Token0: token0, Token1: token1, Fee: fee, TickSpacing: tickSpacing,
+		ticks:        make(map[int]*Tick),
+		bitmap:       make(map[int64]*big.Int),
+		bitmapLoaded: make(map[int64]bool),
 	}
 }
 
@@ -65,13 +68,33 @@ func (p *Pool) clone() *Pool {
 	np.SqrtPriceX96 = new(big.Int).Set(p.SqrtPriceX96)
 	np.ticks = make(map[int]*Tick, len(p.ticks))
 	for k, v := range p.ticks {
-		np.ticks[k] = &Tick{LiquidityNet: new(big.Int).Set(v.LiquidityNet)}
+		np.ticks[k] = &Tick{
+			LiquidityGross: new(big.Int).Set(v.LiquidityGross),
+			LiquidityNet:   new(big.Int).Set(v.LiquidityNet),
+		}
 	}
 	np.bitmap = make(map[int64]*big.Int, len(p.bitmap))
 	for k, v := range p.bitmap {
 		np.bitmap[k] = new(big.Int).Set(v)
 	}
+	np.bitmapLoaded = make(map[int64]bool, len(p.bitmapLoaded))
+	for k, v := range p.bitmapLoaded {
+		np.bitmapLoaded[k] = v
+	}
 	return &np
+}
+
+// WordPos 当前 tick 所在 bitmap word。
+func (p *Pool) WordPos() int64 {
+	return int64(p.compressedTick(p.Tick) >> 8)
+}
+
+// BitmapLoaded word 是否已从链上加载（区分未知与真实为 0）。
+func (p *Pool) BitmapLoaded(wordPos int64) bool {
+	if p.bitmapLoaded == nil {
+		return false
+	}
+	return p.bitmapLoaded[wordPos]
 }
 
 // compressedTick tick 按 spacing 压缩（向下取整）。
@@ -83,38 +106,63 @@ func (p *Pool) compressedTick(tick int) int {
 	return c
 }
 
-// flipTick 翻转位图（与官方 TickBitmap.flipTick 一致，纯 XOR）。
-// 注意：事件流中途接入时 bitmap 可能错位（历史 flip 缺失）；QuoteExactIn 的
-// spacing 边界兜底保证不会因此产生越界报价。tick 的 net liquidity 单独累计。
-func (p *Pool) flipTick(tick int) {
+// updateTick 更新 tick 的 gross/net 流动性；gross 跨零边界时翻转 initialized 位。
+// 与官方 Tick.update + TickBitmap.flipTick 语义一致。
+func (p *Pool) updateTick(tick int, delta *big.Int) {
+	t := p.ticks[tick]
+	if t == nil {
+		t = &Tick{LiquidityGross: new(big.Int), LiquidityNet: new(big.Int)}
+		p.ticks[tick] = t
+	}
+	grossBefore := new(big.Int).Set(t.LiquidityGross)
+	t.LiquidityGross.Add(t.LiquidityGross, delta)
+	if grossBefore.Sign() == 0 && t.LiquidityGross.Sign() != 0 {
+		// 0 → 非0：打开 initialized
+		p.setBit(tick, true)
+	} else if grossBefore.Sign() != 0 && t.LiquidityGross.Sign() == 0 {
+		// 非0 → 0：关闭 initialized
+		p.setBit(tick, false)
+	}
+	t.LiquidityNet.Add(t.LiquidityNet, delta)
+}
+
+// setBit 设置/清除 bit（不影响 bitmapLoaded：只对已加载 word 操作）。
+func (p *Pool) setBit(tick int, on bool) {
 	compressed := p.compressedTick(tick)
 	wordPos := int64(compressed >> 8)
 	bitPos := uint(compressed & 0xff)
-	mask := new(big.Int).Lsh(big.NewInt(1), bitPos)
+	if !p.bitmapLoaded[wordPos] {
+		return // 该 word 未加载：事件流无法重建历史位图，跳过（按需加载兜底）
+	}
 	word := p.bitmap[wordPos]
 	if word == nil {
 		word = new(big.Int)
 		p.bitmap[wordPos] = word
 	}
-	word.Xor(word, mask)
-}
-
-// addLiquidityNet 更新 tick 的 net liquidity（链上 Tick.update 的 liquidityNet 部分）。
-func (p *Pool) addLiquidityNet(tick int, delta *big.Int) {
-	t := p.ticks[tick]
-	if t == nil {
-		t = &Tick{LiquidityNet: new(big.Int)}
-		p.ticks[tick] = t
+	mask := new(big.Int).Lsh(big.NewInt(1), bitPos)
+	if on {
+		word.Or(word, mask)
+	} else {
+		word.AndNot(word, mask)
 	}
-	t.LiquidityNet.Add(t.LiquidityNet, delta)
 }
 
 // nextInitializedTick 找当前 tick 相邻的 initialized tick（单 word 内，与官方一致）。
-// lte=true 向下找；false 向上找。未找到时返回 spacing 区间边界（保守兜底）。
+// lte=true 向下找；false 向上找。
+// 返回值： (tick, found)。相邻 word 未加载时返回 (word 边界 tick, false)，
+// 由调用方决定：found=false 时只能安全使用 spacing 区间边界（仍需经 QuoteExactIn 检查）。
 func (p *Pool) nextInitializedTick(tick int, lte bool) (int, bool) {
 	compressed := p.compressedTick(tick)
 	wordPos := int64(compressed >> 8)
 	bitPos := uint(compressed & 0xff)
+	if !p.bitmapLoaded[wordPos] {
+		// 未加载：保守返回 spacing 区间边界（不得当作真实 initialized tick）
+		lo, hi := TickSpacingBounds(tick, p.TickSpacing)
+		if lte {
+			return lo, false
+		}
+		return hi, false
+	}
 	word := p.bitmap[wordPos]
 	if word == nil {
 		word = new(big.Int)
@@ -148,19 +196,14 @@ func (p *Pool) ApplySwap(log types.Log, sqrtPriceX96, liquidity *big.Int, tick i
 	p.ObservedBlock = log.BlockNumber
 }
 
-// ApplyMintBurn 应用 Mint/Burn：维护 tick net liquidity；仅当前 tick 在 [tickLower, tickUpper) 内时改 active liquidity。
-// 返回是否需要更新 active liquidity（由调用方决定是否读链上确认）。
+// ApplyMintBurn 应用 Mint/Burn：更新 tick gross/net；active liquidity 仅当前 tick 在区间内时变化。
 func (p *Pool) ApplyMintBurn(log types.Log, tickLower, tickUpper int, amount *big.Int, isMint bool) {
 	delta := new(big.Int).Set(amount)
 	if !isMint {
 		delta.Neg(delta)
 	}
-	p.flipTick(tickLower)
-	p.flipTick(tickUpper)
-	p.addLiquidityNet(tickLower, delta)
-	p.addLiquidityNet(tickUpper, new(big.Int).Neg(delta))
-	// active liquidity 仅在当前 tick 位于 [tickLower, tickUpper) 内时变化
-	// ponytail: 事件流中 tick 是处理时的已知值（可能略滞后于事件块），shadow 阶段可接受
+	p.updateTick(tickLower, delta)
+	p.updateTick(tickUpper, new(big.Int).Neg(delta))
 	if p.Tick >= tickLower && p.Tick < tickUpper {
 		if p.Liquidity == nil {
 			p.Liquidity = new(big.Int)

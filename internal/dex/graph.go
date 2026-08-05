@@ -26,36 +26,42 @@ func (g *Graph) AddPool(p Pool, addr common.Address) {
 }
 
 // FindCycles 找从 start 出发、经过 startPool 的 start→TOKEN→start 循环（两跳）。
-// 返回的 Route 按执行顺序排列，每条恰好包含 startPool 一跳。
+// 触发池可以出现在第一跳或第二跳（两个方向都评估）。
 func (g *Graph) FindCycles(start common.Address, startPool common.Address) []Route {
 	out := []Route{}
 	seen := make(map[string]struct{})
-	for _, r0 := range g.adj[start] {
-		if r0.Address != startPool {
-			continue // 必须包含触发池
+	add := func(r0, r1 PoolRef) {
+		if r0.Address == r1.Address {
+			return // 原池折返不算
 		}
+		mid := r0.other()
+		if mid == start || r1.other() != start {
+			return
+		}
+		key := r0.Address.Hex() + "/" + r1.Address.Hex()
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, Route{
+			TokenIn:  start,
+			TokenOut: start,
+			Pools:    []PoolRef{r0, r1},
+			Path:     []common.Address{start, mid, start},
+		})
+	}
+	for _, r0 := range g.adj[start] {
 		mid := r0.other()
 		if mid == start {
 			continue
 		}
 		for _, r1 := range g.adj[mid] {
-			if r1.Address == startPool {
-				continue // 原池折返不算
-			}
 			if r1.other() != start {
-				continue // 第二跳必须回到 WETH
-			}
-			key := r0.Address.Hex() + "/" + r1.Address.Hex()
-			if _, dup := seen[key]; dup {
 				continue
 			}
-			seen[key] = struct{}{}
-			out = append(out, Route{
-				TokenIn:  start,
-				TokenOut: start,
-				Pools:    []PoolRef{r0, r1},
-				Path:     []common.Address{start, mid, start},
-			})
+			if r0.Address == startPool || r1.Address == startPool {
+				add(r0, r1) // 触发池在第一跳或第二跳
+			}
 		}
 	}
 	return out

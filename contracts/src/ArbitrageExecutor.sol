@@ -116,11 +116,10 @@ contract ArbitrageExecutor is BaseExecutor {
             _hops.push(hops[i]);
         }
 
-        // 逐跳执行：approve 本跳输入 token 给池，然后调池 swap
+        // 逐跳执行：调池 swap（回调中主动付款，无需 approve）
         uint256 current = amountIn;
         for (uint256 i = 0; i < _hops.length; i++) {
             address tokenIn = _hops[i].tokenIn;
-            IERC20(tokenIn).approve(_hops[i].pool, current);
             // 方向：tokenIn 若为池 token0 → zeroForOne=true
             bool zeroForOne;
             (address t0, address t1) = poolTokens(_hops[i].pool);
@@ -128,7 +127,8 @@ contract ArbitrageExecutor is BaseExecutor {
             if (tokenIn != t0 && tokenIn != t1) revert PoolNotWhitelisted(_hops[i].pool);
 
             uint160 limit = zeroForOne ? uint160(MIN_SQRT_RATIO + 1) : uint160(MAX_SQRT_RATIO - 1);
-            int256 amountSpecified = zeroForOne ? int256(uint256(current)) : -int256(uint256(current));
+            // V3 语义：amountSpecified > 0 = exact input（与方向无关），方向只由 zeroForOne 决定
+            int256 amountSpecified = int256(uint256(current));
             uint256 outBefore = IERC20(_hops[i].tokenOut).balanceOf(address(this));
             IUniswapV3Pool(_hops[i].pool).swap(address(this), zeroForOne, amountSpecified, limit, abi.encode(i));
             // 本跳输出 = 接收后余额差（不能用绝对余额：可能叠加历史持仓）
@@ -146,18 +146,27 @@ contract ArbitrageExecutor is BaseExecutor {
         delete _hops;
     }
 
-    /// @dev V3 池回调：验证调用者是期望池 + factory 归属，然后支付。
+    /// @dev V3 池回调：验证调用者是期望池 + factory 归属，然后主动支付正的 delta。
+    ///      真实 V3 语义：池在回调返回后检查自身余额增加（balanceAfter >= balanceBefore + delta），
+    ///      因此回调方必须在这里把 token 转给池。
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
         if (_locked == 0) revert Reentrancy();
         (uint256 hopIndex) = abi.decode(data, (uint256));
+        if (hopIndex >= _hops.length) revert InvalidCallback(msg.sender);
         Hop memory h = _hops[hopIndex];
 
         // 双重验证：msg.sender 是期望池 + factory.getPool 确认归属
         if (msg.sender != h.pool) revert InvalidCallback(msg.sender);
         if (factory.getPool(h.tokenIn, h.tokenOut, h.fee) != h.pool) revert PoolNotWhitelisted(msg.sender);
 
-        // 付款由池在回调后 transferFrom 拉取（V3 协议）；回调方只需在 executeV3Cycle
-        // 循环中 approve。这里不做 transfer，避免与池的拉款双重扣款。
+        // 以池的 token0/token1 为准付款（正 delta 的一方是池应收的）
+        (address token0, address token1) = poolTokens(msg.sender);
+        if (amount0Delta > 0) {
+            require(IERC20(token0).transfer(msg.sender, uint256(amount0Delta)), "pay0-failed");
+        }
+        if (amount1Delta > 0) {
+            require(IERC20(token1).transfer(msg.sender, uint256(amount1Delta)), "pay1-failed");
+        }
     }
 
     /// @dev 读取池的 token0/token1（回调方向判定用）。

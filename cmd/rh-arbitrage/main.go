@@ -21,6 +21,7 @@ import (
 	"github.com/auren23/rh-searcher/internal/config"
 	"github.com/auren23/rh-searcher/internal/dex"
 	"github.com/auren23/rh-searcher/internal/dex/v3"
+	"github.com/auren23/rh-searcher/internal/simulation"
 	"github.com/auren23/rh-searcher/internal/storage"
 	"github.com/auren23/rh-searcher/internal/telemetry"
 )
@@ -99,9 +100,43 @@ func main() {
 			os.Exit(1)
 		}
 		defer sink.Close()
+		// 从数据库恢复全部池（重建 Registry/Graph），再补扫增量
+		if _, err := storage.RestorePools(ctx, sink, reg, graph); err != nil {
+			slog.Error("restore pools", "err", err)
+			os.Exit(1)
+		}
+		// 旧数据 tick_spacing 为 0：补查
+		for _, st := range reg.AllPools() {
+			pool := st.(*v3.Pool)
+			if pool.TickSpacing <= 0 {
+				fresh, err := adapter.PoolByAddress(ctx, pool.Address)
+				if err == nil {
+					reg.UpsertPool(v3.State(fresh))
+					graph.AddPool(fresh.Pool(), fresh.Address)
+				} else {
+					slog.Warn("backfill tickSpacing failed", "pool", pool.Address.Hex(), "err", err)
+				}
+			}
+		}
 	}
 
 	weth := common.HexToAddress(cfg.Chain.WETH)
+
+	// 链上模拟器：真实 executeV3Cycle calldata + eth_call（sim RPC 组）
+	var evaluator arbitrage.Evaluator = arbitrage.NewLocalEvaluator()
+	if cfg.Executor.Contract != "" && cfg.Executor.Wallet != "" && len(cfg.RPC.Groups.Sim) > 0 {
+		simCli, dialErr := ethclient.Dial(cfg.RPC.Groups.Sim[0])
+		if dialErr == nil {
+			sim := simulation.NewExecutorSimulator(simCli,
+				common.HexToAddress(cfg.Executor.Contract),
+				common.HexToAddress(cfg.Executor.Wallet), 5_000_000)
+			evaluator = simulation.NewSimulationEvaluator(sim, cfg.Chain.ID, big.NewInt(2e14))
+			slog.Info("simulation evaluator enabled", "contract", cfg.Executor.Contract)
+		} else {
+			slog.Warn("sim rpc dial failed, falling back to local evaluator", "err", dialErr)
+		}
+	}
+
 	engine := arbitrage.NewEngine(
 		arbitrage.Config{
 			ChainID:         cfg.Chain.ID,
@@ -113,13 +148,17 @@ func main() {
 		},
 		sink,
 		arbitrage.NewLocalSearcher(graph, reg, adapter, weth),
-		arbitrage.NewLocalEvaluator(),
+		evaluator,
 		arbitrage.NewExecutor(),
 	)
 
-	// 订阅 Swap 事件（轮询源内部处理重连/补块）
+	// 订阅 Swap（触发套利）+ Mint/Burn（仅更新状态）
 	swapTopic := v3.SwapTopic()
-	logs, logErrs := src.SubscribeLogs(ctx, ethereum.FilterQuery{Topics: [][]common.Hash{{swapTopic}}})
+	mintTopic := common.HexToHash("0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde")
+	burnTopic := common.HexToHash("0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c")
+	logs, logErrs := src.SubscribeLogs(ctx, ethereum.FilterQuery{
+		Topics: [][]common.Hash{{swapTopic, mintTopic, burnTopic}},
+	})
 	go func() {
 		for err := range logErrs {
 			slog.Warn("log subscription error", "err", err)
@@ -134,6 +173,8 @@ func main() {
 			slog.Info("arbitrage stopped")
 			return
 		case l := <-logs:
+			// Mint/Burn 只更新池状态，不触发套利评估
+			isMintBurn := l.Topics[0] == mintTopic || l.Topics[0] == burnTopic
 			state := reg.Pool(l.Address)
 			if state == nil {
 				// 未发现的池（如刚创建）：从链上惰性初始化
@@ -159,6 +200,9 @@ func main() {
 				apply()
 			}
 			reg.UpsertPool(state)
+			if isMintBurn {
+				continue // 状态更新完成，不触发套利
+			}
 			engine.OnSwap(ctx, arbitrage.SwapEvent{
 				Pool:        l.Address,
 				BlockNumber: l.BlockNumber,
