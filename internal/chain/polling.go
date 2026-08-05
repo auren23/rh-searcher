@@ -86,7 +86,17 @@ func (p *PollingSource) SubscribeLogs(ctx context.Context, query ethereum.Filter
 				}
 				start := last + 1
 				if !haveLast {
+					// 首次：尊重调用方传入的 FromBlock（启动前记录的 head+1 可以补回窗口期日志）；
+					// 未指定 FromBlock 时才从当前链头开始
 					start = head
+					if query.FromBlock != nil && query.FromBlock.Sign() > 0 {
+						fb := query.FromBlock.Uint64()
+						if fb > head {
+							start = head // 未来高度（异常输入）保守处理
+						} else {
+							start = fb
+						}
+					}
 					haveLast = true
 				}
 				if start > head {

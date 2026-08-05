@@ -116,6 +116,18 @@ func LoadMerged(paths ...string) (*Config, error) {
 		if cfg.Executor.Contract != "" || cfg.Executor.Wallet != "" {
 			merged.Executor = cfg.Executor
 		}
+		if cfg.Arbitrage.MaxInputWei != "" {
+			merged.Arbitrage.MaxInputWei = cfg.Arbitrage.MaxInputWei
+		}
+		if cfg.Arbitrage.MinProfitWei != "" {
+			merged.Arbitrage.MinProfitWei = cfg.Arbitrage.MinProfitWei
+		}
+		if cfg.Arbitrage.SafetyMarginWei != "" {
+			merged.Arbitrage.SafetyMarginWei = cfg.Arbitrage.SafetyMarginWei
+		}
+		if cfg.Arbitrage.SimulationTopK > 0 {
+			merged.Arbitrage.SimulationTopK = cfg.Arbitrage.SimulationTopK
+		}
 	}
 	return merged, nil
 }

@@ -80,24 +80,12 @@ func (s *LocalSearcher) Optimize(ctx context.Context, r Route, block uint64, ts 
 	}
 
 	// 搜索上限：min(第一池深度, 第二池深度, 配置上限, 合约余额)
-	hi := s.maxInputBound(ctx, r)
-	if hi == nil || hi.Sign() <= 0 {
+	lo, hi, err := s.computeBounds(ctx, r)
+	if err != nil {
 		c := emptyCandidate(r, block, ts, s.weth)
-		c.RejectReason = "no depth bound"
+		c.RejectReason = err.Error()
 		return c
 	}
-	if s.maxInputWei != nil && s.maxInputWei.Sign() > 0 && hi.Cmp(s.maxInputWei) > 0 {
-		hi = new(big.Int).Set(s.maxInputWei)
-	}
-	if s.contractBal != nil && s.contractBal.Sign() >= 0 && hi.Cmp(s.contractBal) > 0 {
-		hi = new(big.Int).Set(s.contractBal)
-	}
-	if hi.Sign() <= 0 {
-		c := emptyCandidate(r, block, ts, s.weth)
-		c.RejectReason = "funding bound zero"
-		return c
-	}
-	lo := big.NewInt(1e15) // 0.001 WETH 起
 
 	// 1. 对数网格粗搜（32 点，几何分布 lo..hi）
 	//    纯整数等比网格：ratio^(i/31) 用 big.Float 计算后 Int(nil) 取整（不走 int64）
@@ -154,7 +142,7 @@ func (s *LocalSearcher) Optimize(ctx context.Context, r Route, block uint64, ts 
 		ObservedBlock: block,
 		ObservedAt:    ts,
 		SourceEvent:   "swap",
-		Route:         r.Hops,
+		Route:         cloneHops(r.Hops),
 		InputAsset:    s.weth,
 		InputAmount:   best,
 		GrossProfit:   bestProfit,
@@ -191,12 +179,17 @@ func (s *LocalSearcher) prepareRoute(ctx context.Context, r Route) error {
 }
 
 // TopKOptimize 本地毛利最高的 k 个输入量（供逐个 eth_call 后选优）。
+// 所有采样金额 clamp 到 [lo, hi]（资金/深度边界）并去重。
 func (s *LocalSearcher) TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate {
 	if k <= 0 {
 		k = 1
 	}
 	base := s.Optimize(ctx, r, block, ts)
 	if base.RejectReason != "" || base.InputAmount.Sign() <= 0 {
+		return []*Candidate{base}
+	}
+	lo, hi, err := s.computeBounds(ctx, r)
+	if err != nil {
 		return []*Candidate{base}
 	}
 	// 在最优量附近取 k 个采样点（最优 ± 网格邻域）
@@ -215,23 +208,63 @@ func (s *LocalSearcher) TopKOptimize(ctx context.Context, r Route, k int, block 
 		amounts = append(amounts, a)
 	}
 	out := make([]*Candidate, 0, k)
+	seen := make(map[string]struct{})
 	for _, a := range amounts {
+		// clamp 到资金/深度边界并去重（失败样本也必须保留真实 InputAmount，避免 ID 冲突）
+		amt := clampAmount(a, lo, hi)
+		if amt.Sign() <= 0 {
+			continue
+		}
+		key := amt.String()
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
 		c := emptyCandidate(r, block, ts, s.weth)
-		outs, ok := s.quoteRoute(ctx, r, a)
+		c.InputAmount = new(big.Int).Set(amt)
+		outs, ok := s.quoteRoute(ctx, r, amt)
 		if !ok || len(outs) != 2 {
 			c.RejectReason = "route quote failed"
 			out = append(out, c)
 			continue
 		}
-		c.InputAmount = a
-		c.GrossProfit = new(big.Int).Sub(outs[1], a)
-		c.Route[0].AmountIn = a
+		c.GrossProfit = new(big.Int).Sub(outs[1], amt)
+		c.Route[0].AmountIn = new(big.Int).Set(amt)
 		c.Route[0].AmountOut = outs[0]
 		c.Route[1].AmountIn = outs[0]
 		c.Route[1].AmountOut = outs[1]
 		out = append(out, c)
 	}
 	return out
+}
+
+// clampAmount 限制到 [lo, hi]。
+func clampAmount(a, lo, hi *big.Int) *big.Int {
+	if a.Cmp(lo) < 0 {
+		return new(big.Int).Set(lo)
+	}
+	if a.Cmp(hi) > 0 {
+		return new(big.Int).Set(hi)
+	}
+	return new(big.Int).Set(a)
+}
+
+// computeBounds 搜索边界：lo=0.001 WETH，hi=min(池深度, 配置上限, 合约余额)。
+func (s *LocalSearcher) computeBounds(ctx context.Context, r Route) (*big.Int, *big.Int, error) {
+	hi := s.maxInputBound(ctx, r)
+	if hi == nil || hi.Sign() <= 0 {
+		return nil, nil, fmt.Errorf("no depth bound")
+	}
+	if s.maxInputWei != nil && s.maxInputWei.Sign() > 0 && hi.Cmp(s.maxInputWei) > 0 {
+		hi = new(big.Int).Set(s.maxInputWei)
+	}
+	if s.contractBal != nil && s.contractBal.Sign() >= 0 && hi.Cmp(s.contractBal) > 0 {
+		hi = new(big.Int).Set(s.contractBal)
+	}
+	if hi.Sign() <= 0 {
+		return nil, nil, fmt.Errorf("funding bound zero")
+	}
+	return big.NewInt(1e15), hi, nil
 }
 
 // maxInputBound 第一跳池的单 tick 可承载量（深度自适应上限）。
@@ -319,12 +352,27 @@ func float64FromBig(b *big.Int) float64 {
 	return f
 }
 
+// cloneHops 深拷贝路由（Top-K 候选共享同一底层数组会互相覆盖每跳金额）。
+func cloneHops(src []Hop) []Hop {
+	dst := make([]Hop, len(src))
+	for i, h := range src {
+		dst[i] = h
+		if h.AmountIn != nil {
+			dst[i].AmountIn = new(big.Int).Set(h.AmountIn)
+		}
+		if h.AmountOut != nil {
+			dst[i].AmountOut = new(big.Int).Set(h.AmountOut)
+		}
+	}
+	return dst
+}
+
 // emptyCandidate 字段完整的空候选（无论搜索成败都不允许 nil 字段进入下游）。
 func emptyCandidate(r Route, block uint64, ts int64, weth common.Address) *Candidate {
 	return &Candidate{
 		ObservedBlock:    block,
 		ObservedAt:       ts,
-		Route:            r.Hops,
+		Route:            cloneHops(r.Hops),
 		RouteJSON:        MarshalRoute(r.Hops),
 		InputAsset:       weth,
 		InputAmount:      new(big.Int),

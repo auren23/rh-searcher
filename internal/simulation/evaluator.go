@@ -54,6 +54,12 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 	gasCostWei := new(big.Int).Mul(new(big.Int).SetUint64(res.GasUsed), res.GasPriceWei)
 	c.GasCostWei = new(big.Int).Set(gasCostWei)
 	c.CalldataHash = res.CalldataHash
+	c.SimulationBlock = res.SimulationBlock
+	// L1 data 费用仅记录（若 totalGasEstimate×baseFee 已含 L1 部分则不重复扣费；
+	// 当前 gasUsed×gasPrice 近似视为总费用）
+	if res.L1GasWei != nil && res.L1GasWei.Sign() > 0 {
+		slog.Debug("l1 component", "l1_fee_wei", res.L1GasWei.String(), "calldata_hash", res.CalldataHash)
+	}
 	net := new(big.Int).Sub(res.Profit, gasCostWei)
 	net.Sub(net, e.safetyMarginWei)
 	c.ExpectedNetProfit = net

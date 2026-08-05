@@ -110,8 +110,19 @@ func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 			c.BlockHash = ev.BlockHash
 			c.TxHash = ev.TxHash
 			c.LogIndex = ev.LogIndex
-			c.RouteJSON = MarshalRoute(r.Hops)
+			c.RouteJSON = MarshalRoute(c.Route) // 用候选自己的路由（含每跳金额）
 			c.ID = CandidateID(e.cfg.ChainID, ev.BlockHash, ev.TxHash, ev.LogIndex, c.RouteJSON, c.InputAmount)
+			if c.RejectReason != "" {
+				// searcher 已判定（state-incomplete / route quote failed）：不再交给模拟器覆盖
+				c.Decision = "local_rejected"
+				c.ExpectedNetProfit = new(big.Int)
+				if e.sink != nil {
+					if err := e.sink.SaveCandidate(ctx, c); err != nil {
+						slog.Error("candidate persist failed", "err", err, "id", c.ID)
+					}
+				}
+				continue
+			}
 			verdict, reason, profit := e.evaluator.Evaluate(ctx, c, e.cfg)
 			c.Decision = verdict
 			c.RejectReason = reason

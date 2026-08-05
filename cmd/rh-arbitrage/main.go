@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -149,8 +150,9 @@ func main() {
 	sim := simulation.NewExecutorSimulator(simCli, contractAddr,
 		common.HexToAddress(cfg.Executor.Wallet), 5_000_000)
 
-	// P0-5: Executor 启动预检（wallet/weth/factory/paused/余额）
-	if err := preflightExecutor(ctx, simCli, contractAddr, cfg); err != nil {
+	// P0-5: Executor 启动预检（wallet/weth/factory/paused/余额）→ 余额用于资金限制
+	contractBal, err := preflightExecutor(ctx, simCli, contractAddr, cfg)
+	if err != nil {
 		slog.Error("executor preflight failed", "err", err)
 		os.Exit(1)
 	}
@@ -176,12 +178,13 @@ func main() {
 		"min_profit_wei", minProfit.String(), "safety_margin_wei", safetyMargin.String(), "top_k", topK)
 
 	searcher := arbitrage.NewLocalSearcher(graph, reg, adapter, weth)
-	// 资金限制：max_input_wei 与执行合约当前 WETH 余额（读一次，运行中由模拟结果反映）
-	var contractBal *big.Int
+	// 资金限制：max_input_wei 与执行合约当前 WETH 余额（预检已读取）
 	if cfg.Arbitrage.MaxInputWei != "" {
 		if v, ok := new(big.Int).SetString(cfg.Arbitrage.MaxInputWei, 10); ok {
 			searcher.SetFunding(v, contractBal)
 		}
+	} else {
+		searcher.SetFunding(nil, contractBal)
 	}
 	if cfg.Mode.Run == "live" {
 		slog.Error("live mode not implemented (signer/nonce/broadcaster/pnl not wired)")
@@ -203,12 +206,19 @@ func main() {
 		arbitrage.NewExecutor(),
 	)
 
-	// 订阅 Swap（触发套利）+ Mint/Burn（仅更新状态）
+	// 订阅 Swap（触发套利）+ Mint/Burn（仅更新状态）。
+	// FromBlock = 启动时链头 + 1：初始化期间发生的 Swap 会被补回（封闭漏日志窗口）
 	swapTopic := v3.SwapTopic()
 	mintTopic := common.HexToHash("0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde")
 	burnTopic := common.HexToHash("0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c")
+	startHead, err := cli.BlockNumber(ctx)
+	if err != nil {
+		slog.Error("read chain head for log subscription", "err", err)
+		os.Exit(1)
+	}
 	logs, logErrs := src.SubscribeLogs(ctx, ethereum.FilterQuery{
-		Topics: [][]common.Hash{{swapTopic, mintTopic, burnTopic}},
+		FromBlock: big.NewInt(int64(startHead) + 1),
+		Topics:    [][]common.Hash{{swapTopic, mintTopic, burnTopic}},
 	})
 	go func() {
 		for err := range logErrs {
@@ -276,7 +286,8 @@ func main() {
 }
 
 // preflightExecutor 校验执行合约配置与链上状态一致（防错地址导致全部模拟 revert）。
-func preflightExecutor(ctx context.Context, cli *ethclient.Client, contract common.Address, cfg *config.Config) error {
+// 返回执行合约的 WETH 余额（资金限制的一部分）。
+func preflightExecutor(ctx context.Context, cli *ethclient.Client, contract common.Address, cfg *config.Config) (*big.Int, error) {
 	read := func(to common.Address, sig string) ([]byte, error) {
 		return cli.CallContract(ctx, ethereum.CallMsg{To: &to, Data: crypto.Keccak256([]byte(sig))[:4]}, nil)
 	}
@@ -288,37 +299,48 @@ func preflightExecutor(ctx context.Context, cli *ethclient.Client, contract comm
 	}
 
 	if b, err := read(contract, "executor()"); err != nil {
-		return fmt.Errorf("executor(): %w", err)
-	} else if a, _ := addrOf(b); a.Hex() != cfg.Executor.Wallet {
-		return fmt.Errorf("executor()=%s want %s", a.Hex(), cfg.Executor.Wallet)
+		return nil, fmt.Errorf("executor(): %w", err)
+	} else if a, _ := addrOf(b); a != common.HexToAddress(cfg.Executor.Wallet) {
+		return nil, fmt.Errorf("executor()=%s want %s", a.Hex(), cfg.Executor.Wallet)
 	}
 	if b, err := read(contract, "weth()"); err != nil {
-		return fmt.Errorf("weth(): %w", err)
-	} else if a, _ := addrOf(b); a.Hex() != cfg.Chain.WETH {
-		return fmt.Errorf("weth()=%s want %s", a.Hex(), cfg.Chain.WETH)
+		return nil, fmt.Errorf("weth(): %w", err)
+	} else if a, _ := addrOf(b); a != common.HexToAddress(cfg.Chain.WETH) {
+		return nil, fmt.Errorf("weth()=%s want %s", a.Hex(), cfg.Chain.WETH)
 	}
 	if b, err := read(contract, "factory()"); err != nil {
-		return fmt.Errorf("factory(): %w", err)
-	} else if a, _ := addrOf(b); a.Hex() != cfg.Dexes.V3[0].Factory {
-		return fmt.Errorf("factory()=%s want %s", a.Hex(), cfg.Dexes.V3[0].Factory)
+		return nil, fmt.Errorf("factory(): %w", err)
+	} else if a, _ := addrOf(b); a != common.HexToAddress(cfg.Dexes.V3[0].Factory) {
+		return nil, fmt.Errorf("factory()=%s want %s", a.Hex(), cfg.Dexes.V3[0].Factory)
 	}
 	if b, err := read(contract, "paused()"); err != nil {
-		return fmt.Errorf("paused(): %w", err)
+		return nil, fmt.Errorf("paused(): %w", err)
 	} else if len(b) >= 32 && b[31] != 0 {
-		return fmt.Errorf("executor is paused")
+		return nil, fmt.Errorf("executor is paused")
 	}
-	// 合约 WETH 余额（资金限制的一部分）
+	// 合约 WETH 余额：balanceOf(address) 需要 32 字节参数（ABI 左补零）
+	addressType, err := abi.NewType("address", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	argEnc, err := abi.Arguments{{Type: addressType}}.Pack(contract)
+	if err != nil {
+		return nil, err
+	}
 	weth := wethAddr(cfg)
 	bal, err := cli.CallContract(ctx, ethereum.CallMsg{
 		To:   &weth,
-		Data: append(crypto.Keccak256([]byte("balanceOf(address)"))[:4], contract.Bytes()...),
+		Data: append(crypto.Keccak256([]byte("balanceOf(address)"))[:4], argEnc...),
 	}, nil)
-	if err != nil || len(bal) < 32 || new(big.Int).SetBytes(bal[:32]).Sign() <= 0 {
-		return fmt.Errorf("executor WETH balance is zero (fund it before shadow)")
+	if err != nil || len(bal) < 32 {
+		return nil, fmt.Errorf("weth balanceOf: %v", err)
 	}
-	slog.Info("executor preflight ok", "contract", contract.Hex(),
-		"weth_balance_wei", new(big.Int).SetBytes(bal[:32]).String())
-	return nil
+	balance := new(big.Int).SetBytes(bal[:32])
+	if balance.Sign() <= 0 {
+		return nil, fmt.Errorf("executor WETH balance is zero (fund it before shadow)")
+	}
+	slog.Info("executor preflight ok", "contract", contract.Hex(), "weth_balance_wei", balance.String())
+	return balance, nil
 }
 
 func wethAddr(cfg *config.Config) common.Address { return common.HexToAddress(cfg.Chain.WETH) }

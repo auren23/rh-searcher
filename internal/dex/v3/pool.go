@@ -178,14 +178,27 @@ func (p *Pool) nextInitializedTick(tick int, lte bool) (int, bool) {
 		}
 		return (compressed - int(bitPos)) * p.TickSpacing, false
 	}
-	// 向上：从 bitPos+1 起找
-	mask := new(big.Int).Lsh(big.NewInt(1), bitPos+1)
-	masked := new(big.Int).And(word, new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), mask))
+	// 向上：官方语义 —— 从 position(compressed+1) 开始，mask 含当前 bitPos。
+	// 当前 tick 自身状态无关紧要（lte=false 只关心严格更高的 tick）。
+	nextCompressed := compressed + 1
+	nextWordPos := int64(nextCompressed >> 8)
+	nextBitPos := uint(nextCompressed & 0xff)
+	if !p.bitmapLoaded[nextWordPos] {
+		lo, hi := TickSpacingBounds(tick, p.TickSpacing)
+		_ = lo
+		return hi, false
+	}
+	nw := p.bitmap[nextWordPos]
+	if nw == nil {
+		nw = new(big.Int)
+	}
+	mask := new(big.Int).Lsh(big.NewInt(1), nextBitPos)
+	masked := new(big.Int).And(nw, new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), mask))
 	if masked.Sign() != 0 {
 		lsb := masked.TrailingZeroBits()
-		return (compressed + 1 + int(lsb) - int(bitPos)) * p.TickSpacing, true
+		return (nextCompressed + int(lsb) - int(nextBitPos)) * p.TickSpacing, true
 	}
-	return (compressed + 1 + 255 - int(bitPos)) * p.TickSpacing, false
+	return (nextCompressed + 255 - int(nextBitPos)) * p.TickSpacing, false
 }
 
 // ApplySwap 应用 Swap 事件（用事件里的 sqrtPriceX96/liquidity/tick 直接覆盖）。
