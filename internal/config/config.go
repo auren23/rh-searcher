@@ -76,6 +76,7 @@ type ModeConfig struct {
 // ArbitrageConfig 套利策略参数（资金限制与模拟深度）。
 type ArbitrageConfig struct {
 	MaxInputWei     string `yaml:"max_input_wei"`      // 单笔最大输入（wei）
+	MinInputWei     string `yaml:"min_input_wei"`      // 单笔最小输入（wei，浅池保护）
 	MinProfitWei    string `yaml:"min_profit_wei"`     // 最小净利（wei）
 	SafetyMarginWei string `yaml:"safety_margin_wei"`  // 安全边际（wei）
 	SimulationTopK  int    `yaml:"simulation_top_k"`   // 本地 Top-K 输入量逐个 eth_call
@@ -118,6 +119,9 @@ func LoadMerged(paths ...string) (*Config, error) {
 		}
 		if cfg.Arbitrage.MaxInputWei != "" {
 			merged.Arbitrage.MaxInputWei = cfg.Arbitrage.MaxInputWei
+		}
+		if cfg.Arbitrage.MinInputWei != "" {
+			merged.Arbitrage.MinInputWei = cfg.Arbitrage.MinInputWei
 		}
 		if cfg.Arbitrage.MinProfitWei != "" {
 			merged.Arbitrage.MinProfitWei = cfg.Arbitrage.MinProfitWei

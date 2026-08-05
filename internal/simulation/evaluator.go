@@ -55,10 +55,13 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 	c.GasCostWei = new(big.Int).Set(gasCostWei)
 	c.CalldataHash = res.CalldataHash
 	c.SimulationBlock = res.SimulationBlock
-	// L1 data 费用仅记录（若 totalGasEstimate×baseFee 已含 L1 部分则不重复扣费；
-	// 当前 gasUsed×gasPrice 近似视为总费用）
-	if res.L1GasWei != nil && res.L1GasWei.Sign() > 0 {
-		slog.Debug("l1 component", "l1_fee_wei", res.L1GasWei.String(), "calldata_hash", res.CalldataHash)
+	// Arbitrum L1 组件仅记录分析（总费仍按 gasUsed×gasPrice 近似；避免重复扣费）
+	if res.L1GasUnits > 0 {
+		slog.Debug("l1 component",
+			"l1_gas_units", res.L1GasUnits,
+			"l2_base_fee_wei", weiString(res.L2BaseFeeWei),
+			"l1_base_fee_estimate_wei", weiString(res.L1BaseFeeEstimateWei),
+			"calldata_hash", res.CalldataHash)
 	}
 	net := new(big.Int).Sub(res.Profit, gasCostWei)
 	net.Sub(net, e.safetyMarginWei)
@@ -72,6 +75,13 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 		return DecisionSimulationRejected, "below min profit after gas", net
 	}
 	return DecisionSimulationOK, "", net
+}
+
+func weiString(v *big.Int) string {
+	if v == nil {
+		return ""
+	}
+	return v.String()
 }
 
 func truncate(s string, n int) string {

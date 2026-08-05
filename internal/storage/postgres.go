@@ -42,8 +42,9 @@ func (d *DB) SaveCandidate(ctx context.Context, c *arbitrage.Candidate) error {
 			swap_cost, slippage_cost, expected_net_profit,
 			simulation_result, decision, reject_reason,
 			simulated_profit_wei, gas_used, gas_price_wei, gas_cost_wei,
-			calldata_hash, state_block, simulation_block
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+			calldata_hash, state_block, simulation_block,
+			opportunity_group_id, rank, selected
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
 		ON CONFLICT (id) DO NOTHING`,
 		c.ID, "weth-2hop", c.ObservedBlock, c.ObservedAt, c.SourceEvent,
 		c.BlockHash.Hex(), c.TxHash.Hex(), c.LogIndex, c.RouteJSON,
@@ -53,6 +54,7 @@ func (d *DB) SaveCandidate(ctx context.Context, c *arbitrage.Candidate) error {
 		nullableWei(c.SimulatedProfitWei), nullableUint64(c.GasUsed),
 		nullableWei(c.GasPriceWei), nullableWei(c.GasCostWei),
 		nullableStr(c.CalldataHash), nullableUint64(c.StateBlock), nullableUint64(c.SimulationBlock),
+		nullableStr(c.OpportunityGroupID), nullableInt(c.Rank), c.Selected,
 	)
 	return err
 }
@@ -129,6 +131,13 @@ func (d *DB) LoadPools(ctx context.Context) ([]Pool, error) {
 }
 
 func nullableUint64(v uint64) *uint64 {
+	if v == 0 {
+		return nil
+	}
+	return &v
+}
+
+func nullableInt(v int) *int {
 	if v == 0 {
 		return nil
 	}

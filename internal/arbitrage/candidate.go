@@ -15,12 +15,13 @@ import (
 // LocalSearcher 基于本地池状态的候选搜索器。
 // 候选搜索必须用本地状态，禁止把 Quoter 塞进搜索热路径。
 type LocalSearcher struct {
-	graph       *dex.Graph
-	registry    *dex.Registry
-	v3          *v3.Adapter
-	weth        common.Address
-	maxInputWei *big.Int // 单笔资金上限（nil = 不限）
-	contractBal *big.Int // 执行合约 WETH 余额（nil = 未知）
+	graph        *dex.Graph
+	registry     *dex.Registry
+	v3           *v3.Adapter
+	weth         common.Address
+	maxInputWei  *big.Int // 单笔资金上限（nil = 不限）
+	minInputWei  *big.Int // 单笔下限（nil = 默认 1e-5 WETH）
+	contractBal  *big.Int // 执行合约 WETH 余额（nil = 未知）
 }
 
 func NewLocalSearcher(g *dex.Graph, reg *dex.Registry, a *v3.Adapter, weth common.Address) *LocalSearcher {
@@ -31,6 +32,11 @@ func NewLocalSearcher(g *dex.Graph, reg *dex.Registry, a *v3.Adapter, weth commo
 func (s *LocalSearcher) SetFunding(maxInputWei, contractBal *big.Int) {
 	s.maxInputWei = maxInputWei
 	s.contractBal = contractBal
+}
+
+// SetMinInput 注入单笔下限（浅池保护；nil = 默认 1e-5 WETH）。
+func (s *LocalSearcher) SetMinInput(minInputWei *big.Int) {
+	s.minInputWei = minInputWei
 }
 
 // FindRoutes 找包含触发池（第一跳或第二跳）的 WETH 循环。
@@ -249,11 +255,16 @@ func clampAmount(a, lo, hi *big.Int) *big.Int {
 	return new(big.Int).Set(a)
 }
 
-// computeBounds 搜索边界：lo=0.001 WETH，hi=min(池深度, 配置上限, 合约余额)。
+// computeBounds 搜索边界：lo=min_input_wei（默认 1e-5 WETH），hi=min(整条 route 可报价容量,
+// 配置上限, 合约余额)。hi < lo（浅池）返回 ErrInsufficientCapacity。
 func (s *LocalSearcher) computeBounds(ctx context.Context, r Route) (*big.Int, *big.Int, error) {
-	hi := s.maxInputBound(ctx, r)
+	lo := big.NewInt(1e13) // 默认 1e-5 WETH
+	if s.minInputWei != nil && s.minInputWei.Sign() > 0 {
+		lo = new(big.Int).Set(s.minInputWei)
+	}
+	hi := s.routeMaxInput(ctx, r, lo) // 整条 route 最大可报价输入（二分）
 	if hi == nil || hi.Sign() <= 0 {
-		return nil, nil, fmt.Errorf("no depth bound")
+		return nil, nil, fmt.Errorf("no route capacity")
 	}
 	if s.maxInputWei != nil && s.maxInputWei.Sign() > 0 && hi.Cmp(s.maxInputWei) > 0 {
 		hi = new(big.Int).Set(s.maxInputWei)
@@ -264,12 +275,47 @@ func (s *LocalSearcher) computeBounds(ctx context.Context, r Route) (*big.Int, *
 	if hi.Sign() <= 0 {
 		return nil, nil, fmt.Errorf("funding bound zero")
 	}
-	return big.NewInt(1e15), hi, nil
+	if hi.Cmp(lo) < 0 {
+		return nil, nil, fmt.Errorf("insufficient capacity: hi=%s < lo=%s", hi.String(), lo.String())
+	}
+	return lo, hi, nil
 }
 
-// maxInputBound 第一跳池的单 tick 可承载量（深度自适应上限）。
-// 简化：用池 token0 reserve 的 5% 与单 tick 边界输入量取小者。
-func (s *LocalSearcher) maxInputBound(ctx context.Context, r Route) *big.Int {
+// routeMaxInput 二分求整条 route 的最大可报价输入。
+// 第一跳容量给上限估计（5% reserve），二分缩到整条 route 可报价（第二跳容量自然包含）。
+func (s *LocalSearcher) routeMaxInput(ctx context.Context, r Route, lo *big.Int) *big.Int {
+	hi := s.firstHopBound(ctx, r)
+	if hi == nil || hi.Sign() <= 0 {
+		return nil
+	}
+	if _, ok := s.quoteRoute(ctx, r, hi); ok {
+		return hi // 上限本身可报价
+	}
+	// 二分：找 [lo, hi] 中最大的可报价输入
+	best := new(big.Int)
+	low := new(big.Int).Set(lo)
+	high := new(big.Int).Set(hi)
+	for low.Cmp(high) <= 0 {
+		mid := new(big.Int).Add(low, high)
+		mid.Rsh(mid, 1)
+		if mid.Sign() <= 0 {
+			break
+		}
+		if _, ok := s.quoteRoute(ctx, r, mid); ok {
+			best = mid
+			low = new(big.Int).Add(mid, big.NewInt(1))
+		} else {
+			high = new(big.Int).Sub(mid, big.NewInt(1))
+		}
+	}
+	if best.Sign() <= 0 {
+		return nil
+	}
+	return best
+}
+
+// firstHopBound 第一跳池深度上限（5% reserve；二分起点）。
+func (s *LocalSearcher) firstHopBound(ctx context.Context, r Route) *big.Int {
 	if len(r.Hops) == 0 {
 		return nil
 	}

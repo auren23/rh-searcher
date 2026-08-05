@@ -10,12 +10,14 @@ import (
 	"math/big"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
@@ -49,23 +51,29 @@ func main() {
 
 	readURL := cfg.RPC.Groups.Read[0]
 	var src chain.Source
-	var cli *ethclient.Client
 	ws, wsErr := chain.NewWSClient(ctx, readURL)
 	if wsErr != nil {
 		slog.Warn("WS unavailable, falling back to polling", "url", readURL, "err", wsErr)
-		cli, err = ethclient.Dial(cfg.RPC.Groups.Archive[0])
-		if err != nil {
-			slog.Error("dial http rpc", "err", err)
+		httpCli, dialErr := ethclient.Dial(cfg.RPC.Groups.Archive[0])
+		if dialErr != nil {
+			slog.Error("dial http rpc", "err", dialErr)
 			os.Exit(1)
 		}
-		src = chain.NewPollingSource(cli)
+		src = chain.NewPollingSource(httpCli)
 	} else {
-		cli = ws.Client()
 		src = ws
 	}
 
+	// Adapter 一律使用独立 HTTP Read RPC（连接池），不复用 WS 客户端：
+	// WS 重连会替换底层连接，Adapter 持有的旧指针会持续失败。
+	readCli, dialErr := ethclient.Dial(cfg.RPC.Groups.Archive[0])
+	if dialErr != nil {
+		slog.Error("dial read rpc for adapter", "err", dialErr)
+		os.Exit(1)
+	}
+
 	d := cfg.Dexes.V3[0]
-	adapter, err := v3.NewAdapter(cli, d.Name,
+	adapter, err := v3.NewAdapter(readCli, d.Name,
 		common.HexToAddress(d.Factory), common.HexToAddress(d.Router), d.RouterKind,
 		common.HexToHash(d.InitCodeHash), d.FactoryBlock)
 	if err != nil {
@@ -82,7 +90,7 @@ func main() {
 		fromBlock = d.FactoryBlock
 	}
 	// 启动时读链头再引导（已完成的从 checkpoint 续跑；未完成的补全到链头）
-	headNum, err := cli.BlockNumber(ctx)
+	headNum, err := readCli.BlockNumber(ctx)
 	if err != nil {
 		slog.Error("read chain head", "err", err)
 		os.Exit(1)
@@ -178,13 +186,18 @@ func main() {
 		"min_profit_wei", minProfit.String(), "safety_margin_wei", safetyMargin.String(), "top_k", topK)
 
 	searcher := arbitrage.NewLocalSearcher(graph, reg, adapter, weth)
-	// 资金限制：max_input_wei 与执行合约当前 WETH 余额（预检已读取）
+	// 资金限制：max_input_wei / min_input_wei 与执行合约当前 WETH 余额（预检已读取）
 	if cfg.Arbitrage.MaxInputWei != "" {
 		if v, ok := new(big.Int).SetString(cfg.Arbitrage.MaxInputWei, 10); ok {
 			searcher.SetFunding(v, contractBal)
 		}
 	} else {
 		searcher.SetFunding(nil, contractBal)
+	}
+	if cfg.Arbitrage.MinInputWei != "" {
+		if v, ok := new(big.Int).SetString(cfg.Arbitrage.MinInputWei, 10); ok {
+			searcher.SetMinInput(v)
+		}
 	}
 	if cfg.Mode.Run == "live" {
 		slog.Error("live mode not implemented (signer/nonce/broadcaster/pnl not wired)")
@@ -211,7 +224,7 @@ func main() {
 	swapTopic := v3.SwapTopic()
 	mintTopic := common.HexToHash("0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde")
 	burnTopic := common.HexToHash("0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c")
-	startHead, err := cli.BlockNumber(ctx)
+	startHead, err := readCli.BlockNumber(ctx)
 	if err != nil {
 		slog.Error("read chain head for log subscription", "err", err)
 		os.Exit(1)
@@ -226,61 +239,103 @@ func main() {
 		}
 	}()
 
-	metrics := telemetry.NewMetrics()
-	slog.Info("arbitrage engine started (shadow)", "mode", "shadow", "pools", len(reg.AllPools()))
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("arbitrage stopped")
+	slog.Info("arbitrage engine started", "mode", cfg.Mode.Run, "pools", len(reg.AllPools()))
+	// 区块聚合：收集同一区块全部 Swap/Mint/Burn → 按 TxIndex/LogIndex 排序 → 应用完整区块状态
+	// → 区块结束时汇总受影响池评估一次（消除交易中间状态机会）
+	type pendingBlock struct {
+		hash  common.Hash
+		logs  []types.Log
+	}
+	pending := map[uint64]*pendingBlock{}
+	var currentHead uint64
+
+	flushBlock := func(number uint64) {
+		pb, ok := pending[number]
+		if !ok {
 			return
-		case l := <-logs:
-			// Mint/Burn 只更新池状态，不触发套利评估
-			isMintBurn := l.Topics[0] == mintTopic || l.Topics[0] == burnTopic
+		}
+		delete(pending, number)
+		// 按 (txIndex, logIndex) 排序，保证同区块内事件顺序正确
+		sort.Slice(pb.logs, func(i, j int) bool {
+			if pb.logs[i].TxIndex != pb.logs[j].TxIndex {
+				return pb.logs[i].TxIndex < pb.logs[j].TxIndex
+			}
+			return pb.logs[i].Index < pb.logs[j].Index
+		})
+		affected := map[common.Address]struct{}{}
+		for _, l := range pb.logs {
 			state := reg.Pool(l.Address)
 			if state == nil {
-				// 未发现的池（如刚创建）：从链上惰性初始化
-				if l.BlockNumber > 0 {
-					pool, err := adapter.PoolByAddress(ctx, l.Address)
-					if err != nil {
-						continue
-					}
-					reg.UpsertPool(v3.State(pool))
-					graph.AddPool(pool.Pool(), pool.Address)
-					state = reg.Pool(l.Address)
-				}
-				if state == nil {
-					continue
-				}
+				continue
 			}
-			apply, err := adapter.DecodeLog(state.(*v3.Pool), l)
-			if err != nil {
-				slog.Warn("apply log", "err", err)
+			pool := state.(*v3.Pool)
+			apply, derr := adapter.DecodeLog(pool, l)
+			if derr != nil {
+				slog.Warn("decode log", "err", derr)
 				continue
 			}
 			if apply != nil {
 				apply()
 			}
-			// Mint/Burn：本地历史 gross 不完整，重读链上 bitmap word 与 active liquidity
-			if isMintBurn {
-				pool := state.(*v3.Pool)
-				if tl, tu, derr := v3.DecodeTickBounds(l); derr == nil {
+			// Mint/Burn：重读链上 bitmap word 与 active liquidity（本地历史 gross 不可信）
+			if l.Topics[0] == mintTopic || l.Topics[0] == burnTopic {
+				if tl, tu, terr := v3.DecodeTickBounds(l); terr == nil {
 					if err := adapter.ResyncMintBurn(ctx, pool, tl, tu); err != nil {
 						slog.Warn("resync mint/burn", "pool", pool.Address.Hex(), "err", err)
 					}
 				}
-				reg.UpsertPool(state)
-				continue
+			} else {
+				affected[l.Address] = struct{}{} // 仅 Swap 触发评估
 			}
 			reg.UpsertPool(state)
-			engine.OnSwap(ctx, arbitrage.SwapEvent{
-				Pool:        l.Address,
-				BlockNumber: l.BlockNumber,
-				BlockHash:   l.BlockHash,
-				TxHash:      l.TxHash,
-				LogIndex:    l.Index,
+		}
+		pools := make([]common.Address, 0, len(affected))
+		for p := range affected {
+			pools = append(pools, p)
+		}
+		if len(pools) > 0 {
+			engine.OnBlockBatch(ctx, arbitrage.SwapEvent{
+				BlockNumber: number,
+				BlockHash:   pb.hash,
 				ReceivedAt:  time.Now().UnixMilli(),
-			})
-			metrics.CandidatesTotal.WithLabelValues("weth-2hop", "observed").Inc()
+			}, pools)
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("arbitrage stopped")
+			return
+		case l, ok := <-logs:
+			if !ok {
+				continue
+			}
+			pb, exists := pending[l.BlockNumber]
+			if !exists {
+				pb = &pendingBlock{hash: l.BlockHash}
+				pending[l.BlockNumber] = pb
+			}
+			pb.logs = append(pb.logs, l)
+			// 区块完结判定：日志高度落后于当前处理头（或出现更高区块日志）
+			if l.BlockNumber > currentHead {
+				currentHead = l.BlockNumber
+			}
+			// 收到更高区块的日志时，flush 之前的区块（保证完整区块状态）
+			for bn := range pending {
+				if bn < currentHead {
+					flushBlock(bn)
+				}
+			}
+			// 链头推进检查由心跳完成；这里也处理同高度全部到达的情况
+			if l.BlockNumber == currentHead && len(pending) == 1 {
+				// 等待：同区块可能还有更多日志（由下一个区块触发 flush）
+			}
+		case <-time.After(3 * time.Second):
+			// 心跳：flush 所有未完结区块（链头已推进但无新日志）
+			for bn := range pending {
+				flushBlock(bn)
+			}
 		}
 	}
 }

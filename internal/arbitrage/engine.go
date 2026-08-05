@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"strings"
@@ -44,6 +45,11 @@ type Candidate struct {
 	CalldataHash      string
 	StateBlock        uint64 // 池状态对应区块（0 = 混合/未知）
 	SimulationBlock   uint64 // eth_call 执行时的链头（0 = 未知）
+
+	// 同一机会（事件+路由）的 Top-K 分组：仅 Selected 候选可发送
+	OpportunityGroupID string // = 事件 ID + 路由（不含金额）
+	Rank               int    // 组内本地毛利排名
+	Selected           bool   // 模拟后选中的唯一候选
 }
 
 // Hop 一跳。
@@ -95,14 +101,30 @@ type SwapEvent struct {
 	ReceivedAt  int64 // unix ms
 }
 
+// OnBlockBatch 区块级评估：应用完整区块的日志后，对每个受影响池评估一次。
+// 消除"交易中间状态"机会（同区块多条 Swap 不得产生虚假候选）。
+func (e *Engine) OnBlockBatch(ctx context.Context, ev SwapEvent, affectedPools []common.Address) {
+	seen := make(map[common.Address]struct{}, len(affectedPools))
+	for _, pool := range affectedPools {
+		if _, dup := seen[pool]; dup {
+			continue
+		}
+		seen[pool] = struct{}{}
+		poolEv := ev
+		poolEv.Pool = pool
+		e.OnSwap(ctx, poolEv)
+	}
+}
+
 // OnSwap 收到 Swap 事件后调用：找循环 → 优化 → 评估 → 落盘（含拒绝）。
 func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 	routes := e.searcher.FindRoutes(ctx, ev.Pool, e.cfg.WETH, e.cfg.MaxHops)
 	for _, r := range routes {
-		// Top-K 输入量逐个链上模拟，选模拟净利最高者；其余记录为 rejected（不丢数据）
+		// Top-K 输入量逐个链上模拟，选模拟净利最高者；先全部模拟，再统一落盘
 		cands := e.searcher.TopKOptimize(ctx, r, e.cfg.TopK, ev.BlockNumber, ev.ReceivedAt)
+		groupID := fmt.Sprintf("%d/%s", ev.BlockNumber, routeID(r))
 		var best *Candidate
-		for _, c := range cands {
+		for rank, c := range cands {
 			if c == nil || c.InputAmount == nil {
 				slog.Error("searcher returned incomplete candidate", "route", routeID(r))
 				continue // 记录并跳过，绝不 panic
@@ -111,16 +133,13 @@ func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 			c.TxHash = ev.TxHash
 			c.LogIndex = ev.LogIndex
 			c.RouteJSON = MarshalRoute(c.Route) // 用候选自己的路由（含每跳金额）
+			c.OpportunityGroupID = groupID
+			c.Rank = rank
 			c.ID = CandidateID(e.cfg.ChainID, ev.BlockHash, ev.TxHash, ev.LogIndex, c.RouteJSON, c.InputAmount)
 			if c.RejectReason != "" {
 				// searcher 已判定（state-incomplete / route quote failed）：不再交给模拟器覆盖
 				c.Decision = "local_rejected"
 				c.ExpectedNetProfit = new(big.Int)
-				if e.sink != nil {
-					if err := e.sink.SaveCandidate(ctx, c); err != nil {
-						slog.Error("candidate persist failed", "err", err, "id", c.ID)
-					}
-				}
 				continue
 			}
 			verdict, reason, profit := e.evaluator.Evaluate(ctx, c, e.cfg)
@@ -129,6 +148,18 @@ func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 			c.ExpectedNetProfit = profit
 			if best == nil || (verdict == SimulationAccepted && c.ExpectedNetProfit.Cmp(best.ExpectedNetProfit) > 0) {
 				best = c
+			}
+		}
+		// 统一落盘：best 标记 selected=true；其他通过模拟的降级为 simulation_valid
+		for _, c := range cands {
+			if c.ID == "" {
+				continue // 未进入评估流程（searcher 异常）
+			}
+			if best != nil && c.ID == best.ID {
+				c.Selected = true
+			} else if c.Decision == SimulationAccepted {
+				c.Decision = "simulation_valid"
+				c.RejectReason = "not selected (lower net profit in group)"
 			}
 			if e.sink != nil {
 				if err := e.sink.SaveCandidate(ctx, c); err != nil {
@@ -139,7 +170,7 @@ func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 		if best == nil {
 			continue
 		}
-		// 非最优的 accepted 候选降级标记（已落盘原始决策，这里只控制发送）
+		// 仅 Selected 候选可发送
 		if best.Decision == SimulationAccepted && e.cfg.Mode == "live" {
 			e.executor.Execute(ctx, best)
 		}

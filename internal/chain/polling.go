@@ -71,7 +71,9 @@ func (p *PollingSource) SubscribeLogs(ctx context.Context, query ethereum.Filter
 		defer close(out)
 		last := uint64(0)
 		haveLast := false
-		seen := make(map[uint64]bool) // 本轮已处理的区块（重组保护：同一高度只发一次）
+		// ponytail: 只按高度去重（Robinhood 为 Arbitrum 链，重组极少）；
+		// 严格重组处理需记录 blockHash，后续 Replay 模式再做
+		seen := make(map[uint64]bool)
 		t := time.NewTicker(700 * time.Millisecond)
 		defer t.Stop()
 		for {
@@ -92,10 +94,10 @@ func (p *PollingSource) SubscribeLogs(ctx context.Context, query ethereum.Filter
 					if query.FromBlock != nil && query.FromBlock.Sign() > 0 {
 						fb := query.FromBlock.Uint64()
 						if fb > head {
-							start = head // 未来高度（异常输入）保守处理
-						} else {
-							start = fb
+							// 链头尚未到达 FromBlock：等待，不回退到当前头（否则重复处理）
+							continue
 						}
+						start = fb
 					}
 					haveLast = true
 				}

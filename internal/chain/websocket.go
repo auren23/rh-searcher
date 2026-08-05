@@ -121,6 +121,9 @@ func (w *WSClient) SubscribeLogs(ctx context.Context, query ethereum.FilterQuery
 	errCh := make(chan error, 4)
 	go func() {
 		defer close(out)
+		// 断线补日志：记录已处理的最大区块，重连后用 FilterLogs 补齐
+		lastProcessed := uint64(0)
+		haveLast := false
 		for {
 			if ctx.Err() != nil {
 				return
@@ -133,21 +136,73 @@ func (w *WSClient) SubscribeLogs(ctx context.Context, query ethereum.FilterQuery
 				_ = w.reconnect(ctx)
 				continue
 			}
-			select {
-			case <-ctx.Done():
-				sub.Unsubscribe()
-				return
-			case err := <-sub.Err():
-				errCh <- err
-				sub.Unsubscribe()
-				_ = w.reconnect(ctx)
-				time.Sleep(2 * time.Second)
-			case l := <-logs:
-				out <- l
+			// 内层循环：持续消费日志，只有订阅错误才重建（不得每条日志重建订阅）
+			subErr := false
+			for !subErr {
+				select {
+				case <-ctx.Done():
+					sub.Unsubscribe()
+					return
+				case err, ok := <-sub.Err():
+					if !ok {
+						subErr = true
+						break
+					}
+					errCh <- err
+					subErr = true
+				case l, ok := <-logs:
+					if !ok {
+						subErr = true
+						break
+					}
+					// 补窗口内到达的旧日志（重连后 FilterLogs 已覆盖，这里只发新的）
+					if haveLast && l.BlockNumber < lastProcessed {
+						continue // 已处理过的高度（重复投递防护）
+					}
+					out <- l
+					if l.BlockNumber > lastProcessed || !haveLast {
+						lastProcessed = l.BlockNumber
+						haveLast = true
+					}
+				}
 			}
+			sub.Unsubscribe()
+			// 断线：重连 + 用 HTTP FilterLogs 补齐 lastProcessed+1 到当前头的日志
+			_ = w.reconnect(ctx)
+			if haveLast {
+				backfilled, err := w.backfillLogs(ctx, query, lastProcessed+1)
+				if err != nil {
+					errCh <- err
+				} else {
+					for _, l := range backfilled {
+						if l.BlockNumber >= lastProcessed+1 {
+							out <- l
+							if l.BlockNumber > lastProcessed {
+								lastProcessed = l.BlockNumber
+							}
+						}
+					}
+				}
+			}
+			time.Sleep(2 * time.Second)
 		}
 	}()
 	return out, errCh
+}
+
+// backfillLogs 用 HTTP FilterLogs 补齐 [from, head] 区间的日志（断线窗口）。
+func (w *WSClient) backfillLogs(ctx context.Context, query ethereum.FilterQuery, from uint64) ([]types.Log, error) {
+	head, err := w.cli.BlockNumber(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if from > head {
+		return nil, nil
+	}
+	q := query
+	q.FromBlock = big.NewInt(int64(from))
+	q.ToBlock = big.NewInt(int64(head))
+	return w.cli.FilterLogs(ctx, q)
 }
 
 func (w *WSClient) BlockByNumber(ctx context.Context, number uint64) (*types.Block, error) {

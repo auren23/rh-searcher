@@ -44,8 +44,11 @@ type SimResult struct {
 	GasPriceWei     *big.Int // 模拟时的链上 gas 价格
 	CalldataHash    string   // keccak(calldata)（与最终发送逐字节相同）
 	SimulationBlock uint64   // eth_call 时的链头
-	L1GasWei        *big.Int // Arbitrum L1 data 费用（eth_gasEstimateL1Component，尽力而为）
-	RevertMsg       string
+	// Arbitrum NodeInterface.gasEstimateL1Component 返回：(gasEstimateForL1, baseFee, l1BaseFeeEstimate)
+	L1GasUnits         uint64   // gasEstimateForL1（仅分析用，不重复扣费）
+	L2BaseFeeWei       *big.Int // baseFee
+	L1BaseFeeEstimateWei *big.Int // l1BaseFeeEstimate
+	RevertMsg          string
 }
 
 // Simulate 构建并模拟 executeV3Cycle 调用。
@@ -79,22 +82,27 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	}
 	// Arbitrum L1 data 费用：NodeInterface 虚拟合约 (0x...C8) 的 gasEstimateL1Component(to, contractCreation, data)
 	// 返回 (gasEstimateForL1, baseFee, l1BaseFeeEstimate)；eth_gasEstimateL1Component RPC 方法不存在。
-	var l1GasWei *big.Int
+	var l1GasUnits uint64
+	var l2BaseFee, l1BaseFeeEstimate *big.Int
 	{
+		// NodeInterface 虚拟合约（0x...C8）的 gasEstimateL1Component(to, contractCreation, data)
 		nodeInterface := common.HexToAddress("0x00000000000000000000000000000000000000C8")
 		intfABI := `[{"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"bool","name":"contractCreation","type":"bool"},{"internalType":"bytes","name":"data","type":"bytes"}],"name":"gasEstimateL1Component","outputs":[{"internalType":"uint64","name":"gasEstimateForL1","type":"uint64"},{"internalType":"uint256","name":"baseFee","type":"uint256"},{"internalType":"uint256","name":"l1BaseFeeEstimate","type":"uint256"}],"stateMutability":"view","type":"function"}]`
 		parsed, aerr := abi.JSON(strings.NewReader(intfABI))
 		if aerr == nil {
 			if callData, perr := parsed.Pack("gasEstimateL1Component", msg.To, false, msg.Data); perr == nil {
-				if res, cerr := s.cli.CallContract(ctx, ethereum.CallMsg{To: &nodeInterface, Data: callData}, nil); cerr == nil && len(res) >= 64 {
-					l1GasWei = new(big.Int).SetBytes(res[32:64]) // baseFee
+				if res, cerr := s.cli.CallContract(ctx, ethereum.CallMsg{To: &nodeInterface, Data: callData}, nil); cerr == nil && len(res) >= 96 {
+					l1GasUnits = new(big.Int).SetBytes(res[0:32]).Uint64()
+					l2BaseFee = new(big.Int).SetBytes(res[32:64])
+					l1BaseFeeEstimate = new(big.Int).SetBytes(res[64:96])
 				}
 			}
 		}
 	}
 	simBlock, _ := s.cli.BlockNumber(ctx)
 	return &SimResult{Profit: profit, GasUsed: gas, GasPriceWei: gasPrice,
-		CalldataHash: hashHex(calldata), SimulationBlock: simBlock, L1GasWei: l1GasWei}, nil
+		CalldataHash: hashHex(calldata), SimulationBlock: simBlock,
+		L1GasUnits: l1GasUnits, L2BaseFeeWei: l2BaseFee, L1BaseFeeEstimateWei: l1BaseFeeEstimate}, nil
 }
 
 // hashHex keccak256 十六进制（calldata 指纹）。

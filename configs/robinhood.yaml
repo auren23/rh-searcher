@@ -36,6 +36,7 @@ executor:
 # 套利策略参数（资金限制：搜索上限 = min(池深度, max_input_wei, 合约余额)）
 arbitrage:
   max_input_wei: "30000000000000000"  # 0.03 WETH 单笔上限
+  min_input_wei: "10000000000000"     # 1e-5 WETH 单笔下限（浅池保护）
   min_profit_wei: "10000000000000"    # 1e-5 WETH
   safety_margin_wei: "5000000000000"  # 5e-6 WETH
   simulation_top_k: 5
