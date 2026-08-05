@@ -1,12 +1,15 @@
-# DEX 配置：多个 V3 DEX 只需加一条。
-# 所有地址为占位符 —— M0 核实后填写，并记录来源。
-# 本地 V3 报价与链上 Quoter eth_call 一致性验收（M2）通过前，不要修改这里的值。
+# DEX 配置 —— M0 已核实（2026-08-05，见 deployments/M0-chain-facts.md）
+# Robinhood 上的 Uniswap 部署：官方全家桶（V3+V2 Factory + UniversalRouter + MixedRouteQuoterV2），
+# 通过 0x4e59b448...（create2 deployer）部署，但地址与 mainnet 不同。
 
 dexes:
   v3:
-    - name: "robinhood-swap" # M0 TODO: 核实链上实际 DEX
-      factory: "0x0000000000000000000000000000000000000000"
-      router: "0x0000000000000000000000000000000000000000"
-      quoter_v2: "0x0000000000000000000000000000000000000000"
-      init_code_hash: "0x0000000000000000000000000000000000000000000000000000000000000000"
-      factory_block: 0
+    - name: "uniswap-v3"
+      factory: "0x1f7d7550b1b028f7571e69a784071f0205fd2efa" # verified UniswapV3Factory (0.7.6)，deploy block 8930
+      router: "0x8876789976dEcBfCbBbe364623C63652db8C0904"   # UniversalRouter (非 SwapRouter！calldata 用 execute(commands, inputs)，deploy block 18127)
+      router_kind: "universal" # swaprouter | universal（影响 BuildSwap 编码）
+      quoter_v2: "0x7edd862aa08dD5Be664C21188E1A2A0E64e3A283" # MixedRouteQuoterV2，deploy block 27077903
+      # M0 TODO: 池部署字节码与 mainnet 不同（0x69d2e169... vs 0xf2b8b58f...），
+      # 实际 init code 需 archive 节点内部交易提取；本地池寻址先用 factory.getPool()
+      init_code_hash: ""
+      factory_block: 8930

@@ -43,9 +43,10 @@ func main() {
 
 	reg := dex.NewRegistry()
 	graph := dex.NewGraph()
-	adapter, err := v3.NewAdapter(ws.Client(), "robinhood-swap",
+	adapter, err := v3.NewAdapter(ws.Client(), cfg.Dexes.V3[0].Name,
 		common.HexToAddress(cfg.Dexes.V3[0].Factory),
 		common.HexToAddress(cfg.Dexes.V3[0].Router),
+		cfg.Dexes.V3[0].RouterKind,
 		common.HexToHash(cfg.Dexes.V3[0].InitCodeHash),
 		cfg.Dexes.V3[0].FactoryBlock)
 	if err != nil {

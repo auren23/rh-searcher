@@ -54,6 +54,7 @@ func main() {
 			ws.Client(), d.Name,
 			common.HexToAddress(d.Factory),
 			common.HexToAddress(d.Router),
+			d.RouterKind,
 			common.HexToHash(d.InitCodeHash),
 			d.FactoryBlock,
 		)

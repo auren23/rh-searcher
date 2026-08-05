@@ -48,6 +48,7 @@ type V3DexConfig struct {
 	Name         string `yaml:"name"`
 	Factory      string `yaml:"factory"`
 	Router       string `yaml:"router"`
+	RouterKind   string `yaml:"router_kind"` // swaprouter | universal
 	QuoterV2     string `yaml:"quoter_v2"`
 	InitCodeHash string `yaml:"init_code_hash"`
 	FactoryBlock uint64 `yaml:"factory_block"`

@@ -56,15 +56,16 @@ type Adapter struct {
 	exchange     string
 	factory      common.Address
 	router       common.Address
+	routerKind   string // swaprouter | universal
 	initCodeHash common.Hash
 	factoryBlock uint64
 	events       map[common.Hash]abi.Event
 }
 
-func NewAdapter(cli *ethclient.Client, exchange string, factory, router common.Address, initCodeHash common.Hash, factoryBlock uint64) (*Adapter, error) {
+func NewAdapter(cli *ethclient.Client, exchange string, factory, router common.Address, routerKind string, initCodeHash common.Hash, factoryBlock uint64) (*Adapter, error) {
 	a := &Adapter{
 		cli: cli, exchange: exchange, factory: factory, router: router,
-		initCodeHash: initCodeHash, factoryBlock: factoryBlock,
+		routerKind: routerKind, initCodeHash: initCodeHash, factoryBlock: factoryBlock,
 		events: make(map[common.Hash]abi.Event),
 	}
 	fullABI := fmt.Sprintf(`[{"anonymous":false,"inputs":[{"indexed":true,"name":"token0","type":"address"},{"indexed":true,"name":"token1","type":"address"},{"indexed":true,"name":"fee","type":"uint24"},{"indexed":false,"name":"tickSpacing","type":"int24"},{"indexed":false,"name":"pool","type":"address"}],"name":"PoolCreated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"sender","type":"address"},{"indexed":true,"name":"recipient","type":"address"},{"indexed":false,"name":"amount0","type":"int256"},{"indexed":false,"name":"amount1","type":"int256"},{"indexed":false,"name":"sqrtPriceX96","type":"uint160"},{"indexed":false,"name":"liquidity","type":"uint128"},{"indexed":false,"name":"tick","type":"int24"}],"name":"Swap","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":true,"name":"tickLower","type":"int24"},{"indexed":true,"name":"tickUpper","type":"int24"},{"indexed":false,"name":"amount","type":"uint128"},{"indexed":false,"name":"amount0","type":"uint256"},{"indexed":false,"name":"amount1","type":"uint256"}],"name":"Mint","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":true,"name":"tickLower","type":"int24"},{"indexed":true,"name":"tickUpper","type":"int24"},{"indexed":false,"name":"amount","type":"uint128"},{"indexed":false,"name":"amount0","type":"uint256"},{"indexed":false,"name":"amount1","type":"uint256"}],"name":"Burn","type":"event"}]`)
@@ -257,6 +258,38 @@ func (a *Adapter) BuildSwap(p *Pool, tokenIn, recipient common.Address, amountIn
 	}
 	enc = append(enc, leftPad(limit.Bytes())...)
 	return enc, nil
+}
+
+// buildUniversalSwap UniversalRouter.execute 的 V3_SWAP_EXACT_IN (command 0x08)。
+// input = abi.encode(recipient, amountIn, amountOutMinimum, path, payerIsUser)，
+// payerIsUser=false → payer = msg.sender（执行合约，调用前已 approve）。
+func buildUniversalSwap(tokenIn, tokenOut common.Address, fee uint32, recipient common.Address, amountIn, minOut *big.Int) ([]byte, error) {
+	path := make([]byte, 0, 43)
+	path = append(path, tokenIn.Bytes()...)
+	path = append(path, byte(fee>>16), byte(fee>>8), byte(fee))
+	path = append(path, tokenOut.Bytes()...)
+
+	executeABI := `[{"inputs":[{"internalType":"bytes","name":"commands","type":"bytes"},{"internalType":"bytes[]","name":"inputs","type":"bytes[]"}],"name":"execute","outputs":[],"stateMutability":"payable","type":"function"}]`
+	parsed, err := abi.JSON(strings.NewReader(executeABI))
+	if err != nil {
+		return nil, fmt.Errorf("parse universal router abi: %w", err)
+	}
+
+	v3SwapInput := make([]byte, 0, 128+len(path))
+	v3SwapInput = append(v3SwapInput, leftPad(recipient.Bytes())...)
+	v3SwapInput = append(v3SwapInput, leftPad(amountIn.Bytes())...)
+	v3SwapInput = append(v3SwapInput, leftPad(minOut.Bytes())...)
+	// bytes path 的动态编码：offset, len, data（pad 到 32）
+	pathOff := 32 * 3
+	v3SwapInput = append(v3SwapInput, leftPadUint(uint64(pathOff), 256)...)
+	v3SwapInput = append(v3SwapInput, leftPadUint(uint64(len(path)), 256)...)
+	v3SwapInput = append(v3SwapInput, path...)
+	v3SwapInput = append(v3SwapInput, make([]byte, (32-len(path)%32)%32)...)
+	// bool payerIsUser
+	v3SwapInput = append(v3SwapInput, make([]byte, 31)...)
+	v3SwapInput = append(v3SwapInput, 0)
+
+	return parsed.Pack("execute", []byte{0x08}, [][]byte{v3SwapInput})
 }
 
 // leftPad 按 32 字节左补零。

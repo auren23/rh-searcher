@@ -1,24 +1,22 @@
-# rh-searcher 链配置。
-# 所有地址均为占位符 —— M0 验收：从官方地址页和链上字节码确认，标注来源、部署区块、字节码哈希。
+# rh-searcher 链配置 —— M0 已核实（2026-08-05，见 deployments/M0-chain-facts.md）
 # 敏感值（私钥/API Key）一律用环境变量注入，禁止写入本文件。
 
 chain:
-  id: 224168 # M0 TODO: 核实 Robinhood Chain ID
-  weth: "0x4200000000000000000000000000000000000006" # M0 TODO: 核实（OP Stack 标准 WETH 桥地址）
-  wbtc: "" # M0 TODO
-  usdc: "" # M0 TODO
+  id: 4663 # Robinhood Chain mainnet（官方文档 + eth_chainId 双重确认）
+  weth: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" # aeWETH（eip1967 proxy，实现 0xC6B81b429797E0f555440b70cD99e032D7AE947e，标准 ERC20+deposit/withdraw）
+  # wbtc/usdc: Robinhood 未镜像 mainnet 地址；稳定币确认为 Morpho 市场 loan asset（见 morpho.yaml）
   gas_limit: 5000000
 
 rpc:
-  # 读取/发送/模拟严格分组，不要一个 RPC 承担所有职责
+  # 读取/发送/模拟严格分组。公共端点限速，仅开发用；生产用供应商端点。
   groups:
-    archive: # 历史读取
-      - "${RH_ARCHIVE_RPC}"
-    read: # 实时 WebSocket 读取
-      - "${RH_READ_WS_RPC}"
+    archive: # 历史读取（M0: 公共 RPC 不支持 archive 方法，需供应商）
+      - "${RH_ARCHIVE_RPC:-https://rpc.mainnet.chain.robinhood.com}"
+    read: # 实时 WebSocket 读取（公共 WS 端点）
+      - "${RH_READ_WS_RPC:-wss://rpc.mainnet.chain.robinhood.com/ws}"
     sim: # 独立模拟 RPC
-      - "${RH_SIM_RPC}"
-    send: # GMGN 快速 RPC（发送专用）
+      - "${RH_SIM_RPC:-https://rpc.mainnet.chain.robinhood.com}"
+    send: # GMGN 快速 RPC（发送专用；M0 TODO: 确认 GMGN 是否支持 robinhood 链）
       - "${RH_GMGN_RPC}"
   timeout_sec: 10
   max_retries: 3

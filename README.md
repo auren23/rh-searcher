@@ -95,15 +95,15 @@ make run-arbitrage
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| M0 | 链上事实确认（Chain ID / WETH / Morpho / DEX 地址 / GMGN 能力） | **待做**，configs 里全是占位符 |
+| M0 | 链上事实确认 | ✅ **完成**（见 `deployments/M0-chain-facts.md`）：Chain ID 4663、aeWETH、Uniswap V3/V2 全家桶、Morpho Blue 地址全部实测确认；发现 Morpho 链上 0 市场 |
 | M1 | 多 RPC 池、WS 重连、补块、签名、Nonce、Receipt 确认 | ✅ 骨架完成 |
-| M2 | V3 Factory/Pool 索引 + 本地 Quote vs Quoter 验收 | ✅ 索引/报价实现，待链上验收 |
+| M2 | V3 Factory/Pool 索引 + 本地 Quote vs Quoter 验收 | 🔶 索引/报价已实现；Quoter 对部分池 revert，待专项验收 |
 | M3 | WETH→TOKEN→WETH 两池 Shadow 搜索 | ✅ 引擎实现（shadow） |
 | M4 | ArbitrageExecutor + Foundry 测试 | ✅ 合约 + 5 项测试通过 |
 | M5 | Replay → Shadow → Canary → Live 上线门槛 | 未开始 |
-| M6 | Morpho 市场/仓位索引 | 🔶 数据模型完成，事件接入待做 |
-| M7 | 清算机会计算 | 🔶 骨架 |
-| M8 | LiquidationExecutor + Flash Loan | 🔶 合约草案，待 fork 测试 |
+| M6 | Morpho 市场/仓位索引 | ⏸ 推迟：链上 0 市场（见 M0 报告），等 CreateMarket 事件 |
+| M7 | 清算机会计算 | ⏸ 推迟（依赖 M6） |
+| M8 | LiquidationExecutor + Flash Loan | 🔶 合约草案保留 |
 
 **开发顺序：先完成共享底座 → DEX 池状态 → 套利 Shadow → 套利执行 → Morpho 索引 → 清算执行。**
 清算会复用套利约一半的基础能力（DEX 状态/报价/模拟），不要两个策略同时开写。
