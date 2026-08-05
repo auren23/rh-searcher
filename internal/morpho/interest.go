@@ -6,10 +6,10 @@ import (
 
 // 常数：Morpho Blue 的固定参数。
 const (
-	VIRTUAL_SHARES  = 1e6
-	VIRTUAL_ASSETS  = 1
+	VIRTUAL_SHARES            = 1e6
+	VIRTUAL_ASSETS            = 1
 	MAX_LIQUIDATION_INCENTIVE = 0.3 // 30%
-	LIQUIDATION_CT = 0.5            // 清算折扣 CT，见白皮书
+	LIQUIDATION_CT            = 0.5 // 清算折扣 CT，见白皮书
 )
 
 // Interest 利息计算：按 Morpho Blue 白皮书公式。

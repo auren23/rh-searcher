@@ -13,10 +13,10 @@ import (
 // LocalSearcher 基于本地池状态的候选搜索器。
 // 候选搜索必须用本地状态，禁止把 Quoter 塞进搜索热路径。
 type LocalSearcher struct {
-	graph   *dex.Graph
+	graph    *dex.Graph
 	registry *dex.Registry
-	v3      *v3.Adapter
-	weth    common.Address
+	v3       *v3.Adapter
+	weth     common.Address
 }
 
 func NewLocalSearcher(g *dex.Graph, reg *dex.Registry, a *v3.Adapter, weth common.Address) *LocalSearcher {

@@ -14,19 +14,19 @@ import (
 
 // Candidate 清算候选。
 type Candidate struct {
-	MarketID        common.Hash
-	User            common.Address
-	ObservedBlock   uint64
-	HealthFactor    *big.Float
-	RepayAssets     *big.Int
+	MarketID         common.Hash
+	User             common.Address
+	ObservedBlock    uint64
+	HealthFactor     *big.Float
+	RepayAssets      *big.Int
 	SeizedCollateral *big.Int
 	// 退出路径成本
-	FlashLoanCost   *big.Int
-	SwapCost        *big.Int
-	GasCost         *big.Int
+	FlashLoanCost     *big.Int
+	SwapCost          *big.Int
+	GasCost           *big.Int
 	ExpectedNetProfit *big.Int
-	Decision        string
-	RejectReason    string
+	Decision          string
+	RejectReason      string
 }
 
 // Sink 候选落盘接口（与套利一致：拒绝的也要记录）。
@@ -56,10 +56,10 @@ func (e *Engine) Scan(ctx context.Context) []*Candidate {
 	cands := make([]*Candidate, 0, len(positions))
 	for _, p := range positions {
 		c := &Candidate{
-			MarketID:      p.MarketID,
-			User:          p.User,
-			HealthFactor:  big.NewFloat(0.9), // 简化，M7 接入真实计算
-			RepayAssets:   p.BorrowShares,
+			MarketID:     p.MarketID,
+			User:         p.User,
+			HealthFactor: big.NewFloat(0.9), // 简化，M7 接入真实计算
+			RepayAssets:  p.BorrowShares,
 		}
 		if e.eval != nil {
 			c.Decision, c.RejectReason = e.eval.Evaluate(ctx, c)

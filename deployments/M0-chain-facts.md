@@ -51,5 +51,5 @@
 - [ ] 归档节点（供应商）：公共 RPC 不支持 archive/debug 方法
 - [x] 稳定币主地址：mainnet 标准地址（USDC `0xA0b8...`、cbBTC `0xcbB7...`）链上确认无代码（与 Morpho API 数据矛盾 → API 不可信）
 - [ ] Morpho 市场：等待真实 CreateMarket 事件（当前链上 0 市场）
-- [ ] init code hash 提取（内部交易），或长期使用 factory.getPool()
-- [ ] V3 WETH 池清单与 TVL（第一版两池循环的基础）
+- [x] init code hash：pool 部署字节码与 mainnet 不同（定制版 V3），Quoter 在该链 create2 寻址失败（quoteExactInputSingle(V2/V3) 全部 revert）→ **本地报价直读 slot0/liquidity，寻址用 factory.getPool()，链上验证走自己的执行合约**（不依赖 Quoter）
+- [ ] V3 WETH 池清单与 TVL（第一版两池循环的基础）—— rh-indexer 跑通后自动积累

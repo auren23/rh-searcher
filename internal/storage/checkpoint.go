@@ -16,7 +16,7 @@ type Checkpoint struct {
 }
 
 type checkpointData struct {
-	UpdatedAt int64            `json:"updated_at"`
+	UpdatedAt int64             `json:"updated_at"`
 	Heights   map[string]uint64 `json:"heights"` // strategy -> block
 }
 

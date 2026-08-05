@@ -5,7 +5,9 @@ package config
 import (
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -69,6 +71,36 @@ type ModeConfig struct {
 	Run string `yaml:"run"`
 }
 
+// LoadMerged 顺序加载多个配置并合并（后者覆盖前者）。
+func LoadMerged(paths ...string) (*Config, error) {
+	merged := &Config{}
+	for _, p := range paths {
+		cfg, err := Load(p)
+		if err != nil {
+			return nil, fmt.Errorf("load %s: %w", p, err)
+		}
+		if cfg.Chain.ID != 0 {
+			merged.Chain = cfg.Chain
+		}
+		if len(cfg.RPC.Groups.Read) > 0 {
+			merged.RPC = cfg.RPC
+		}
+		if len(cfg.Dexes.V3) > 0 {
+			merged.Dexes = cfg.Dexes
+		}
+		if cfg.Morpho.Blue != "" {
+			merged.Morpho = cfg.Morpho
+		}
+		if cfg.Storage.PostgresURL != "" {
+			merged.Storage = cfg.Storage
+		}
+		if cfg.Mode.Run != "" {
+			merged.Mode = cfg.Mode
+		}
+	}
+	return merged, nil
+}
+
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -79,7 +111,69 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.applyEnv()
+	expandEnvVars(reflect.ValueOf(cfg).Elem())
 	return cfg, nil
+}
+
+// expandEnvVars 递归展开所有 string 字段中的 ${VAR} 与 ${VAR:-default}。
+func expandEnvVars(v reflect.Value) {
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Field(i)
+		switch f.Kind() {
+		case reflect.String:
+			if f.CanSet() {
+				f.SetString(expand(f.String()))
+			}
+		case reflect.Struct:
+			expandEnvVars(f)
+		case reflect.Slice:
+			if f.Type().Elem().Kind() == reflect.String {
+				for j := 0; j < f.Len(); j++ {
+					if f.Index(j).CanSet() {
+						f.Index(j).SetString(expand(f.Index(j).String()))
+					}
+				}
+			} else if f.Type().Elem().Kind() == reflect.Struct {
+				for j := 0; j < f.Len(); j++ {
+					expandEnvVars(f.Index(j))
+				}
+			}
+		}
+	}
+}
+
+// expand 展开 ${VAR} 与 ${VAR:-default}（- 为前缀时变量为空也取默认）。
+func expand(s string) string {
+	var out strings.Builder
+	for {
+		start := strings.Index(s, "${")
+		if start < 0 {
+			out.WriteString(s)
+			return out.String()
+		}
+		out.WriteString(s[:start])
+		rest := s[start+2:]
+		end := strings.Index(rest, "}")
+		if end < 0 {
+			out.WriteString(s[start:])
+			return out.String()
+		}
+		expr := rest[:end]
+		name, def, hasDef := expr, "", false
+		if i := strings.Index(expr, ":-"); i >= 0 {
+			name, def, hasDef = expr[:i], expr[i+2:], true
+		}
+		val, ok := os.LookupEnv(name)
+		if !ok || (val == "" && hasDef && strings.HasPrefix(expr, name+":-")) {
+			if hasDef {
+				val = def
+			} else {
+				val = ""
+			}
+		}
+		out.WriteString(val)
+		s = rest[end+1:]
+	}
 }
 
 // applyEnv 用环境变量覆盖 YAML，用于部署时注入密钥与端点。

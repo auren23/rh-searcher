@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -100,6 +101,14 @@ func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock u
 	}
 	logs, err := a.cli.FilterLogs(ctx, q)
 	if err != nil {
+		if strings.Contains(err.Error(), "429") {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(3 * time.Second): // ponytail: 公共 RPC 限速退避
+			}
+			return a.DiscoverPools(ctx, fromBlock, toBlock) // 重试同批
+		}
 		return nil, err
 	}
 	ev := a.events[PoolCreatedTopic()]
@@ -108,11 +117,15 @@ func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock u
 	}
 	out := []*Pool{}
 	for _, l := range logs {
-		v, err := ev.Inputs.Unpack(l.Data)
-		if err != nil {
+		if len(l.Topics) < 4 {
 			continue
 		}
-		poolAddr := v[4].(common.Address)
+		// indexed: token0, token1, fee；data: tickSpacing, pool
+		v, err := ev.Inputs.Unpack(l.Data)
+		if err != nil || len(v) < 2 {
+			continue
+		}
+		poolAddr := v[1].(common.Address)
 		p := &Pool{
 			Address: poolAddr, Exchange: a.exchange,
 			Token0:        common.BytesToAddress(l.Topics[1][12:]),
@@ -120,9 +133,7 @@ func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock u
 			Fee:           uint32(new(big.Int).SetBytes(l.Topics[3][29:]).Uint64()),
 			ObservedBlock: l.BlockNumber,
 		}
-		if err := a.loadSlot0(ctx, p); err != nil {
-			continue // 池尚不可查询（刚创建）跳过，后续事件会补
-		}
+		// 惰性状态：slot0/liquidity 首次事件时加载，避免全量发现的 RPC 开销
 		out = append(out, p)
 	}
 	return out, nil
@@ -169,22 +180,18 @@ func (a *Adapter) ApplyLog(p *Pool, log types.Log) (*Pool, error) {
 	p.ObservedBlock = log.BlockNumber
 	switch ev.Name {
 	case "Swap":
-		amount0 := v[2].(*big.Int)
-		amount1 := v[3].(*big.Int)
 		p.SqrtPriceX96 = v[4].(*big.Int)
 		p.Liquidity = v[5].(*big.Int)
 		tick := v[6].(*big.Int)
 		p.Tick = int(tick.Int64())
-		_ = amount0
-		_ = amount1
 	case "Mint":
 		if p.Liquidity == nil {
-			p.Liquidity = new(big.Int)
+			_ = a.loadSlot0(context.Background(), p) // 惰性初始化
 		}
 		p.Liquidity.Add(p.Liquidity, v[3].(*big.Int))
 	case "Burn":
 		if p.Liquidity == nil {
-			p.Liquidity = new(big.Int)
+			_ = a.loadSlot0(context.Background(), p)
 		}
 		p.Liquidity.Sub(p.Liquidity, v[3].(*big.Int))
 		if p.Liquidity.Sign() < 0 {
@@ -308,3 +315,31 @@ func leftPadUint(v uint64, bits int) []byte {
 type stateAdapter struct{ p *Pool }
 
 func (s stateAdapter) Pool() dex.Pool { return s.p.Pool() }
+
+// PoolByAddress 按地址构造池并读取 token0/token1/fee（用于事件驱动下发现的新池）。
+func (a *Adapter) PoolByAddress(ctx context.Context, addr common.Address) (*Pool, error) {
+	callData := func(sig string) []byte { return crypto.Keccak256([]byte(sig))[:4] }
+	read := func(data []byte) ([]byte, error) {
+		return a.cli.CallContract(ctx, ethereum.CallMsg{To: &addr, Data: data}, nil)
+	}
+	t0raw, err := read(callData("token0()"))
+	if err != nil {
+		return nil, err
+	}
+	t1raw, err := read(callData("token1()"))
+	if err != nil {
+		return nil, err
+	}
+	feeraw, err := read(callData("fee()"))
+	if err != nil {
+		return nil, err
+	}
+	p := &Pool{
+		Address: addr, Exchange: a.exchange,
+		Token0: common.BytesToAddress(t0raw[12:32]),
+		Token1: common.BytesToAddress(t1raw[12:32]),
+		Fee:    uint32(new(big.Int).SetBytes(feeraw[29:32]).Uint64()),
+	}
+	_ = a.loadSlot0(ctx, p)
+	return p, nil
+}

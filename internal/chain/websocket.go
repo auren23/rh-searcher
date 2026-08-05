@@ -2,7 +2,9 @@ package chain
 
 import (
 	"context"
+	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +24,9 @@ type WSClient struct {
 }
 
 func NewWSClient(ctx context.Context, url string) (*WSClient, error) {
+	if !strings.HasPrefix(url, "ws://") && !strings.HasPrefix(url, "wss://") {
+		return nil, fmt.Errorf("not a websocket url: %s", url)
+	}
 	rc, err := rpc.DialContext(ctx, url)
 	if err != nil {
 		return nil, err

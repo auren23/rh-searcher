@@ -12,18 +12,18 @@ import (
 
 // Candidate 一个套利候选（observed 字段与执行结果严格分离，禁止 look-ahead）。
 type Candidate struct {
-	ID           string
+	ID            string
 	ObservedBlock uint64
-	ObservedAt   int64 // unix ms
-	SourceEvent  string // 触发来源：如 "swap:0x...:0x..."
-	Route        []Hop
-	InputAsset   common.Address
-	InputAmount  *big.Int
+	ObservedAt    int64  // unix ms
+	SourceEvent   string // 触发来源：如 "swap:0x...:0x..."
+	Route         []Hop
+	InputAsset    common.Address
+	InputAmount   *big.Int
 	// 以下为本地估算
-	GrossProfit     *big.Int
-	GasEstimate     *big.Int
-	SwapCost        *big.Int
-	SlippageCost    *big.Int
+	GrossProfit       *big.Int
+	GasEstimate       *big.Int
+	SwapCost          *big.Int
+	SlippageCost      *big.Int
 	ExpectedNetProfit *big.Int
 	// 以下为链上验证结果（模拟后）
 	SimulationResult string
@@ -33,13 +33,13 @@ type Candidate struct {
 
 // Hop 一跳。
 type Hop struct {
-	Pool       common.Address
-	Exchange   string
-	Fee        uint32
-	TokenIn    common.Address
-	TokenOut   common.Address
-	AmountIn   *big.Int
-	AmountOut  *big.Int
+	Pool      common.Address
+	Exchange  string
+	Fee       uint32
+	TokenIn   common.Address
+	TokenOut  common.Address
+	AmountIn  *big.Int
+	AmountOut *big.Int
 }
 
 // Sink 候选落盘接口：所有候选（含拒绝）必须记录，而不是只记成交。
@@ -49,19 +49,19 @@ type Sink interface {
 
 // Engine 套利引擎主循环（shadow 模式默认）。
 type Engine struct {
-	cfg      Config
-	sink     Sink
-	searcher Searcher
+	cfg       Config
+	sink      Sink
+	searcher  Searcher
 	evaluator Evaluator
-	executor Executor
+	executor  Executor
 }
 
 type Config struct {
-	WETH         common.Address
-	MinProfitWei *big.Int
+	WETH            common.Address
+	MinProfitWei    *big.Int
 	SafetyMarginWei *big.Int
-	MaxHops      int
-	Mode         string // dry | shadow | live
+	MaxHops         int
+	Mode            string // dry | shadow | live
 }
 
 func NewEngine(cfg Config, sink Sink, searcher Searcher, evaluator Evaluator, executor Executor) *Engine {
@@ -117,4 +117,3 @@ type Evaluator interface {
 type Executor interface {
 	Execute(ctx context.Context, c *Candidate) (hash common.Hash, err error)
 }
-
