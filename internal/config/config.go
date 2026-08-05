@@ -104,6 +104,9 @@ func LoadMerged(paths ...string) (*Config, error) {
 		if cfg.Mode.Run != "" {
 			merged.Mode = cfg.Mode
 		}
+		if cfg.Executor.Contract != "" || cfg.Executor.Wallet != "" {
+			merged.Executor = cfg.Executor
+		}
 	}
 	return merged, nil
 }

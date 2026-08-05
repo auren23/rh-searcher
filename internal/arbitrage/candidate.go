@@ -65,19 +65,21 @@ func (s *LocalSearcher) Optimize(ctx context.Context, r Route, block uint64, ts 
 	// 搜索上限：第一跳池单 tick 可承载量（由池深度决定）
 	hi := s.maxInputBound(ctx, r)
 	if hi == nil || hi.Sign() <= 0 {
-		return &Candidate{ObservedBlock: block, ObservedAt: ts, GrossProfit: big.NewInt(0)}
+		return emptyCandidate(r, block, ts, s.weth)
 	}
 	lo := big.NewInt(1e15) // 0.001 WETH 起
 
 	// 1. 对数网格粗搜（32 点，几何分布 lo..hi）
+	//    纯整数等比网格：ratio^(i/31) 用 big.Float 计算后 Int(nil) 取整（不走 int64）
 	best := big.NewInt(0)
 	bestProfit := big.NewInt(0)
-	loF := float64FromBig(lo)
-	hiF := float64FromBig(hi)
-	ratioF := hiF / loF // 通常 1e3~1e9 内，float64 精度足够做粗搜
+	loF := new(big.Float).SetInt(lo)
+	hiF := new(big.Float).SetInt(hi)
+	ratioF := new(big.Float).Quo(hiF, loF)
+	ratio64, _ := ratioF.Float64()
 	for i := 0; i < 32; i++ {
-		amtF := loF * powf(ratioF, float64(i)/31)
-		amt := big.NewInt(int64(amtF))
+		amtF := new(big.Float).Mul(loF, big.NewFloat(math.Pow(ratio64, float64(i)/31)))
+		amt, _ := amtF.Int(nil) // big.Int，无 int64 溢出
 		if amt.Sign() <= 0 {
 			amt = big.NewInt(1)
 		}
@@ -180,10 +182,9 @@ func (s *LocalSearcher) quoteRoute(ctx context.Context, r Route, amountIn *big.I
 			return nil, false
 		}
 		p := state.(*v3.Pool)
-		if !p.BitmapLoaded(p.WordPos()) {
-			if err := s.v3.LoadBitmapWord(ctx, p, p.WordPos()); err != nil {
-				return nil, false
-			}
+		// 统一状态入口：spacing/slot0/liquidity/bitmap 任缺 → 本次不评估
+		if err := s.v3.EnsureQuoteState(ctx, p); err != nil {
+			return nil, false
 		}
 		out, err := s.v3.QuoteExactIn(p, h.TokenIn, cur)
 		if err != nil || out.Sign() <= 0 {
@@ -224,4 +225,21 @@ func powf(base, exp float64) float64 {
 func float64FromBig(b *big.Int) float64 {
 	f, _ := new(big.Float).SetInt(b).Float64()
 	return f
+}
+
+// emptyCandidate 字段完整的空候选（无论搜索成败都不允许 nil 字段进入下游）。
+func emptyCandidate(r Route, block uint64, ts int64, weth common.Address) *Candidate {
+	return &Candidate{
+		ObservedBlock:    block,
+		ObservedAt:       ts,
+		Route:            r.Hops,
+		RouteJSON:        MarshalRoute(r.Hops),
+		InputAsset:       weth,
+		InputAmount:      new(big.Int),
+		GrossProfit:      new(big.Int),
+		GasEstimate:      new(big.Int),
+		SwapCost:         new(big.Int),
+		SlippageCost:     new(big.Int),
+		ExpectedNetProfit: new(big.Int),
+	}
 }

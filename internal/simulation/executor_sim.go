@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
 	"github.com/auren23/rh-searcher/internal/arbitrage"
@@ -38,9 +39,11 @@ func NewExecutorSimulator(cli *ethclient.Client, contract, from common.Address, 
 
 // SimResult 一次链上模拟的结果。
 type SimResult struct {
-	Profit    *big.Int // 合约返回的 WETH 净利（未扣 gas）
-	GasUsed   uint64
-	RevertMsg string
+	Profit       *big.Int // 合约返回的 WETH 净利（未扣 gas）
+	GasUsed      uint64
+	GasPriceWei  *big.Int // 模拟时的链上 gas 价格
+	CalldataHash string   // keccak(calldata)（与最终发送逐字节相同）
+	RevertMsg    string
 }
 
 // Simulate 构建并模拟 executeV3Cycle 调用。
@@ -57,17 +60,28 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	}
 	out, err := s.cli.CallContract(ctx, msg, nil)
 	if err != nil {
-		return &SimResult{RevertMsg: err.Error()}, nil
+		return &SimResult{RevertMsg: err.Error(), CalldataHash: hashHex(calldata)}, nil
 	}
 	if len(out) < 32 {
-		return &SimResult{RevertMsg: fmt.Sprintf("short return %d bytes", len(out))}, nil
+		return &SimResult{RevertMsg: fmt.Sprintf("short return %d bytes", len(out)), CalldataHash: hashHex(calldata)}, nil
 	}
 	profit := new(big.Int).SetBytes(out[:32])
 	gas, err := s.cli.EstimateGas(ctx, msg)
 	if err != nil {
 		gas = s.maxGas // 估算失败用上限（保守）
 	}
-	return &SimResult{Profit: profit, GasUsed: gas}, nil
+	// 动态 gas 价格（eth_gasPrice；失败时保守默认）
+	gasPrice, err := s.cli.SuggestGasPrice(ctx)
+	if err != nil || gasPrice.Sign() <= 0 {
+		gasPrice = big.NewInt(1e8) // 0.1 gwei 兜底
+	}
+	return &SimResult{Profit: profit, GasUsed: gas, GasPriceWei: gasPrice, CalldataHash: hashHex(calldata)}, nil
+}
+
+// hashHex keccak256 十六进制（calldata 指纹）。
+func hashHex(data []byte) string {
+	h := crypto.Keccak256(data)
+	return common.Bytes2Hex(h)
 }
 
 // BuildExecuteV3CycleCalldata 构建 ArbitrageExecutor.executeV3Cycle 的 ABI calldata。

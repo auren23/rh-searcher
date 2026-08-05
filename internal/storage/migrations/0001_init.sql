@@ -80,14 +80,13 @@ CREATE TABLE IF NOT EXISTS opportunities (
     simulation_result TEXT,
     decision        TEXT NOT NULL,
     reject_reason   TEXT,
-    tx_hash         TEXT,
     actual_net_profit NUMERIC,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS execution_attempts (
     id          BIGSERIAL PRIMARY KEY,
-    opportunity_id BIGINT REFERENCES opportunities(id),
+    opportunity_id TEXT REFERENCES opportunities(id),
     tx_hash     TEXT,
     status      TEXT NOT NULL, -- broadcast | confirmed | reverted | dropped
     error       TEXT,

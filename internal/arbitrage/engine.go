@@ -92,6 +92,10 @@ func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 	routes := e.searcher.FindRoutes(ctx, ev.Pool, e.cfg.WETH, e.cfg.MaxHops)
 	for _, r := range routes {
 		c := e.searcher.Optimize(ctx, r, ev.BlockNumber, ev.ReceivedAt)
+		if c == nil || c.InputAmount == nil {
+			slog.Error("searcher returned incomplete candidate", "route", routeID(r))
+			continue // 记录并跳过，绝不 panic
+		}
 		c.BlockHash = ev.BlockHash
 		c.TxHash = ev.TxHash
 		c.LogIndex = ev.LogIndex
@@ -101,7 +105,8 @@ func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 		c.Decision = verdict
 		c.RejectReason = reason
 		c.ExpectedNetProfit = profit
-		if c.Decision == "accepted" && e.cfg.Mode == "live" {
+		// live 判定：只有通过链上模拟的机会才允许发送（simulation_accepted）
+		if (c.Decision == SimulationAccepted) && e.cfg.Mode == "live" {
 			e.executor.Execute(ctx, c)
 		} else {
 			slog.Info("candidate", "block", ev.BlockNumber, "decision", c.Decision, "reason", reason,
@@ -140,6 +145,9 @@ func MarshalRoute(hops []Hop) string {
 	raw, _ := json.Marshal(hops)
 	return string(raw)
 }
+
+// SimulationAccepted 通过链上模拟的决策值（live 发送门槛）。
+const SimulationAccepted = "simulation_accepted"
 
 // Route 从 searcher 返回的候选路径。
 type Route struct {

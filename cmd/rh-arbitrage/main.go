@@ -122,20 +122,32 @@ func main() {
 
 	weth := common.HexToAddress(cfg.Chain.WETH)
 
-	// 链上模拟器：真实 executeV3Cycle calldata + eth_call（sim RPC 组）
-	var evaluator arbitrage.Evaluator = arbitrage.NewLocalEvaluator()
-	if cfg.Executor.Contract != "" && cfg.Executor.Wallet != "" && len(cfg.RPC.Groups.Sim) > 0 {
-		simCli, dialErr := ethclient.Dial(cfg.RPC.Groups.Sim[0])
-		if dialErr == nil {
-			sim := simulation.NewExecutorSimulator(simCli,
-				common.HexToAddress(cfg.Executor.Contract),
-				common.HexToAddress(cfg.Executor.Wallet), 5_000_000)
-			evaluator = simulation.NewSimulationEvaluator(sim, cfg.Chain.ID, big.NewInt(2e14))
-			slog.Info("simulation evaluator enabled", "contract", cfg.Executor.Contract)
-		} else {
-			slog.Warn("sim rpc dial failed, falling back to local evaluator", "err", dialErr)
-		}
+	// 链上模拟器：真实 executeV3Cycle calldata + eth_call（sim RPC 组）。
+	// shadow 模式失败关闭：无执行合约 / 无 sim RPC / 合约无代码 → 拒绝启动，
+	// 绝不静默降级成 LocalEvaluator（否则"accepted"只是本地数学，不是可执行验证）。
+	if cfg.Executor.Contract == "" || cfg.Executor.Wallet == "" {
+		slog.Error("executor.contract / executor.wallet not configured (required in shadow mode)")
+		os.Exit(1)
 	}
+	if len(cfg.RPC.Groups.Sim) == 0 {
+		slog.Error("no sim RPC configured (required in shadow mode)")
+		os.Exit(1)
+	}
+	simCli, dialErr := ethclient.Dial(cfg.RPC.Groups.Sim[0])
+	if dialErr != nil {
+		slog.Error("sim rpc dial failed", "err", dialErr)
+		os.Exit(1)
+	}
+	contractAddr := common.HexToAddress(cfg.Executor.Contract)
+	code, codeErr := simCli.CodeAt(ctx, contractAddr, nil)
+	if codeErr != nil || len(code) == 0 {
+		slog.Error("executor contract has no code", "contract", cfg.Executor.Contract, "err", codeErr)
+		os.Exit(1)
+	}
+	sim := simulation.NewExecutorSimulator(simCli, contractAddr,
+		common.HexToAddress(cfg.Executor.Wallet), 5_000_000)
+	evaluator := simulation.NewSimulationEvaluator(sim, cfg.Chain.ID, big.NewInt(2e14))
+	slog.Info("simulation evaluator enabled", "contract", cfg.Executor.Contract)
 
 	engine := arbitrage.NewEngine(
 		arbitrage.Config{
@@ -144,7 +156,7 @@ func main() {
 			MinProfitWei:    big.NewInt(1e15), // shadow 阶段仅记录，0.001 ETH 门槛
 			SafetyMarginWei: big.NewInt(2e14),
 			MaxHops:         2,
-			Mode:            "shadow",
+			Mode:            cfg.Mode.Run,
 		},
 		sink,
 		arbitrage.NewLocalSearcher(graph, reg, adapter, weth),
@@ -199,10 +211,18 @@ func main() {
 			if apply != nil {
 				apply()
 			}
-			reg.UpsertPool(state)
+			// Mint/Burn：本地历史 gross 不完整，重读链上 bitmap word 与 active liquidity
 			if isMintBurn {
-				continue // 状态更新完成，不触发套利
+				pool := state.(*v3.Pool)
+				if tl, tu, derr := v3.DecodeTickBounds(l); derr == nil {
+					if err := adapter.ResyncMintBurn(ctx, pool, tl, tu); err != nil {
+						slog.Warn("resync mint/burn", "pool", pool.Address.Hex(), "err", err)
+					}
+				}
+				reg.UpsertPool(state)
+				continue
 			}
+			reg.UpsertPool(state)
 			engine.OnSwap(ctx, arbitrage.SwapEvent{
 				Pool:        l.Address,
 				BlockNumber: l.BlockNumber,

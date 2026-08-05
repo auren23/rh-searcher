@@ -192,6 +192,14 @@ func (a *Adapter) DecodeLog(p *Pool, log types.Log) (apply func(), err error) {
 	return nil, nil
 }
 
+// DecodeTickBounds 从 Mint/Burn 日志解码 tick 区间（topics 布局：owner, tickLower, tickUpper）。
+func DecodeTickBounds(log types.Log) (tickLower, tickUpper int, err error) {
+	if len(log.Topics) < 4 {
+		return 0, 0, fmt.Errorf("need 4 topics, got %d", len(log.Topics))
+	}
+	return decodeInt24(log.Topics[2]), decodeInt24(log.Topics[3]), nil
+}
+
 // decodeInt24 从 topics 中解码 int24（右对齐 3 字节，补码）。
 func decodeInt24(topic common.Hash) int {
 	raw := new(big.Int).SetBytes(topic[29:32])
@@ -203,11 +211,19 @@ func decodeInt24(topic common.Hash) int {
 }
 
 // LoadBitmapWord 按需读取池 tickBitmap 的一个 word（区分"未加载"与"真实为 0"）。
+// 注意：wordPos 可能为负（负 tick 池），必须用 ABI 编码 int16 二补码，
+// 不能用 big.Int.Bytes()（负数返回绝对值）。
 func (a *Adapter) LoadBitmapWord(ctx context.Context, p *Pool, wordPos int64) error {
+	int16Type, err := abi.NewType("int16", "", nil)
+	if err != nil {
+		return err
+	}
+	encoded, err := abi.Arguments{{Type: int16Type}}.Pack(int16(wordPos))
+	if err != nil {
+		return err
+	}
 	sel := crypto.Keccak256([]byte("tickBitmap(int16)"))[:4]
-	arg := new(big.Int).SetInt64(wordPos)
-	argB := leftPad(arg.Bytes())
-	data := append(sel, argB...)
+	data := append(sel, encoded...)
 	res, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &p.Address, Data: data}, nil)
 	if err != nil {
 		return err
@@ -223,6 +239,73 @@ func (a *Adapter) LoadBitmapWord(ctx context.Context, p *Pool, wordPos int64) er
 	}
 	p.bitmap[wordPos] = new(big.Int).SetBytes(res[:32])
 	p.bitmapLoaded[wordPos] = true
+	return nil
+}
+
+// EnsureQuoteState 报价前统一确保池状态就绪：
+//   tickSpacing → 读取 tickSpacing()
+//   slot0/liquidity → 读取 slot0() 与 liquidity()
+//   当前 bitmap word → 读取 tickBitmap(wordPos)
+// 任一失败返回错误（调用方不得降级报价）。
+func (a *Adapter) EnsureQuoteState(ctx context.Context, p *Pool) error {
+	if p.TickSpacing <= 0 {
+		ts, err := a.readTickSpacing(ctx, p.Address)
+		if err != nil {
+			return err
+		}
+		p.TickSpacing = ts
+	}
+	if p.SqrtPriceX96 == nil || p.Liquidity == nil {
+		if err := a.loadSlot0(ctx, p); err != nil {
+			return err
+		}
+	}
+	if p.SqrtPriceX96 == nil || p.Liquidity == nil || p.Liquidity.Sign() <= 0 {
+		return ErrStateIncomplete
+	}
+	if !p.BitmapLoaded(p.WordPos()) {
+		if err := a.LoadBitmapWord(ctx, p, p.WordPos()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readTickSpacing 读取池的 tickSpacing()。
+func (a *Adapter) readTickSpacing(ctx context.Context, pool common.Address) (int, error) {
+	res, err := a.cli.CallContract(ctx, ethereum.CallMsg{
+		To:   &pool,
+		Data: crypto.Keccak256([]byte("tickSpacing()"))[:4],
+	}, nil)
+	if err != nil {
+		return 0, err
+	}
+	if len(res) < 32 {
+		return 0, fmt.Errorf("short tickSpacing response %d bytes", len(res))
+	}
+	ts := int(new(big.Int).SetBytes(res[29:32]).Int64())
+	if ts <= 0 {
+		return 0, fmt.Errorf("invalid tickSpacing %d", ts)
+	}
+	return ts, nil
+}
+
+// ResyncMintBurn 收到 Mint/Burn 后重读链上 bitmap word 与 active liquidity
+// （不自行推断历史 LiquidityGross —— 程序中途启动时本地历史不完整）。
+func (a *Adapter) ResyncMintBurn(ctx context.Context, p *Pool, tickLower, tickUpper int) error {
+	// 受影响的两个 word 重新加载
+	for _, w := range []int64{
+		int64(p.compressedTick(tickLower) >> 8),
+		int64(p.compressedTick(tickUpper) >> 8),
+	} {
+		if err := a.LoadBitmapWord(ctx, p, w); err != nil {
+			return err
+		}
+	}
+	// active liquidity 重读
+	if err := a.loadSlot0(ctx, p); err != nil {
+		return err
+	}
 	return nil
 }
 

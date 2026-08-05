@@ -6,15 +6,20 @@ import (
 
 // Graph 池图：token 邻接表，用于循环路径搜索。
 type Graph struct {
-	adj map[common.Address][]PoolRef
+	adj       map[common.Address][]PoolRef
+	seenEdges map[string]struct{} // 池地址去重（启动时 Bootstrap/Restore 可能重复添加）
 }
 
 func NewGraph() *Graph {
-	return &Graph{adj: make(map[common.Address][]PoolRef)}
+	return &Graph{adj: make(map[common.Address][]PoolRef), seenEdges: make(map[string]struct{})}
 }
 
-// AddPool 把池作为两个方向的边加入图。
+// AddPool 把池作为两个方向的边加入图（同一池只加一次）。
 func (g *Graph) AddPool(p Pool, addr common.Address) {
+	if _, dup := g.seenEdges[addr.Hex()]; dup {
+		return
+	}
+	g.seenEdges[addr.Hex()] = struct{}{}
 	g.adj[p.Token0] = append(g.adj[p.Token0], PoolRef{
 		Address: addr, Exchange: p.Exchange, Protocol: p.Protocol, Fee: p.Fee,
 		Token0: p.Token0, Token1: p.Token1, TokenInIsToken0: true,

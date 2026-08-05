@@ -39,17 +39,24 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 	if res.RevertMsg != "" {
 		return DecisionSimulationRejected, "revert: " + truncate(res.RevertMsg, 120), big.NewInt(0)
 	}
-	c.SimulationResult = "eth_call ok"
 	if res.Profit == nil {
 		return DecisionSimulationRejected, "no profit returned", big.NewInt(0)
 	}
 
-	// gas 成本（WETH 计价，1:1 ETH）
-	gasPrice := big.NewInt(1e8) // 保守默认 0.1 gwei；生产从 sim RPC 读 eth_gasPrice
+	// 完整记录：profit / gasUsed / gasPrice / calldata hash（供复盘与误差分析）
+	c.SimulationResult = "eth_call ok"
+	c.GasEstimate = new(big.Int).SetUint64(res.GasUsed)
+	c.SwapCost = big.NewInt(0) // DEX 费已含在链上 profit 中
+	c.SlippageCost = big.NewInt(0)
+	gasPrice := res.GasPriceWei
 	gasCostWei := new(big.Int).Mul(new(big.Int).SetUint64(res.GasUsed), gasPrice)
 	net := new(big.Int).Sub(res.Profit, gasCostWei)
 	net.Sub(net, e.safetyMarginWei)
 	c.ExpectedNetProfit = net
+	slog.Debug("simulation result",
+		"profit_wei", res.Profit.String(), "gas_used", res.GasUsed,
+		"gas_price_wei", gasPrice.String(), "net_wei", net.String(),
+		"calldata_hash", res.CalldataHash)
 
 	if net.Cmp(cfg.MinProfitWei) < 0 {
 		return DecisionSimulationRejected, "below min profit after gas", net
