@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 
@@ -41,16 +42,18 @@ func main() {
 
 	readURL := cfg.RPC.Groups.Read[0]
 	var src chain.Source
+	var cli *ethclient.Client
 	ws, wsErr := chain.NewWSClient(ctx, readURL)
 	if wsErr != nil {
 		slog.Warn("WS unavailable, falling back to polling", "url", readURL, "err", wsErr)
-		httpCli, err := ethclient.Dial(cfg.RPC.Groups.Archive[0])
+		cli, err = ethclient.Dial(cfg.RPC.Groups.Archive[0])
 		if err != nil {
 			slog.Error("dial http rpc", "err", err)
 			os.Exit(1)
 		}
-		src = chain.NewPollingSource(httpCli)
+		src = chain.NewPollingSource(cli)
 	} else {
+		cli = ws.Client()
 		src = ws
 	}
 
@@ -60,12 +63,6 @@ func main() {
 	var adapter *v3.Adapter
 	if len(cfg.Dexes.V3) > 0 {
 		d := cfg.Dexes.V3[0]
-		var cli *ethclient.Client
-		if ws != nil {
-			cli = ws.Client()
-		} else {
-			cli, _ = ethclient.Dial(cfg.RPC.Groups.Archive[0])
-		}
 		adapter, err = v3.NewAdapter(
 			cli, d.Name,
 			common.HexToAddress(d.Factory),
@@ -80,36 +77,80 @@ func main() {
 		}
 	}
 
-	// checkpoint 恢复：从上次高度继续发现池
 	ckpt := storage.NewCheckpoint("deployments/checkpoint.json")
 	heights, _ := ckpt.Load()
-	startBlock := heights["pools"]
-	if startBlock < cfg.Dexes.V3[0].FactoryBlock {
-		startBlock = cfg.Dexes.V3[0].FactoryBlock
-	}
-	slog.Info("discovering pools", "from", startBlock)
 
-	head, err := src.BlockByNumber(ctx, 0) // 最新头
-	if err != nil {
-		slog.Warn("head query failed", "err", err)
-	}
-	_ = head
-
-	// 分批发现池（每批 100k 块，公共 RPC 限速友好），断点续跑
-	if adapter != nil {
-		lastPoolBlock, err := v3.Bootstrap(ctx, adapter, reg, graph, startBlock, v3.BootstrapOptions{})
+	// 可选 PostgreSQL：池元数据落库/恢复
+	var db *storage.DB
+	if cfg.Storage.PostgresURL != "" {
+		db, err = storage.New(ctx, cfg.Storage.PostgresURL)
 		if err != nil {
-			slog.Warn("bootstrap incomplete", "err", err)
+			slog.Warn("postgres unavailable, pool persistence disabled", "err", err)
 		} else {
-			_ = ckpt.Save("pools", lastPoolBlock)
+			defer db.Close()
+			saved, err := db.LoadPools(ctx)
+			if err != nil {
+				slog.Error("load pools from db", "err", err)
+				os.Exit(1) // 不允许忽略恢复错误继续运行（漏池）
+			}
+			for _, sp := range saved {
+				p := v3.NewPoolFromMeta(
+					common.HexToAddress(sp.Address), sp.Exchange,
+					common.HexToAddress(sp.Token0), common.HexToAddress(sp.Token1), sp.Fee)
+				reg.UpsertPool(v3.State(p))
+				graph.AddPool(p.Pool(), p.Address)
+			}
+			slog.Info("restored pools from db", "count", len(saved))
 		}
+	}
+
+	// 启动时先读链头：Bootstrap 只扫到当前链头，不查询未来区块
+	headNum, err := cli.BlockNumber(ctx)
+	if err != nil {
+		slog.Error("read chain head", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("chain head", "block", headNum)
+
+	// 池引导（断点续扫到链头；bootstrap 错误不忽略）
+	if adapter != nil {
+		startBlock := heights["pools"]
+		if startBlock < cfg.Dexes.V3[0].FactoryBlock {
+			startBlock = cfg.Dexes.V3[0].FactoryBlock
+		}
+		slog.Info("discovering pools", "from", startBlock, "to", headNum)
+		lastPoolBlock, err := v3.Bootstrap(ctx, adapter, reg, graph, startBlock, headNum, v3.BootstrapOptions{})
+		if err != nil {
+			slog.Error("bootstrap failed (pools may be missing)", "err", err)
+			os.Exit(1)
+		}
+		_ = ckpt.Save("pools", lastPoolBlock)
 	}
 	slog.Info("total pools", "count", len(reg.AllPools()))
 
-	// 区块订阅 + 连续性检测
+	// 落库新发现池（若 db 可用）
+	if db != nil {
+		for _, st := range reg.AllPools() {
+			p := st.Pool()
+			if err := db.SavePool(ctx, p.ID, p.Exchange, p.Protocol, p.Token0, p.Token1, p.Fee); err != nil {
+				slog.Warn("save pool", "err", err)
+			}
+		}
+	}
+
+	// 订阅新池创建（PoolCreated）+ 区块
+	poolCreatedTopic := v3.PoolCreatedTopic()
+	createdLogs, createdErrs := src.SubscribeLogs(ctx, ethereum.FilterQuery{
+		Addresses: []common.Address{common.HexToAddress(cfg.Dexes.V3[0].Factory)},
+		Topics:    [][]common.Hash{{poolCreatedTopic}},
+	})
+	go func() {
+		for err := range createdErrs {
+			slog.Warn("pool-created subscription error", "err", err)
+		}
+	}()
+
 	heads, errs := src.SubscribeBlocks(ctx)
-	gaps := chain.NewGapDetector()
-	_ = gaps
 	metrics := telemetry.NewMetrics()
 	go func() {
 		for err := range errs {
@@ -129,6 +170,19 @@ func main() {
 				slog.Warn("checkpoint save", "err", err)
 			}
 			slog.Debug("head", "block", h.Number, "hash", h.Hash.Hex())
+		case l := <-createdLogs:
+			// 新池：从链上初始化并注册
+			p, err := adapter.PoolByAddress(ctx, l.Address)
+			if err != nil {
+				slog.Warn("new pool init", "addr", l.Address.Hex(), "err", err)
+				continue
+			}
+			reg.UpsertPool(v3.State(p))
+			graph.AddPool(p.Pool(), p.Address)
+			if db != nil {
+				_ = db.SavePool(ctx, p.Address.Hex(), p.Exchange, "v3", p.Token0, p.Token1, p.Fee)
+			}
+			slog.Info("new pool", "addr", p.Address.Hex(), "t0", p.Token0.Hex(), "t1", p.Token1.Hex(), "fee", p.Fee)
 		}
 	}
 }

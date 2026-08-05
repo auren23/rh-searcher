@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
@@ -23,7 +24,8 @@ func (b *GMGNBroadcaster) SendRawTransaction(ctx context.Context, rawTx []byte) 
 		return common.Hash{}, errors.New("no healthy GMGN endpoint")
 	}
 	start := time.Now()
-	err := c.RPC.CallContext(ctx, nil, "eth_sendRawTransaction", common.Bytes2Hex(rawTx))
+	// eth_sendRawTransaction 要求 0x 前缀的十六进制
+	err := c.RPC.CallContext(ctx, nil, "eth_sendRawTransaction", hexutil.Encode(rawTx))
 	c.Record(err == nil, time.Since(start))
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("gmgn send: %w", err)
@@ -46,7 +48,7 @@ func (b *SequencerBroadcaster) SendRawTransaction(ctx context.Context, rawTx []b
 		return common.Hash{}, errors.New("no healthy sequencer endpoint")
 	}
 	start := time.Now()
-	err := c.RPC.CallContext(ctx, nil, "eth_sendRawTransaction", common.Bytes2Hex(rawTx))
+	err := c.RPC.CallContext(ctx, nil, "eth_sendRawTransaction", hexutil.Encode(rawTx))
 	c.Record(err == nil, time.Since(start))
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("sequencer send: %w", err)

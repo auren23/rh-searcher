@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -76,34 +77,45 @@ func main() {
 	if fromBlock < d.FactoryBlock {
 		fromBlock = d.FactoryBlock
 	}
-	// 池引导（已完成的从 checkpoint 续跑；未完成的补全）
-	lastPoolBlock, _ := v3.Bootstrap(ctx, adapter, reg, graph, fromBlock, v3.BootstrapOptions{})
+	// 启动时读链头再引导（已完成的从 checkpoint 续跑；未完成的补全到链头）
+	headNum, err := cli.BlockNumber(ctx)
+	if err != nil {
+		slog.Error("read chain head", "err", err)
+		os.Exit(1)
+	}
+	lastPoolBlock, err := v3.Bootstrap(ctx, adapter, reg, graph, fromBlock, headNum, v3.BootstrapOptions{})
+	if err != nil {
+		slog.Error("bootstrap failed (pools may be missing)", "err", err)
+		os.Exit(1)
+	}
 	_ = ckpt.Save("pools", lastPoolBlock)
+
+	// 先初始化 DB，再创建 Engine（sink 必须可用，不允许静默丢失候选）
+	var sink *storage.DB
+	if cfg.Storage.PostgresURL != "" {
+		sink, err = storage.New(ctx, cfg.Storage.PostgresURL)
+		if err != nil {
+			slog.Error("postgres unavailable, refusing to run without persistence", "err", err)
+			os.Exit(1)
+		}
+		defer sink.Close()
+	}
 
 	weth := common.HexToAddress(cfg.Chain.WETH)
 	engine := arbitrage.NewEngine(
 		arbitrage.Config{
+			ChainID:         cfg.Chain.ID,
 			WETH:            weth,
 			MinProfitWei:    big.NewInt(1e15), // shadow 阶段仅记录，0.001 ETH 门槛
 			SafetyMarginWei: big.NewInt(2e14),
 			MaxHops:         2,
 			Mode:            "shadow",
 		},
-		nil,
+		sink,
 		arbitrage.NewLocalSearcher(graph, reg, adapter, weth),
 		arbitrage.NewLocalEvaluator(),
 		arbitrage.NewExecutor(),
 	)
-
-	var sink *storage.DB
-	if cfg.Storage.PostgresURL != "" {
-		sink, err = storage.New(ctx, cfg.Storage.PostgresURL)
-		if err != nil {
-			slog.Warn("postgres unavailable, candidates will not persist", "err", err)
-		} else {
-			defer sink.Close()
-		}
-	}
 
 	// 订阅 Swap 事件（轮询源内部处理重连/补块）
 	swapTopic := v3.SwapTopic()
@@ -138,12 +150,23 @@ func main() {
 					continue
 				}
 			}
-			if _, err := adapter.ApplyLog(state.(*v3.Pool), l); err != nil {
+			apply, err := adapter.DecodeLog(state.(*v3.Pool), l)
+			if err != nil {
 				slog.Warn("apply log", "err", err)
 				continue
 			}
+			if apply != nil {
+				apply()
+			}
 			reg.UpsertPool(state)
-			engine.OnSwap(ctx, l.Address, l.BlockNumber, int64(l.BlockNumber))
+			engine.OnSwap(ctx, arbitrage.SwapEvent{
+				Pool:        l.Address,
+				BlockNumber: l.BlockNumber,
+				BlockHash:   l.BlockHash,
+				TxHash:      l.TxHash,
+				LogIndex:    l.Index,
+				ReceivedAt:  time.Now().UnixMilli(),
+			})
 			metrics.CandidatesTotal.WithLabelValues("weth-2hop", "observed").Inc()
 		}
 	}

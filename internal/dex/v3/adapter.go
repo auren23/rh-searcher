@@ -15,31 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
-
-	"github.com/auren23/rh-searcher/internal/dex"
 )
-
-// Pool 内存中的 V3 池状态。
-type Pool struct {
-	Address      common.Address
-	Exchange     string
-	Token0       common.Address
-	Token1       common.Address
-	Fee          uint32
-	Tick         int
-	Liquidity    *big.Int
-	SqrtPriceX96 *big.Int
-	// ticks 未实现的完整 tick 位图；MVP 只做单区间报价
-	ObservedBlock uint64
-}
-
-func (p *Pool) Pool() dex.Pool {
-	return dex.Pool{
-		ID: p.Address.Hex(), Protocol: "v3", Exchange: p.Exchange,
-		Token0: p.Token0, Token1: p.Token1, Fee: p.Fee,
-		Liquidity: p.Liquidity, SqrtPriceX96: p.SqrtPriceX96, Tick: p.Tick,
-	}
-}
 
 // Factory 事件与函数签名（完整 ABI 只需用到的事件/方法）。
 const (
@@ -69,7 +45,7 @@ func NewAdapter(cli *ethclient.Client, exchange string, factory, router common.A
 		routerKind: routerKind, initCodeHash: initCodeHash, factoryBlock: factoryBlock,
 		events: make(map[common.Hash]abi.Event),
 	}
-	fullABI := fmt.Sprintf(`[{"anonymous":false,"inputs":[{"indexed":true,"name":"token0","type":"address"},{"indexed":true,"name":"token1","type":"address"},{"indexed":true,"name":"fee","type":"uint24"},{"indexed":false,"name":"tickSpacing","type":"int24"},{"indexed":false,"name":"pool","type":"address"}],"name":"PoolCreated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"sender","type":"address"},{"indexed":true,"name":"recipient","type":"address"},{"indexed":false,"name":"amount0","type":"int256"},{"indexed":false,"name":"amount1","type":"int256"},{"indexed":false,"name":"sqrtPriceX96","type":"uint160"},{"indexed":false,"name":"liquidity","type":"uint128"},{"indexed":false,"name":"tick","type":"int24"}],"name":"Swap","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":true,"name":"tickLower","type":"int24"},{"indexed":true,"name":"tickUpper","type":"int24"},{"indexed":false,"name":"amount","type":"uint128"},{"indexed":false,"name":"amount0","type":"uint256"},{"indexed":false,"name":"amount1","type":"uint256"}],"name":"Mint","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":true,"name":"tickLower","type":"int24"},{"indexed":true,"name":"tickUpper","type":"int24"},{"indexed":false,"name":"amount","type":"uint128"},{"indexed":false,"name":"amount0","type":"uint256"},{"indexed":false,"name":"amount1","type":"uint256"}],"name":"Burn","type":"event"}]`)
+	fullABI := fmt.Sprintf(`[{"anonymous":false,"inputs":[{"indexed":true,"name":"token0","type":"address"},{"indexed":true,"name":"token1","type":"address"},{"indexed":true,"name":"fee","type":"uint24"},{"indexed":false,"name":"tickSpacing","type":"int24"},{"indexed":false,"name":"pool","type":"address"}],"name":"PoolCreated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"sender","type":"address"},{"indexed":true,"name":"recipient","type":"address"},{"indexed":false,"name":"amount0","type":"int256"},{"indexed":false,"name":"amount1","type":"int256"},{"indexed":false,"name":"sqrtPriceX96","type":"uint160"},{"indexed":false,"name":"liquidity","type":"uint128"},{"indexed":false,"name":"tick","type":"int24"}],"name":"Swap","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"},{"indexed":true,"name":"owner","type":"address"},{"indexed":true,"name":"tickLower","type":"int24"},{"indexed":true,"name":"tickUpper","type":"int24"},{"indexed":false,"name":"amount","type":"uint128"},{"indexed":false,"name":"amount0","type":"uint256"},{"indexed":false,"name":"amount1","type":"uint256"}],"name":"Mint","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":true,"name":"tickLower","type":"int24"},{"indexed":true,"name":"tickUpper","type":"int24"},{"indexed":false,"name":"amount","type":"uint128"},{"indexed":false,"name":"amount0","type":"uint256"},{"indexed":false,"name":"amount1","type":"uint256"}],"name":"Burn","type":"event"}]`)
 	parsed, err := abi.JSON(strings.NewReader(fullABI))
 	if err != nil {
 		return nil, fmt.Errorf("parse v3 abi: %w", err)
@@ -132,6 +108,8 @@ func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock u
 			Token1:        common.BytesToAddress(l.Topics[2][12:]),
 			Fee:           uint32(new(big.Int).SetBytes(l.Topics[3][29:]).Uint64()),
 			ObservedBlock: l.BlockNumber,
+			ticks:         make(map[int]*Tick),
+			bitmap:        make(map[int64]*big.Int),
 		}
 		// 惰性状态：slot0/liquidity 首次事件时加载，避免全量发现的 RPC 开销
 		out = append(out, p)
@@ -164,85 +142,180 @@ func (a *Adapter) loadSlot0(ctx context.Context, p *Pool) error {
 	return nil
 }
 
-// ApplyLog 应用 Swap/Mint/Burn 到池状态。
-func (a *Adapter) ApplyLog(p *Pool, log types.Log) (*Pool, error) {
-	if log.Address != p.Address {
-		return p, fmt.Errorf("log from wrong pool")
-	}
+// DecodeLog 解码一条事件到池状态。返回 (池状态变更闭包, 是否认识的事件)。
+// 事件 ABI（data 字段顺序，indexed 参数在 topics）：
+//   Swap:   amount0, amount1, sqrtPriceX96, liquidity, tick
+//   Mint:   sender, amount, amount0, amount1（sender 非 indexed！）
+//   Burn:   amount, amount0, amount1
+func (a *Adapter) DecodeLog(p *Pool, log types.Log) (apply func(), err error) {
 	ev, ok := a.events[log.Topics[0]]
 	if !ok {
-		return p, nil
+		return nil, nil // 不认识的事件，忽略
 	}
 	v, err := ev.Inputs.Unpack(log.Data)
 	if err != nil {
-		return p, fmt.Errorf("unpack %s: %w", ev.Name, err)
+		return nil, fmt.Errorf("unpack %s: %w", ev.Name, err)
 	}
-	p.ObservedBlock = log.BlockNumber
 	switch ev.Name {
 	case "Swap":
-		p.SqrtPriceX96 = v[4].(*big.Int)
-		p.Liquidity = v[5].(*big.Int)
-		tick := v[6].(*big.Int)
-		p.Tick = int(tick.Int64())
+		if len(v) < 5 {
+			return nil, fmt.Errorf("Swap: %d values, want 5", len(v))
+		}
+		sqrtPriceX96 := v[2].(*big.Int)
+		liquidity := v[3].(*big.Int)
+		tick := v[4].(*big.Int)
+		return func() { p.ApplySwap(log, sqrtPriceX96, liquidity, int(tick.Int64())) }, nil
 	case "Mint":
-		if p.Liquidity == nil {
-			_ = a.loadSlot0(context.Background(), p) // 惰性初始化
+		if len(v) < 4 {
+			return nil, fmt.Errorf("Mint: %d values, want 4", len(v))
 		}
-		p.Liquidity.Add(p.Liquidity, v[3].(*big.Int))
+		amount := v[1].(*big.Int)
+		tickLower := decodeInt24(log.Topics[2])
+		tickUpper := decodeInt24(log.Topics[3])
+		return func() { p.ApplyMintBurn(log, tickLower, tickUpper, amount, true) }, nil
 	case "Burn":
-		if p.Liquidity == nil {
-			_ = a.loadSlot0(context.Background(), p)
+		if len(v) < 3 {
+			return nil, fmt.Errorf("Burn: %d values, want 3", len(v))
 		}
-		p.Liquidity.Sub(p.Liquidity, v[3].(*big.Int))
-		if p.Liquidity.Sign() < 0 {
-			p.Liquidity.SetInt64(0)
-		}
+		amount := v[0].(*big.Int)
+		// Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, ...)
+		tickLower := decodeInt24(log.Topics[2])
+		tickUpper := decodeInt24(log.Topics[3])
+		return func() { p.ApplyMintBurn(log, tickLower, tickUpper, amount, false) }, nil
 	}
-	return p, nil
+	return nil, nil
 }
 
-// QuoteExactIn 本地报价（单 tick 区间内精确，跨 tick 返回近似误差已标记）。
+// decodeInt24 从 topics 中解码 int24（右对齐 3 字节，补码）。
+func decodeInt24(topic common.Hash) int {
+	raw := new(big.Int).SetBytes(topic[29:32])
+	n := raw.Int64()
+	if n >= 1<<23 {
+		n -= 1 << 24
+	}
+	return int(n)
+}
+
+// QuoteExactIn 本地精确报价（严格单 tick 模式）。
+// - 双向公式与官方 SqrtPriceMath 一致（token0 输入走 getNextSqrtPriceFromAmount0RoundingUp(add=false)，
+//   token1 输入走 getNextSqrtPriceFromAmount1RoundingDown(add=true)）
+// - 输入超过下一 initialized tick 边界 → ErrTickCrossed（绝不近似）
+// - tick 索引不完整（无 slot0/流动性）→ ErrStateIncomplete
 func (a *Adapter) QuoteExactIn(p *Pool, tokenIn common.Address, amountIn *big.Int) (*big.Int, error) {
 	if amountIn.Sign() <= 0 {
 		return big.NewInt(0), nil
 	}
-	// 扣手续费
-	feeNum := new(big.Int).SetUint64(1_000_000 - uint64(p.Fee))
-	amountAfterFee := new(big.Int).Mul(amountIn, feeNum)
-	amountAfterFee.Div(amountAfterFee, big.NewInt(1_000_000))
-
-	Q := new(big.Int).Set(p.SqrtPriceX96)
-	L := new(big.Int).Set(p.Liquidity)
-	if L.Sign() <= 0 {
-		return nil, fmt.Errorf("pool %s has zero liquidity", p.Address.Hex())
+	if p.SqrtPriceX96 == nil || p.Liquidity == nil || p.Liquidity.Sign() <= 0 {
+		return nil, ErrStateIncomplete
 	}
-	numerator1 := new(big.Int).Lsh(L, 96)
-	product := new(big.Int).Mul(amountAfterFee, Q)
-	denominator := new(big.Int).Add(numerator1, product)
-	// Q' = ceil(numerator1 * Q / denominator)
-	Qp := new(big.Int).Mul(numerator1, Q)
-	Qp.Add(Qp, new(big.Int).Sub(denominator, big.NewInt(1)))
-	Qp.Div(Qp, denominator)
+	zeroForOne := tokenIn == p.Token0
+	if !zeroForOne && tokenIn != p.Token1 {
+		return nil, fmt.Errorf("tokenIn %s not in pool %s", tokenIn.Hex(), p.Address.Hex())
+	}
+	// 扣手续费
+	amount := new(big.Int).Mul(amountIn, new(big.Int).SetUint64(uint64(1_000_000-p.Fee)))
+	amount.Div(amount, big.NewInt(1_000_000))
+	if amount.Sign() <= 0 {
+		return big.NewInt(0), nil
+	}
 
-	// out = L * |Q' - Q| * 2^96 / (Q * Q')
-	dQ := new(big.Int).Sub(Qp, Q)
-	dQ.Abs(dQ)
-	out := new(big.Int).Mul(L, dQ)
-	out.Lsh(out, 96)
-	out.Div(out, new(big.Int).Mul(Q, Qp))
+	Q := p.SqrtPriceX96
+	L := p.Liquidity
+	var out *big.Int
+	if zeroForOne {
+		// token0 → token1：用户给池 token0（池 token0 增加）→ 价格（token1/token0）下降。
+		// 官方 SwapMath: getNextSqrtPriceFromAmount0RoundingUp(add=true)，Q' < Q。
+		// 边界 = 下一 initialized tick（向下，价格更低的方向）。
+		boundTick, _ := p.nextInitializedTick(p.Tick, true)
+		Qb := GetSqrtRatioAtTick(boundTick)
+		if Qb.Cmp(Q) >= 0 {
+			return nil, ErrTickCrossed
+		}
+		// x_max：Q' = ceil(n1*Q/(n1+x*Q)) → x = floor(n1*(Q-Q')/(Q*Q'))
+		xMax := new(big.Int).Lsh(L, 96)
+		xMax.Mul(xMax, new(big.Int).Sub(Q, Qb))
+		xMax.Div(xMax, new(big.Int).Mul(Q, Qb))
+		if amount.Cmp(xMax) > 0 {
+			return nil, ErrTickCrossed
+		}
+		Qp := getNextSqrtPriceFromAmount0RoundingUp(Q, L, amount, true)
+		out = getAmount1Delta(Qp, Q, L, false) // Qp < Q
+	} else {
+		// token1 → token0：池 token1 增加 → 价格上升。add=true，Q' > Q。
+		boundTick, _ := p.nextInitializedTick(p.Tick, false)
+		Qb := GetSqrtRatioAtTick(boundTick)
+		if Qb.Cmp(Q) <= 0 {
+			return nil, ErrTickCrossed
+		}
+		// y_max：Q' = Q + y*2^96/L → y = floor((Qb-Q)*L/2^96)
+		yMax := new(big.Int).Sub(Qb, Q)
+		yMax.Mul(yMax, L)
+		yMax.Rsh(yMax, 96)
+		if amount.Cmp(yMax) > 0 {
+			return nil, ErrTickCrossed
+		}
+		Qp := getNextSqrtPriceFromAmount1RoundingDown(Q, L, amount, true)
+		out = getAmount0Delta(Q, Qp, L, false) // Qp > Q
+	}
 	return out, nil
 }
 
-// BuildSwap 构建 Router.exactInputSingle 的 calldata。tokenIn 决定交易方向。
-func (a *Adapter) BuildSwap(p *Pool, tokenIn, recipient common.Address, amountIn, minOut *big.Int, deadline uint64, sqrtPriceLimit *big.Int) ([]byte, error) {
-	// exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96))
-	sig := "exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))"
-	selector := crypto.Keccak256([]byte(sig))[:4]
-	enc := make([]byte, 0, 32*8+4)
-	enc = append(enc, selector...)
-	if p.Token0 == p.Token1 {
-		return nil, fmt.Errorf("degenerate pool")
+
+
+// PoolByAddress 按地址构造池并读取 token0/token1/fee/tickSpacing（含返回长度校验 + Factory 归属验证）。
+func (a *Adapter) PoolByAddress(ctx context.Context, addr common.Address) (*Pool, error) {
+	read := func(data []byte) ([]byte, error) {
+		res, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &addr, Data: data}, nil)
+		if err != nil {
+			return nil, err
+		}
+		if len(res) < 32 {
+			return nil, fmt.Errorf("short response %d bytes", len(res))
+		}
+		return res, nil
 	}
+	t0raw, err := read(crypto.Keccak256([]byte("token0()"))[:4])
+	if err != nil {
+		return nil, err
+	}
+	t1raw, err := read(crypto.Keccak256([]byte("token1()"))[:4])
+	if err != nil {
+		return nil, err
+	}
+	feeraw, err := read(crypto.Keccak256([]byte("fee()"))[:4])
+	if err != nil {
+		return nil, err
+	}
+	tsraw, err := read(crypto.Keccak256([]byte("tickSpacing()"))[:4])
+	if err != nil {
+		return nil, err
+	}
+	// Factory 归属验证：factory.getPool(token0, token1, fee) == addr
+	sel := crypto.Keccak256([]byte("getPool(address,address,uint24)"))[:4]
+	args := append(append(append(sel,
+		leftPad(t0raw[12:32])...), leftPad(t1raw[12:32])...), leftPad(feeraw[29:32])...)
+	got, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &a.factory, Data: args}, nil)
+	if err != nil || len(got) < 32 || common.BytesToAddress(got[12:32]) != addr {
+		return nil, fmt.Errorf("pool %s not verified by factory %s", addr.Hex(), a.factory.Hex())
+	}
+	p := &Pool{
+		Address: addr, Exchange: a.exchange,
+		Token0:      common.BytesToAddress(t0raw[12:32]),
+		Token1:      common.BytesToAddress(t1raw[12:32]),
+		Fee:         uint32(new(big.Int).SetBytes(feeraw[29:32]).Uint64()),
+		TickSpacing: int(new(big.Int).SetBytes(tsraw[29:32]).Int64()),
+		ticks:       make(map[int]*Tick),
+		bitmap:      make(map[int64]*big.Int),
+	}
+	_ = a.loadSlot0(ctx, p)
+	return p, nil
+}
+
+// BuildSwap 构建 swap calldata。按 router kind 分支：
+//   - swaprouter: SwapRouter.exactInputSingle
+//   - universal:  UniversalRouter.execute(commands, inputs) 的 V3_SWAP_EXACT_IN (0x08)
+// tokenIn 决定交易方向。
+func (a *Adapter) BuildSwap(p *Pool, tokenIn, recipient common.Address, amountIn, minOut *big.Int, deadline uint64, sqrtPriceLimit *big.Int) ([]byte, error) {
 	tokenOut := p.Token1
 	if tokenIn == p.Token0 {
 		tokenOut = p.Token1
@@ -251,10 +324,21 @@ func (a *Adapter) BuildSwap(p *Pool, tokenIn, recipient common.Address, amountIn
 	} else {
 		return nil, fmt.Errorf("tokenIn %s not in pool %s", tokenIn.Hex(), p.Address.Hex())
 	}
-	// 参数按 ABI 编码（uint160 补零）
+	if a.routerKind == "universal" {
+		return buildUniversalSwap(tokenIn, tokenOut, p.Fee, recipient, amountIn, minOut)
+	}
+	return buildSwapRouterCall(tokenIn, tokenOut, p.Fee, recipient, amountIn, minOut, deadline, sqrtPriceLimit)
+}
+
+// buildSwapRouterCall SwapRouter.exactInputSingle calldata。
+func buildSwapRouterCall(tokenIn, tokenOut common.Address, fee uint32, recipient common.Address, amountIn, minOut *big.Int, deadline uint64, sqrtPriceLimit *big.Int) ([]byte, error) {
+	sig := "exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))"
+	selector := crypto.Keccak256([]byte(sig))[:4]
+	enc := make([]byte, 0, 32*8+4)
+	enc = append(enc, selector...)
 	enc = append(enc, leftPad(tokenIn.Bytes())...)
 	enc = append(enc, leftPad(tokenOut.Bytes())...)
-	enc = append(enc, leftPadUint(uint64(p.Fee), 24)...)
+	enc = append(enc, leftPadUint(uint64(fee), 24)...)
 	enc = append(enc, leftPad(recipient.Bytes())...)
 	enc = append(enc, leftPadUint(deadline, 256)...)
 	enc = append(enc, leftPad(amountIn.Bytes())...)
@@ -286,13 +370,11 @@ func buildUniversalSwap(tokenIn, tokenOut common.Address, fee uint32, recipient 
 	v3SwapInput = append(v3SwapInput, leftPad(recipient.Bytes())...)
 	v3SwapInput = append(v3SwapInput, leftPad(amountIn.Bytes())...)
 	v3SwapInput = append(v3SwapInput, leftPad(minOut.Bytes())...)
-	// bytes path 的动态编码：offset, len, data（pad 到 32）
 	pathOff := 32 * 3
 	v3SwapInput = append(v3SwapInput, leftPadUint(uint64(pathOff), 256)...)
 	v3SwapInput = append(v3SwapInput, leftPadUint(uint64(len(path)), 256)...)
 	v3SwapInput = append(v3SwapInput, path...)
 	v3SwapInput = append(v3SwapInput, make([]byte, (32-len(path)%32)%32)...)
-	// bool payerIsUser
 	v3SwapInput = append(v3SwapInput, make([]byte, 31)...)
 	v3SwapInput = append(v3SwapInput, 0)
 
@@ -309,37 +391,4 @@ func leftPad(b []byte) []byte {
 func leftPadUint(v uint64, bits int) []byte {
 	b := big.NewInt(int64(v)).Bytes()
 	return leftPad(b)
-}
-
-// PoolState 适配 dex.PoolState 接口。
-type stateAdapter struct{ p *Pool }
-
-func (s stateAdapter) Pool() dex.Pool { return s.p.Pool() }
-
-// PoolByAddress 按地址构造池并读取 token0/token1/fee（用于事件驱动下发现的新池）。
-func (a *Adapter) PoolByAddress(ctx context.Context, addr common.Address) (*Pool, error) {
-	callData := func(sig string) []byte { return crypto.Keccak256([]byte(sig))[:4] }
-	read := func(data []byte) ([]byte, error) {
-		return a.cli.CallContract(ctx, ethereum.CallMsg{To: &addr, Data: data}, nil)
-	}
-	t0raw, err := read(callData("token0()"))
-	if err != nil {
-		return nil, err
-	}
-	t1raw, err := read(callData("token1()"))
-	if err != nil {
-		return nil, err
-	}
-	feeraw, err := read(callData("fee()"))
-	if err != nil {
-		return nil, err
-	}
-	p := &Pool{
-		Address: addr, Exchange: a.exchange,
-		Token0: common.BytesToAddress(t0raw[12:32]),
-		Token1: common.BytesToAddress(t1raw[12:32]),
-		Fee:    uint32(new(big.Int).SetBytes(feeraw[29:32]).Uint64()),
-	}
-	_ = a.loadSlot0(ctx, p)
-	return p, nil
 }

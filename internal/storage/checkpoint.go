@@ -50,7 +50,12 @@ func (c *Checkpoint) Save(strategy string, block uint64) error {
 	if err := os.MkdirAll(filepath.Dir(c.Path), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(c.Path, raw, 0o644); err != nil {
+	// 原子写：临时文件 + rename，防止写到一半损坏
+	tmp := c.Path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, c.Path); err != nil {
 		return err
 	}
 	slog.Debug("checkpoint saved", "strategy", strategy, "block", block)

@@ -61,11 +61,15 @@ CREATE TABLE IF NOT EXISTS strategy_checkpoints (
 
 -- 机会与执行：拒绝的机会也必须入库
 CREATE TABLE IF NOT EXISTS opportunities (
-    id              BIGSERIAL PRIMARY KEY,
+    id              TEXT PRIMARY KEY,
     strategy        TEXT NOT NULL,
     observed_block  BIGINT NOT NULL,
     observed_at     BIGINT NOT NULL,
     source_event    TEXT,
+    block_hash      TEXT,
+    tx_hash         TEXT,
+    log_index       BIGINT,
+    route_json      TEXT,
     input_asset     TEXT,
     input_amount    NUMERIC,
     gross_profit    NUMERIC,
