@@ -1,0 +1,7 @@
+# Morpho Blue 配置（MVP 只做 Morpho Blue，不做 Midnight）。
+# 地址为占位符 —— M0 从 Morpho 官方地址页核实。
+morpho:
+  blue: "0x0000000000000000000000000000000000000000" # M0 TODO: 核实
+  bootstrap_api: "https://blue-api.morpho.org/graphql" # M0 TODO: 核实 Robinhood 支持
+  # 活跃市场：M0 核实后填入（loan/collateral/oracle/irm/lltv）
+  markets: []

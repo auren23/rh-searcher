@@ -1,0 +1,47 @@
+# 密钥与敏感信息 —— 绝不提交
+.env
+.env.*
+*.pem
+*.key
+!*.sol  # 保留合约源文件
+**/keystore*/
+**/secret*
+gmgn_env.sh
+id_rsa*
+*.p12
+
+# Go
+rh-searcher/bin/
+rh-searcher/dist/
+*.test
+*.out
+coverage.*
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/lib/forge-std/cache/
+
+# 运行数据
+deployments/checkpoint.json
+deployments/*.json
+!deployments/prometheus.yml
+!deployments/*.md
+data/
+*.db
+*.sqlite*
+
+# 研究产物（不进仓库）
+research/notebooks/.ipynb_checkpoints/
+research/reports/*.html
+
+# 日志与临时文件
+*.log
+/tmp/
+nohup.out
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp

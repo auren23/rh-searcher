@@ -1,0 +1,31 @@
+# rh-searcher 链配置。
+# 所有地址均为占位符 —— M0 验收：从官方地址页和链上字节码确认，标注来源、部署区块、字节码哈希。
+# 敏感值（私钥/API Key）一律用环境变量注入，禁止写入本文件。
+
+chain:
+  id: 224168 # M0 TODO: 核实 Robinhood Chain ID
+  weth: "0x4200000000000000000000000000000000000006" # M0 TODO: 核实（OP Stack 标准 WETH 桥地址）
+  wbtc: "" # M0 TODO
+  usdc: "" # M0 TODO
+  gas_limit: 5000000
+
+rpc:
+  # 读取/发送/模拟严格分组，不要一个 RPC 承担所有职责
+  groups:
+    archive: # 历史读取
+      - "${RH_ARCHIVE_RPC}"
+    read: # 实时 WebSocket 读取
+      - "${RH_READ_WS_RPC}"
+    sim: # 独立模拟 RPC
+      - "${RH_SIM_RPC}"
+    send: # GMGN 快速 RPC（发送专用）
+      - "${RH_GMGN_RPC}"
+  timeout_sec: 10
+  max_retries: 3
+
+mode:
+  run: "shadow" # dry | shadow | live —— live 前必须通过 M5 Canary 门槛
+
+# 存储（本地开发用 docker-compose 的 postgres）
+storage:
+  postgres_url: "${RH_POSTGRES_URL:-postgres://rh:rh@localhost:5432/rh}"
