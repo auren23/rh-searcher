@@ -8,6 +8,20 @@ on:
 jobs:
   go:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: rh
+          POSTGRES_PASSWORD: rh
+          POSTGRES_DB: rh
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rh"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -17,8 +31,42 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
-      - name: Test
+      - name: Test (unit)
         run: go test ./...
+      - name: Test (postgres migrations)
+        env:
+          RH_TEST_PG_URL: postgres://rh:rh@localhost:5432/rh
+        run: |
+          # 空库依次执行 0001 + 0002
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0001_init.sql
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0002_shadow_schema_fix.sql
+          psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q "route_json" && echo "0001+0002 OK"
+          # 模拟旧结构（0001 早期版）后只跑 0002
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          DROP TABLE IF EXISTS execution_attempts, opportunities, dex_pools CASCADE;
+          CREATE TABLE opportunities (
+            id BIGSERIAL PRIMARY KEY, strategy TEXT NOT NULL,
+            observed_block BIGINT NOT NULL, observed_at BIGINT NOT NULL,
+            source_event TEXT, input_asset TEXT, input_amount NUMERIC,
+            gross_profit NUMERIC, gas_estimate NUMERIC, swap_cost NUMERIC,
+            slippage_cost NUMERIC, expected_net_profit NUMERIC,
+            simulation_result TEXT, decision TEXT NOT NULL, reject_reason TEXT,
+            tx_hash TEXT, actual_net_profit NUMERIC, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          );
+          CREATE TABLE execution_attempts (
+            id BIGSERIAL PRIMARY KEY,
+            opportunity_id BIGINT REFERENCES opportunities(id),
+            tx_hash TEXT, status TEXT NOT NULL, error TEXT,
+            attempt_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          );
+          CREATE TABLE dex_pools (
+            address TEXT PRIMARY KEY, exchange TEXT NOT NULL, protocol TEXT NOT NULL,
+            token0 TEXT NOT NULL, token1 TEXT NOT NULL, fee INT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          );
+SQL
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0002_shadow_schema_fix.sql
+          psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q "route_json" && echo "0002-only OK"
 
   forge:
     runs-on: ubuntu-latest
@@ -27,11 +75,8 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
       - name: Build contracts
-        run: |
-          cd contracts
-          forge install foundry-rs/forge-std --no-git
-          forge build
+        working-directory: contracts
+        run: forge build
       - name: Test contracts
-        run: |
-          cd contracts
-          forge test
+        working-directory: contracts
+        run: forge test -vvv

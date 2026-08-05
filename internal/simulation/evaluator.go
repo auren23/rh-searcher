@@ -43,19 +43,23 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 		return DecisionSimulationRejected, "no profit returned", big.NewInt(0)
 	}
 
-	// 完整记录：profit / gasUsed / gasPrice / calldata hash（供复盘与误差分析）
+	// 完整记录：profit / gasUsed / gasPrice / gasCost / calldata hash（供复盘与误差分析）
 	c.SimulationResult = "eth_call ok"
 	c.GasEstimate = new(big.Int).SetUint64(res.GasUsed)
 	c.SwapCost = big.NewInt(0) // DEX 费已含在链上 profit 中
 	c.SlippageCost = big.NewInt(0)
-	gasPrice := res.GasPriceWei
-	gasCostWei := new(big.Int).Mul(new(big.Int).SetUint64(res.GasUsed), gasPrice)
+	c.SimulatedProfitWei = new(big.Int).Set(res.Profit)
+	c.GasUsed = res.GasUsed
+	c.GasPriceWei = new(big.Int).Set(res.GasPriceWei)
+	gasCostWei := new(big.Int).Mul(new(big.Int).SetUint64(res.GasUsed), res.GasPriceWei)
+	c.GasCostWei = new(big.Int).Set(gasCostWei)
+	c.CalldataHash = res.CalldataHash
 	net := new(big.Int).Sub(res.Profit, gasCostWei)
 	net.Sub(net, e.safetyMarginWei)
 	c.ExpectedNetProfit = net
 	slog.Debug("simulation result",
 		"profit_wei", res.Profit.String(), "gas_used", res.GasUsed,
-		"gas_price_wei", gasPrice.String(), "net_wei", net.String(),
+		"gas_price_wei", res.GasPriceWei.String(), "net_wei", net.String(),
 		"calldata_hash", res.CalldataHash)
 
 	if net.Cmp(cfg.MinProfitWei) < 0 {

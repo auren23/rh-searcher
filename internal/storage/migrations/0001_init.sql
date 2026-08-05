@@ -80,6 +80,13 @@ CREATE TABLE IF NOT EXISTS opportunities (
     simulation_result TEXT,
     decision        TEXT NOT NULL,
     reject_reason   TEXT,
+    simulated_profit_wei NUMERIC,
+    gas_used        BIGINT,
+    gas_price_wei   NUMERIC,
+    gas_cost_wei    NUMERIC,
+    calldata_hash   TEXT,
+    state_block     BIGINT,
+    simulation_block BIGINT,
     actual_net_profit NUMERIC,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

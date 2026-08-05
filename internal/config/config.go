@@ -17,9 +17,10 @@ type Config struct {
 	RPC     RPCConfig     `yaml:"rpc"`
 	Dexes   DexesConfig   `yaml:"dexes"`
 	Morpho  MorphoConfig  `yaml:"morpho"`
-	Storage  StorageConfig  `yaml:"storage"`
-	Mode     ModeConfig     `yaml:"mode"`
-	Executor ExecutorConfig `yaml:"executor"`
+	Storage  StorageConfig     `yaml:"storage"`
+	Mode     ModeConfig        `yaml:"mode"`
+	Executor ExecutorConfig    `yaml:"executor"`
+	Arbitrage ArbitrageConfig  `yaml:"arbitrage"`
 }
 
 type ChainConfig struct {
@@ -70,6 +71,14 @@ type StorageConfig struct {
 type ModeConfig struct {
 	// dry: 只发现和记录；shadow: 模拟但不发送；live: 真实发送
 	Run string `yaml:"run"`
+}
+
+// ArbitrageConfig 套利策略参数（资金限制与模拟深度）。
+type ArbitrageConfig struct {
+	MaxInputWei     string `yaml:"max_input_wei"`      // 单笔最大输入（wei）
+	MinProfitWei    string `yaml:"min_profit_wei"`     // 最小净利（wei）
+	SafetyMarginWei string `yaml:"safety_margin_wei"`  // 安全边际（wei）
+	SimulationTopK  int    `yaml:"simulation_top_k"`   // 本地 Top-K 输入量逐个 eth_call
 }
 
 // ExecutorConfig 执行合约与热钱包（模拟/发送用）。
@@ -214,6 +223,12 @@ func (c *Config) applyEnv() {
 	}
 	if v := os.Getenv("RH_HOT_WALLET"); v != "" {
 		c.Executor.Wallet = v
+	}
+	if v := os.Getenv("RH_MAX_INPUT_WEI"); v != "" {
+		c.Arbitrage.MaxInputWei = v
+	}
+	if v := os.Getenv("RH_MIN_PROFIT_WEI"); v != "" {
+		c.Arbitrage.MinProfitWei = v
 	}
 }
 

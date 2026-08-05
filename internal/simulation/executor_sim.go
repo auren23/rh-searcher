@@ -39,11 +39,13 @@ func NewExecutorSimulator(cli *ethclient.Client, contract, from common.Address, 
 
 // SimResult 一次链上模拟的结果。
 type SimResult struct {
-	Profit       *big.Int // 合约返回的 WETH 净利（未扣 gas）
-	GasUsed      uint64
-	GasPriceWei  *big.Int // 模拟时的链上 gas 价格
-	CalldataHash string   // keccak(calldata)（与最终发送逐字节相同）
-	RevertMsg    string
+	Profit          *big.Int // 合约返回的 WETH 净利（未扣 gas）
+	GasUsed         uint64
+	GasPriceWei     *big.Int // 模拟时的链上 gas 价格
+	CalldataHash    string   // keccak(calldata)（与最终发送逐字节相同）
+	SimulationBlock uint64   // eth_call 时的链头
+	L1GasWei        *big.Int // Arbitrum L1 data 费用（eth_gasEstimateL1Component，尽力而为）
+	RevertMsg       string
 }
 
 // Simulate 构建并模拟 executeV3Cycle 调用。
@@ -75,7 +77,21 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	if err != nil || gasPrice.Sign() <= 0 {
 		gasPrice = big.NewInt(1e8) // 0.1 gwei 兜底
 	}
-	return &SimResult{Profit: profit, GasUsed: gas, GasPriceWei: gasPrice, CalldataHash: hashHex(calldata)}, nil
+	// Arbitrum L1 data 费用（eth_gasEstimateL1Component；公共 RPC 可能不支持，尽力而为）
+	var l1GasWei *big.Int
+	{
+		var l1 []interface{}
+		if err := s.cli.Client().CallContext(ctx, &l1, "eth_gasEstimateL1Component", msg); err == nil && len(l1) >= 2 {
+			if v, ok := l1[1].(string); ok {
+				if bi, ok := new(big.Int).SetString(v, 0); ok {
+					l1GasWei = bi
+				}
+			}
+		}
+	}
+	simBlock, _ := s.cli.BlockNumber(ctx)
+	return &SimResult{Profit: profit, GasUsed: gas, GasPriceWei: gasPrice,
+		CalldataHash: hashHex(calldata), SimulationBlock: simBlock, L1GasWei: l1GasWei}, nil
 }
 
 // hashHex keccak256 十六进制（calldata 指纹）。

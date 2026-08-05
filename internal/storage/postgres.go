@@ -40,14 +40,19 @@ func (d *DB) SaveCandidate(ctx context.Context, c *arbitrage.Candidate) error {
 			block_hash, tx_hash, log_index, route_json,
 			input_asset, input_amount, gross_profit, gas_estimate,
 			swap_cost, slippage_cost, expected_net_profit,
-			simulation_result, decision, reject_reason
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+			simulation_result, decision, reject_reason,
+			simulated_profit_wei, gas_used, gas_price_wei, gas_cost_wei,
+			calldata_hash, state_block, simulation_block
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
 		ON CONFLICT (id) DO NOTHING`,
 		c.ID, "weth-2hop", c.ObservedBlock, c.ObservedAt, c.SourceEvent,
 		c.BlockHash.Hex(), c.TxHash.Hex(), c.LogIndex, c.RouteJSON,
 		c.InputAsset.Hex(), c.InputAmount.String(), c.GrossProfit.String(),
 		c.GasEstimate.String(), c.SwapCost.String(), c.SlippageCost.String(),
 		nullableWei(c.ExpectedNetProfit), c.SimulationResult, c.Decision, c.RejectReason,
+		nullableWei(c.SimulatedProfitWei), nullableUint64(c.GasUsed),
+		nullableWei(c.GasPriceWei), nullableWei(c.GasCostWei),
+		nullableStr(c.CalldataHash), nullableUint64(c.StateBlock), nullableUint64(c.SimulationBlock),
 	)
 	return err
 }
@@ -121,6 +126,20 @@ func (d *DB) LoadPools(ctx context.Context) ([]Pool, error) {
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+func nullableUint64(v uint64) *uint64 {
+	if v == 0 {
+		return nil
+	}
+	return &v
+}
+
+func nullableStr(v string) *string {
+	if v == "" {
+		return nil
+	}
+	return &v
 }
 
 func nullableWei(v interface{ String() string }) *string {
