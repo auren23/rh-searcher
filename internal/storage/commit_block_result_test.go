@@ -513,12 +513,12 @@ func TestSchemaGateRejectsOldMigrationVersion(t *testing.T) {
 		t.Fatalf("downgrade: %v", err)
 	}
 	t.Cleanup(func() {
-		// 恢复 requiredSchemaVersion（0013 被删时 0014 也可能被删——MAX 门槛即可）
-		_, cerr := db.pool.Exec(context.Background(),
-			`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`,
-			requiredSchemaVersion)
-		if cerr != nil {
-			t.Logf("cleanup restore %s failed: %v", requiredSchemaVersion, cerr)
+		// 恢复被删除的版本（完整集合——gate 现在要求全部在场）
+		for _, v := range requiredVersions {
+			if _, cerr := db.pool.Exec(context.Background(),
+				`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, v); cerr != nil {
+				t.Logf("cleanup restore %s failed: %v", v, cerr)
+			}
 		}
 	})
 	_, err = New(ctx, url)
@@ -554,8 +554,10 @@ func TestMigrateRunnerIdempotent(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		// 无论结果如何恢复版本（防止污染其他测试的 schema gate）
-		_, _ = db.pool.Exec(context.Background(),
-			`INSERT INTO schema_migrations (version) VALUES ('0013') ON CONFLICT DO NOTHING`)
+		for _, v := range requiredVersions {
+			_, _ = db.pool.Exec(context.Background(),
+				`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, v)
+		}
 	})
 	// 同时把 0013 之前已被 0013 清洗过的数据也清掉，保证 seed 行是"迁移前"状态
 	if _, err := db.pool.Exec(ctx, `DELETE FROM opportunities WHERE id LIKE 'migrate-idem-%'`); err != nil {
@@ -599,7 +601,7 @@ func TestMigrateFreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admin connect: %v", err)
 	}
-	defer admin.Close()
+	t.Cleanup(admin.Close) // 注册在 drop Cleanup 之前（LIFO：drop 先执行）
 	dbName := "rh_migrate_fresh"
 	if _, err := admin.Exec(ctx, `DROP DATABASE IF EXISTS `+dbName); err != nil {
 		t.Fatalf("drop: %v", err)
@@ -608,7 +610,9 @@ func TestMigrateFreshDatabase(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	t.Cleanup(func() {
-		admin.Exec(context.Background(), `DROP DATABASE IF EXISTS `+dbName)
+		if _, err := admin.Exec(context.Background(), `DROP DATABASE IF EXISTS `+dbName+` WITH (FORCE)`); err != nil {
+			t.Logf("cleanup drop %s: %v", dbName, err)
+		}
 	})
 	// 从 admin 连接派生 fresh URL（替换库名）
 	u, err := url.Parse(base)
@@ -634,10 +638,12 @@ func TestMigrateFreshDatabase(t *testing.T) {
 			t.Fatalf("table %s missing after fresh migrate (err=%v)", table, err)
 		}
 	}
-	// schema gate 通过（New 不报错）
-	if _, err := New(ctx, u.String()); err != nil {
+	// schema gate 通过（New 不报错；必须关闭避免 DROP DATABASE 阻塞）
+	gateDB, err := New(ctx, u.String())
+	if err != nil {
 		t.Fatalf("schema gate after fresh migrate: %v", err)
 	}
+	gateDB.Close()
 	// 幂等：二次执行无变化
 	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate fresh twice: %v", err)
@@ -655,7 +661,7 @@ func TestMigrateBaselineLegacyDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admin connect: %v", err)
 	}
-	defer admin.Close()
+	t.Cleanup(admin.Close) // 注册在 drop Cleanup 之前（LIFO：drop 先执行）
 	dbName := "rh_migrate_legacy"
 	if _, err := admin.Exec(ctx, `DROP DATABASE IF EXISTS `+dbName); err != nil {
 		t.Fatalf("drop: %v", err)
@@ -664,7 +670,9 @@ func TestMigrateBaselineLegacyDatabase(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	t.Cleanup(func() {
-		admin.Exec(context.Background(), `DROP DATABASE IF EXISTS `+dbName)
+		if _, err := admin.Exec(context.Background(), `DROP DATABASE IF EXISTS `+dbName+` WITH (FORCE)`); err != nil {
+			t.Logf("cleanup drop %s: %v", dbName, err)
+		}
 	})
 	u, _ := url.Parse(base)
 	u.Path = "/" + dbName

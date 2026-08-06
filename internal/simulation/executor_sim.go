@@ -93,15 +93,42 @@ func (s *ExecutorSimulator) VerifyBlockHash(ctx context.Context, block uint64, w
 // isUnsupportedHistoricalEstimate 判断节点是否明确不支持历史估算
 // （-32601 method not found / -32602 invalid params / not supported）。
 // 只有这类错误允许 fallback latest；其余按基础设施或一致性错误处理。
+// isUnsupportedHistoricalEstimate 兼容旧名（结构化 + 字符串双通道）。
 func isUnsupportedHistoricalEstimate(err error) bool {
+	return isUnsupportedRPCMethod(err)
+}
+
+// isInfraError 判断是否为可重试的基础设施错误（RPC 超时/限流/断连/节点落后），
+// 而非确定性的合约执行结果。基础设施错误必须让区块保持未评估（游标不前进），
+// 不能落成 simulation_rejected 永久拒绝。
+// rpcErrorCode 结构化 JSON-RPC 错误（go-ethereum rpc.Error 的 ErrorCode）。
+type rpcErrorCode interface {
+	ErrorCode() int
+}
+
+// rpcCode 提取结构化 JSON-RPC 错误码（-32601/-32602/-32000 等）；非 RPC 错误返回 0。
+func rpcCode(err error) int {
+	var e rpcErrorCode
+	if errors.As(err, &e) {
+		return e.ErrorCode()
+	}
+	return 0
+}
+
+// isUnsupportedRPCMethod 结构化优先：-32601 method not found / -32602 invalid params；
+// 字符串兜底（注意：不能包含通用 "not found"，它可能出现在基础设施错误里）。
+func isUnsupportedRPCMethod(err error) bool {
 	if err == nil {
 		return false
 	}
+	switch rpcCode(err) {
+	case -32601, -32602:
+		return true
+	}
 	msg := strings.ToLower(err.Error())
 	for _, s := range []string{
-		"method not found", "-32601", "invalid params", "-32602",
-		"too many arguments", "wrong number of arguments",
-		"not supported", "unsupported",
+		"method not found", "invalid params", "too many arguments",
+		"wrong number of arguments", "not supported", "unsupported",
 	} {
 		if strings.Contains(msg, s) {
 			return true
@@ -110,9 +137,6 @@ func isUnsupportedHistoricalEstimate(err error) bool {
 	return false
 }
 
-// isInfraError 判断是否为可重试的基础设施错误（RPC 超时/限流/断连/节点落后），
-// 而非确定性的合约执行结果。基础设施错误必须让区块保持未评估（游标不前进），
-// 不能落成 simulation_rejected 永久拒绝。
 func isInfraError(err error) bool {
 	if err == nil {
 		return false
@@ -130,7 +154,7 @@ func isInfraError(err error) bool {
 		"timeout", "deadline exceeded", "connection reset", "connection refused",
 		"eof", "429", "rate limit", "too many requests", "server error",
 		"service unavailable", "execution aborted", "no historical state",
-		"header not found", "not found", "archive",
+		"header not found", "archive", // 注意：不用裸 "not found"（与 method not found 冲突）
 	} {
 		if strings.Contains(msg, s) {
 			return true

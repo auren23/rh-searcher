@@ -147,16 +147,24 @@ func (d *DB) checkSchema(ctx context.Context) error {
 		return fmt.Errorf("database schema out of date: migration 0011 not applied "+
 			"(gas_estimate_mode default %q, want not_estimated)", def)
 	}
-	// 0012/0013: schema_migrations 版本门控（不再猜列存在）
-	var latest string
+	// 版本门控：全部必须版本都必须在场（MAX 门槛无法发现中间缺失）。
+	// 另检查不存在高于程序支持的未知版本（降级风险）。
+	var present, unknown int
 	if err := d.pool.QueryRow(ctx, `
-		SELECT COALESCE(MAX(version), '') FROM schema_migrations
-	`).Scan(&latest); err != nil {
+		SELECT
+			COUNT(*) FILTER (WHERE version = ANY($1)),
+			COUNT(*) FILTER (WHERE version > $2)
+		FROM schema_migrations
+	`, requiredVersions, requiredSchemaVersion).Scan(&present, &unknown); err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if latest < requiredSchemaVersion {
-		return fmt.Errorf("database schema out of date: latest=%q want >=%s",
-			latest, requiredSchemaVersion)
+	if present != len(requiredVersions) {
+		return fmt.Errorf("database schema out of date: %d/%d required migrations recorded "+
+			"(want up to %s)", present, len(requiredVersions), requiredSchemaVersion)
+	}
+	if unknown > 0 {
+		return fmt.Errorf("database schema ahead of this binary: %d unknown migrations > %s",
+			unknown, requiredSchemaVersion)
 	}
 	return nil
 }
@@ -404,6 +412,12 @@ func (d *DB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 
 // requiredSchemaVersion 启动要求的最高迁移版本（0014 统一旧 historical 命名）。
 const requiredSchemaVersion = "0014"
+
+// requiredVersions 启动要求的完整迁移版本集合（任何中间缺失都拒绝启动）。
+var requiredVersions = []string{
+	"0001", "0002", "0003", "0004", "0005", "0006", "0007",
+	"0008", "0009", "0010", "0011", "0012", "0013", "0014",
+}
 
 // RollbackToAncestor：reorg 单事务回滚——
 // 1) processed_blocks 标孤块；2) 本策略候选标孤块（不碰其他策略）；

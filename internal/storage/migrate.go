@@ -42,16 +42,54 @@ func discoverMigrations() ([]migrationFile, error) {
 	return out, nil
 }
 
-// hasBusinessTables 判断库是否已有业务表（旧库手工迁移的标志）。
-func hasBusinessTables(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
-	var n int
+// verifyLegacyBaselineFingerprint 验证旧库确实完整应用了 0001..0011
+// （表、索引、列、默认值全部匹配才算 baseline 安全——不允许"有任意业务表
+// 就猜测迁移已完成"）。返回 (是否旧库, error)。
+func verifyLegacyBaselineFingerprint(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
+	var checks int
+	expect := 7 // 5 张业务表 + 0004 唯一索引 + 0011 默认值
+	// 1) 全部业务表存在
+	for _, tbl := range []string{"opportunities", "dex_pools", "strategy_checkpoints",
+		"processed_blocks", "block_affected_pools"} {
+		var ok bool
+		if err := conn.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM information_schema.tables
+				WHERE table_schema='public' AND table_name=$1)`, tbl).Scan(&ok); err != nil {
+			return false, err
+		}
+		if ok {
+			checks++
+		}
+	}
+	// 2) 0004 唯一索引
+	var idx bool
 	if err := conn.QueryRow(ctx, `
-		SELECT COUNT(*) FROM information_schema.tables
-		WHERE table_schema = 'public' AND table_name IN ('opportunities', 'dex_pools', 'strategy_checkpoints')
-	`).Scan(&n); err != nil {
+		SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='uq_opportunities_group_selected')
+	`).Scan(&idx); err != nil {
 		return false, err
 	}
-	return n > 0, nil
+	if idx {
+		checks++
+	}
+	// 3) 0010/0011 gas_estimate_mode 默认 not_estimated（MAX 聚合保证恒有一行）
+	var def string
+	if err := conn.QueryRow(ctx, `
+		SELECT COALESCE(MAX(column_default), '') FROM information_schema.columns
+		WHERE table_name='opportunities' AND column_name='gas_estimate_mode'
+	`).Scan(&def); err != nil {
+		return false, err
+	}
+	if strings.Contains(def, "not_estimated") {
+		checks++
+	}
+	if checks == 0 {
+		return false, nil // 全新库
+	}
+	if checks != expect {
+		return false, fmt.Errorf("legacy baseline fingerprint incomplete: %d/%d checks passed "+
+			"(refusing to guess migration state)", checks, expect)
+	}
+	return true, nil
 }
 
 // Migrate 内置迁移 runner：Fresh-safe、幂等、并发安全。
@@ -86,26 +124,30 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if err := conn.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&recorded); err != nil {
 		return err
 	}
-	business, err := hasBusinessTables(ctx, conn)
-	if err != nil {
-		return err
-	}
-	switch {
-	case recorded == 0 && business:
-		// 旧库手工迁移过（0001..0011 已应用但无记录）：显式 baseline
-		for _, v := range []string{"0001", "0002", "0003", "0004", "0005", "0006",
-			"0007", "0008", "0009", "0010", "0011"} {
-			if _, err := conn.Exec(ctx,
-				`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, v); err != nil {
+	if recorded == 0 {
+		legacy, err := verifyLegacyBaselineFingerprint(ctx, conn)
+		if err != nil {
+			return err
+		}
+		if legacy {
+			// 旧库：指纹完整匹配 0001..0011 → 单事务写 baseline 记录
+			tx, err := conn.Begin(ctx)
+			if err != nil {
 				return err
 			}
+			for _, v := range []string{"0001", "0002", "0003", "0004", "0005", "0006",
+				"0007", "0008", "0009", "0010", "0011"} {
+				if _, err := tx.Exec(ctx,
+					`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, v); err != nil {
+					tx.Rollback(ctx)
+					return fmt.Errorf("baseline %s: %w", v, err)
+				}
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("baseline commit: %w", err)
+			}
 		}
-	case recorded == 0 && !business:
-		// 全新库：从 0001 开始（不登记任何版本）
-	case recorded > 0:
-		// 正常续跑：从最大版本之后继续
-	default:
-		return fmt.Errorf("migrate: inconsistent state (schema_migrations empty, business tables present)")
+		// 全新库：不登记任何版本，从 0001 开始
 	}
 
 	files, err := discoverMigrations()

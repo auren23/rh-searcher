@@ -41,9 +41,19 @@ jobs:
         run: go test ./...
       - name: Test (race)
         run: go test -race ./...
-      - name: Test fresh migrations
+      - name: Create integration databases
         env:
           RH_TEST_PG_URL: postgres://rh:rh@localhost:5432/rh
+        run: |
+          psql "$RH_TEST_PG_URL" -c "DROP DATABASE IF EXISTS rh_runner WITH (FORCE)"
+          psql "$RH_TEST_PG_URL" -c "DROP DATABASE IF EXISTS rh_sql_fresh WITH (FORCE)"
+          psql "$RH_TEST_PG_URL" -c "DROP DATABASE IF EXISTS rh_sql_legacy WITH (FORCE)"
+          psql "$RH_TEST_PG_URL" -c "CREATE DATABASE rh_runner"
+          psql "$RH_TEST_PG_URL" -c "CREATE DATABASE rh_sql_fresh"
+          psql "$RH_TEST_PG_URL" -c "CREATE DATABASE rh_sql_legacy"
+      - name: Test fresh SQL migrations (compatibility only)
+        env:
+          RH_TEST_PG_URL: postgres://rh:rh@localhost:5432/rh_sql_fresh
         run: |
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0001_init.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0002_shadow_schema_fix.sql
@@ -64,9 +74,9 @@ jobs:
           psql "$RH_TEST_PG_URL" -c "\d dex_pools" | grep -q tick_spacing
           psql "$RH_TEST_PG_URL" -c "\d dex_pools" | grep -q canonical
           psql "$RH_TEST_PG_URL" -c "\d strategy_checkpoints" | grep -q block_hash
-      - name: Test legacy migration
+      - name: Test legacy SQL migration (compatibility only)
         env:
-          RH_TEST_PG_URL: postgres://rh:rh@localhost:5432/rh
+          RH_TEST_PG_URL: postgres://rh:rh@localhost:5432/rh_sql_legacy
         run: |
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/testdata/legacy_schema.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0002_shadow_schema_fix.sql
@@ -85,13 +95,17 @@ jobs:
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q route_json
           psql "$RH_TEST_PG_URL" -c "SELECT 1 FROM information_schema.table_constraints WHERE constraint_name='execution_attempts_opportunity_id_fkey'" | grep -q 1
 
-      - name: Test PostgreSQL integration (fresh migrations)
+      - name: Test PostgreSQL integration (runner-managed database)
         env:
           RH_TEST_PG_URL: postgres://rh:rh@localhost:5432/rh
+          RH_POSTGRES_URL: postgres://rh:rh@localhost:5432/rh_runner
         run: |
-          go test ./internal/storage/ -count=1 -v
-          go test -race ./internal/storage/ -count=1
-          go test ./internal/storage/ -run TestSaveLocalRejectedCandidate -v
+          # 集成库完全由迁移 runner 初始化（Fresh-safe 路径）
+          go run ./cmd/rh-cli migrate
+          go run ./cmd/rh-cli migrate  # 幂等二次执行
+          psql "$RH_POSTGRES_URL" -t -c "SELECT COUNT(*) FROM schema_migrations" | grep -q 14
+          RH_TEST_PG_URL="$RH_POSTGRES_URL" go test ./internal/storage/ -count=1 -v
+          RH_TEST_PG_URL="$RH_POSTGRES_URL" go test -race ./internal/storage/ -count=1
 
   forge:
     runs-on: ubuntu-latest

@@ -23,7 +23,8 @@ type mockRPCServer struct {
 	estimateCalls []struct{ data, block string }
 	estErr     error  // 注入错误（nil = 成功）
 	estGas     uint64 // 成功返回值
-	headers    map[string]any
+	l1Err      error  // NodeInterface 调用注入错误
+	l1Short    bool   // NodeInterface 返回不足 96 字节
 }
 
 func (m *mockRPCServer) handle(w http.ResponseWriter, r *http.Request) {
@@ -69,6 +70,16 @@ func (m *mockRPCServer) handle(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = json.Unmarshal(params[0], &obj)
 			if strings.EqualFold(obj.To, "0x00000000000000000000000000000000000000C8") {
+				if m.l1Err != nil {
+					writeRPCError(w, req.ID, m.l1Err)
+					return
+				}
+				if m.l1Short {
+					resp := map[string]any{"jsonrpc": "2.0", "id": req.ID,
+						"result": "0x" + strings.Repeat("00", 31) + "01"}
+					json.NewEncoder(w).Encode(resp)
+					return
+				}
 				// NodeInterface.gasEstimateL1Component：96 字节
 				// (gasEstimateForL1=1000, baseFee=1e9, l1BaseFeeEstimate=1e9)
 				result = "0x" + strings.Repeat("00", 31) + "03e8" +
@@ -205,5 +216,70 @@ func TestHistoricalEstimateInfraErrorRetries(t *testing.T) {
 	}
 	if !isInfraError(err) {
 		t.Fatalf("error must be infra-classified: %v", err)
+	}
+}
+
+// P0-1: -32601 method not found 必须走 unsupported fallback（不是 infra 重试）
+func TestHistoricalEstimateMethodNotFoundFallsBack(t *testing.T) {
+	m := &mockRPCServer{estErr: fmt.Errorf("method not found")}
+	sim, ctx, block := newSimForTest(t, m)
+	res, err := sim.Simulate(ctx, mockCandidate(), 4663, block)
+	if err != nil {
+		t.Fatalf("simulate: %v", err)
+	}
+	if res.GasEstimateMode != GasEstimateLatest {
+		t.Fatalf("mode=%s want latest_approximation (method not found must fall back)", res.GasEstimateMode)
+	}
+}
+
+// P0-1: header not found（历史状态不可用）→ infra 重试（区块保持未评估）
+func TestHeaderNotFoundRetries(t *testing.T) {
+	m := &mockRPCServer{estErr: fmt.Errorf("header not found")}
+	sim, ctx, block := newSimForTest(t, m)
+	_, err := sim.Simulate(ctx, mockCandidate(), 4663, block)
+	if err == nil {
+		t.Fatalf("expected infra error for header not found")
+	}
+	if !isInfraError(err) {
+		t.Fatalf("header not found must be infra-classified: %v", err)
+	}
+}
+
+// P1-2: L1 NodeInterface 返回 method not found → 降级 latest（不是重试卡死）
+func TestL1MethodNotFoundDowngrades(t *testing.T) {
+	m := &mockRPCServer{estGas: 300000, l1Err: fmt.Errorf("method not found")}
+	sim, ctx, block := newSimForTest(t, m)
+	res, err := sim.Simulate(ctx, mockCandidate(), 4663, block)
+	if err != nil {
+		t.Fatalf("simulate: %v", err)
+	}
+	if res.GasEstimateMode != GasEstimateLatest {
+		t.Fatalf("mode=%s want latest_approximation (L1 method not found downgrades)", res.GasEstimateMode)
+	}
+}
+
+// P1-2: L1 NodeInterface 429 → infra 重试（区块保持未评估）
+func TestL1InfraErrorRetries(t *testing.T) {
+	m := &mockRPCServer{estGas: 300000, l1Err: fmt.Errorf("429 Too Many Requests")}
+	sim, ctx, block := newSimForTest(t, m)
+	_, err := sim.Simulate(ctx, mockCandidate(), 4663, block)
+	if err == nil {
+		t.Fatalf("expected infra error for L1 429")
+	}
+	if !isInfraError(err) {
+		t.Fatalf("L1 429 must be infra-classified: %v", err)
+	}
+}
+
+// P1-2: L1 响应不足 96 字节 → 一致性错误（不静默降级）
+func TestL1InvalidResponseIsConsistencyError(t *testing.T) {
+	m := &mockRPCServer{estGas: 300000, l1Short: true}
+	sim, ctx, block := newSimForTest(t, m)
+	_, err := sim.Simulate(ctx, mockCandidate(), 4663, block)
+	if err == nil {
+		t.Fatalf("expected consistency error for short L1 response")
+	}
+	if isInfraError(err) || isUnsupportedRPCMethod(err) {
+		t.Fatalf("short L1 response must not be infra/unsupported: %v", err)
 	}
 }
