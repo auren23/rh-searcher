@@ -69,6 +69,7 @@ jobs:
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0012_schema_migrations.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0013_sanitize_legacy_historical.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0014_legacy_unverifiable.sql
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0015_observation_modes.sql
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q route_json
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q opportunity_group_id
           psql "$RH_TEST_PG_URL" -c "\d dex_pools" | grep -q tick_spacing
@@ -92,6 +93,7 @@ jobs:
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0012_schema_migrations.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0013_sanitize_legacy_historical.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0014_legacy_unverifiable.sql
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0015_observation_modes.sql
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q route_json
           psql "$RH_TEST_PG_URL" -c "SELECT 1 FROM information_schema.table_constraints WHERE constraint_name='execution_attempts_opportunity_id_fkey'" | grep -q 1
 

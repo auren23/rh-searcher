@@ -80,6 +80,11 @@ type ArbitrageConfig struct {
 	MinProfitWei    string `yaml:"min_profit_wei"`     // 最小净利（wei）
 	SafetyMarginWei string `yaml:"safety_margin_wei"`  // 安全边际（wei）
 	SimulationTopK  int    `yaml:"simulation_top_k"`   // 本地 Top-K 输入量逐个 eth_call
+	// SimulationMode 显式评估模式（禁止静默降级）：
+	//   local_only      - 零资金：本地报价 + 保守 gas，不调合约（无需 executor）
+	//   latest_observe  - 需主网 executor：latest 状态对齐模拟，标记 latest
+	//   historical_strict - 需 archive RPC：固定块模拟，historical_complete 才准入正式 EV
+	SimulationMode string `yaml:"simulation_mode"`
 }
 
 // ExecutorConfig 执行合约与热钱包（模拟/发送用）。

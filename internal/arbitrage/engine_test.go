@@ -329,3 +329,62 @@ func TestSnapshotQuotesHistoricalState(t *testing.T) {
 		}
 	}
 }
+
+// local_only：本地毛利为正 → local_profitable_observed + analysis_selected=true
+// 且 selected 保持 false；不调用 evaluator（nil 安全）。
+func TestLocalOnlyModeDecision(t *testing.T) {
+	searcher := &fakeSearcher{cands: []*Candidate{
+		{InputAmount: big.NewInt(5), GrossProfit: big.NewInt(1e16), Route: []Hop{{}}, RouteJSON: "[]",
+			GasEstimate: big.NewInt(2e5)},
+	}}
+	eng := NewEngine(Config{ChainID: 4663, MinProfitWei: big.NewInt(1), TopK: 1,
+		Mode: "shadow", SimulationMode: "local_only"}, nil, searcher, nil, &fakeExecutor{})
+	res, err := eng.ProcessBlock(context.Background(), SwapEvent{
+		BlockNumber: 100, BlockHash: common.Hash{1}, ReceivedAt: 1,
+	}, []common.Address{{1}})
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if len(res.Candidates) != 1 {
+		t.Fatalf("candidates=%d want 1", len(res.Candidates))
+	}
+	c := res.Candidates[0]
+	if c.Decision != "local_profitable_observed" {
+		t.Fatalf("decision=%s want local_profitable_observed", c.Decision)
+	}
+	if !c.AnalysisSelected {
+		t.Fatalf("analysis_selected must be true in local_only mode")
+	}
+	if c.Selected {
+		t.Fatalf("live selected must stay false in local_only mode")
+	}
+	if c.SimulationMode != "local_only" || c.StateQuality != "local" {
+		t.Fatalf("mode fields wrong: %s/%s", c.SimulationMode, c.StateQuality)
+	}
+	if c.ExpectedNetProfit.Cmp(big.NewInt(0)) <= 0 {
+		t.Fatalf("net profit must be positive (gross 10 - 2x gas)")
+	}
+}
+
+// local_only 毛利为负 → local_unprofitable，无 analysis_selected。
+func TestLocalOnlyUnprofitable(t *testing.T) {
+	searcher := &fakeSearcher{cands: []*Candidate{
+		{InputAmount: big.NewInt(5), GrossProfit: big.NewInt(1), Route: []Hop{{}}, RouteJSON: "[]",
+			GasEstimate: big.NewInt(2e6)},
+	}}
+	// gross=1 wei，成本 = 2e6*2*2e8 = 8e14 → 必为 unprofitable
+	eng := NewEngine(Config{ChainID: 4663, MinProfitWei: big.NewInt(1), TopK: 1,
+		Mode: "shadow", SimulationMode: "local_only"}, nil, searcher, nil, &fakeExecutor{})
+	res, err := eng.ProcessBlock(context.Background(), SwapEvent{
+		BlockNumber: 100, BlockHash: common.Hash{1}, ReceivedAt: 1,
+	}, []common.Address{{1}})
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if res.Candidates[0].Decision != "local_unprofitable" {
+		t.Fatalf("decision=%s want local_unprofitable", res.Candidates[0].Decision)
+	}
+	if res.Candidates[0].AnalysisSelected {
+		t.Fatalf("no analysis_selected for unprofitable")
+	}
+}

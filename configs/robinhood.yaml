@@ -40,3 +40,4 @@ arbitrage:
   min_profit_wei: "10000000000000"    # 1e-5 WETH
   safety_margin_wei: "5000000000000"  # 5e-6 WETH
   simulation_top_k: 5
+  simulation_mode: local_only

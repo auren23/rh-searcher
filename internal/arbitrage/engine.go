@@ -47,6 +47,11 @@ type Candidate struct {
 	GasCostWei         *big.Int
 	CalldataHash       string
 	GasEstimateMode    string // latest_approximation | max_gas_fallback | historical
+	// 观察模式字段（local_only / latest_observe / historical_strict）
+	SimulationMode   string // 本候选的评估模式
+	StateQuality     string // historical | latest_consistent | latest_mixed_state | local
+	StateAgeMs       int64  // 快照构建时的状态年龄
+	AnalysisSelected bool   // 研究用组内最佳（与 live selected 分离）
 	StateBlock         uint64 // 池状态对应区块（0 = 混合/未知）
 	SimulationBlock    uint64 // eth_call 执行时的链头（0 = 未知）
 
@@ -94,11 +99,20 @@ type Config struct {
 	MaxHops         int
 	TopK            int    // 本地 Top-K 输入量逐个链上模拟
 	Mode            string // dry | shadow | live
+	SimulationMode  string // local_only | latest_observe | historical_strict（显式，禁止静默降级）
 	StateBlock      *big.Int // 评估固定区块（eth_call 与该高度对齐；nil = latest）
+	// 状态对齐信息（latest_observe 用）
+	HeadAtSnapshot  uint64 // 快照构建时的 head（状态年龄计算）
+	HeadAtSnapshotMs int64
 }
 
 func NewEngine(cfg Config, sink Sink, searcher Searcher, evaluator Evaluator, executor Executor) *Engine {
 	return &Engine{cfg: cfg, sink: sink, searcher: searcher, evaluator: evaluator, executor: executor}
+}
+
+// SetConfig 运行时更新配置（latest_observe 模式每批评估前更新 head 对齐信息）。
+func (e *Engine) SetConfig(cfg Config) {
+	e.cfg = cfg
 }
 
 // SwapEvent 触发一次评估的链上事件上下文。
@@ -227,6 +241,25 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 	// Top-K 输入量逐个链上模拟，选模拟净利最高者；先全部模拟，再统一落盘。
 	// 本地报价链显式使用 snapshot（历史状态），不触碰实时 Registry。
 	cands := e.searcher.TopKOptimizeAt(ctx, r, snapshot, e.cfg.TopK, ev.BlockNumber, ev.ReceivedAt)
+	// 标记观察模式与状态质量（每个候选）
+	for _, c := range cands {
+		c.SimulationMode = e.cfg.SimulationMode
+		c.StateAgeMs = 0
+		if e.cfg.HeadAtSnapshotMs > 0 && c.ObservedAt > 0 {
+			c.StateAgeMs = e.cfg.HeadAtSnapshotMs - c.ObservedAt
+			if c.StateAgeMs < 0 {
+				c.StateAgeMs = 0
+			}
+		}
+		switch e.cfg.SimulationMode {
+		case "local_only":
+			c.StateQuality = "local"
+		case "latest_observe":
+			c.StateQuality = "latest_consistent"
+		default:
+			c.StateQuality = "historical"
+		}
+	}
 	// Rank 必须是真实利润排名：按本地毛利降序
 	sort.Slice(cands, func(i, j int) bool {
 		if cands[i] == nil || cands[j] == nil {
@@ -255,6 +288,28 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 			c.ExpectedNetProfit = new(big.Int)
 			continue
 		}
+		if e.cfg.SimulationMode == "local_only" {
+			// 零资金观察：本地毛利 + 保守 gas 估算（不调合约、不要求 executor）
+			if c.GrossProfit == nil || c.GrossProfit.Sign() <= 0 {
+				c.Decision = "local_unprofitable"
+				c.ExpectedNetProfit = new(big.Int)
+			} else {
+				// 保守净利 = 毛利 - 2×估算 gas（压力区间下限）
+				gasCost := new(big.Int).Mul(new(big.Int).SetUint64(uint64(c.GasEstimate.Int64()*2)), big.NewInt(2e8))
+				net := new(big.Int).Sub(c.GrossProfit, gasCost)
+				c.ExpectedNetProfit = net
+				if net.Sign() <= 0 {
+					c.Decision = "local_unprofitable"
+				} else {
+					c.Decision = "local_profitable_observed"
+				}
+			}
+			if c.Decision == "local_profitable_observed" &&
+				(best == nil || c.ExpectedNetProfit.Cmp(best.ExpectedNetProfit) > 0) {
+				best = c
+			}
+			continue
+		}
 		simCfg := e.cfg
 		simCfg.StateBlock = new(big.Int).SetUint64(snapshot.Block)
 		verdict, reason, profit, err := e.evaluator.Evaluate(ctx, c, simCfg)
@@ -271,13 +326,18 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 			}
 		}
 	}
-	// 统一收集：best 标记 selected=true；其他通过模拟的降级为 simulation_valid
+	// 统一收集：best 标记 selected=true；其他通过模拟的降级为 simulation_valid。
+	// local_only/latest_observe 下 best 只标 analysis_selected（live selected 保持 false）
 	for _, c := range cands {
 		if c.ID == "" {
 			continue // 未进入评估流程（searcher 异常）
 		}
 		if best != nil && c.ID == best.ID {
-			c.Selected = true
+			if e.cfg.SimulationMode == "local_only" || e.cfg.SimulationMode == "latest_observe" {
+				c.AnalysisSelected = true
+			} else {
+				c.Selected = true
+			}
 		} else if c.Decision == SimulationAccepted {
 			c.Decision = "simulation_valid"
 			c.RejectReason = "not selected (lower net profit in group)"

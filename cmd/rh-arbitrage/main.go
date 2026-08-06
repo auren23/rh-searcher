@@ -179,32 +179,51 @@ func main() {
 		_ = ckpt.Save(storage.CheckpointPools, lastPoolBlock)
 	}
 
-	// 链上模拟器：真实 executeV3Cycle calldata + eth_call（sim RPC 组）。
-	// shadow 模式失败关闭：无执行合约 / 无 sim RPC / 合约无代码 → 拒绝启动。
-	if cfg.Executor.Contract == "" || cfg.Executor.Wallet == "" {
-		slog.Error("executor.contract / executor.wallet not configured (required in shadow mode)")
+	// 评估模式：local_only（零资金，不要求 executor）/ latest_observe（需主网
+	// executor，latest 状态对齐）/ historical_strict（需 archive）。显式配置，
+	// 禁止模式间静默降级。
+	simMode := cfg.Arbitrage.SimulationMode
+	if simMode == "" {
+		simMode = "local_only"
+	}
+	switch simMode {
+	case "local_only", "latest_observe", "historical_strict":
+	default:
+		slog.Error("invalid simulation_mode", "mode", simMode,
+			"want", "local_only | latest_observe | historical_strict")
 		os.Exit(1)
 	}
-	if len(cfg.RPC.Groups.Sim) == 0 {
-		slog.Error("no sim RPC configured (required in shadow mode)")
-		os.Exit(1)
+	var sim *simulation.ExecutorSimulator
+	var contractAddr common.Address
+	var contractBal *big.Int
+	if simMode != "local_only" {
+		// latest_observe / historical_strict 失败关闭：无执行合约 / 无 sim RPC /
+		// 合约无代码 → 拒绝启动（不允许"以为在模拟其实没调合约"）
+		if cfg.Executor.Contract == "" || cfg.Executor.Wallet == "" {
+			slog.Error("executor.contract / executor.wallet not configured",
+				"required for simulation_mode", simMode)
+			os.Exit(1)
+		}
+		if len(cfg.RPC.Groups.Sim) == 0 {
+			slog.Error("no sim RPC configured (required for simulation_mode)", "mode", simMode)
+			os.Exit(1)
+		}
+		simCli, dialErr := ethclient.Dial(cfg.RPC.Groups.Sim[0])
+		if dialErr != nil {
+			slog.Error("sim rpc dial failed", "err", dialErr)
+			os.Exit(1)
+		}
+		contractAddr = common.HexToAddress(cfg.Executor.Contract)
+		code, codeErr := simCli.CodeAt(ctx, contractAddr, nil)
+		if codeErr != nil || len(code) == 0 {
+			slog.Error("executor contract has no code", "contract", cfg.Executor.Contract, "err", codeErr)
+			os.Exit(1)
+		}
+		sim = simulation.NewExecutorSimulator(simCli, contractAddr,
+			common.HexToAddress(cfg.Executor.Wallet), 5_000_000)
+		// Executor 启动预检（wallet/weth/factory/paused/余额）→ 余额用于资金限制
+		contractBal, err = preflightExecutor(ctx, simCli, contractAddr, cfg)
 	}
-	simCli, dialErr := ethclient.Dial(cfg.RPC.Groups.Sim[0])
-	if dialErr != nil {
-		slog.Error("sim rpc dial failed", "err", dialErr)
-		os.Exit(1)
-	}
-	contractAddr := common.HexToAddress(cfg.Executor.Contract)
-	code, codeErr := simCli.CodeAt(ctx, contractAddr, nil)
-	if codeErr != nil || len(code) == 0 {
-		slog.Error("executor contract has no code", "contract", cfg.Executor.Contract, "err", codeErr)
-		os.Exit(1)
-	}
-	sim := simulation.NewExecutorSimulator(simCli, contractAddr,
-		common.HexToAddress(cfg.Executor.Wallet), 5_000_000)
-
-	// Executor 启动预检（wallet/weth/factory/paused/余额）→ 余额用于资金限制
-	contractBal, err := preflightExecutor(ctx, simCli, contractAddr, cfg)
 	if err != nil {
 		slog.Error("executor preflight failed", "err", err)
 		os.Exit(1)
@@ -226,8 +245,15 @@ func main() {
 	if cfg.Arbitrage.SimulationTopK > 0 {
 		topK = cfg.Arbitrage.SimulationTopK
 	}
-	evaluator := simulation.NewSimulationEvaluator(sim, cfg.Chain.ID, safetyMargin)
-	slog.Info("simulation evaluator enabled", "contract", cfg.Executor.Contract,
+	var evaluator arbitrage.Evaluator
+	if simMode != "local_only" {
+		evaluator = simulation.NewSimulationEvaluator(sim, cfg.Chain.ID, safetyMargin)
+	} else {
+		// local_only：engine 的本地分支不调用 evaluator（零资金、无合约）
+		evaluator = nil
+	}
+	slog.Info("evaluation mode", "simulation_mode", simMode,
+		"contract", cfg.Executor.Contract,
 		"min_profit_wei", minProfit.String(), "safety_margin_wei", safetyMargin.String(), "top_k", topK)
 
 	weth := common.HexToAddress(cfg.Chain.WETH)
@@ -241,7 +267,10 @@ func main() {
 			maxInputWei = v
 		}
 	}
-	executorAddr := contractAddr
+	var executorAddr common.Address
+	if simMode != "local_only" {
+		executorAddr = contractAddr
+	}
 	searcher.SetFunding(maxInputWei, contractBal)
 	if cfg.Arbitrage.MinInputWei != "" {
 		if v, ok := new(big.Int).SetString(cfg.Arbitrage.MinInputWei, 10); ok {
@@ -252,16 +281,18 @@ func main() {
 		slog.Error("live mode not implemented (signer/nonce/broadcaster/pnl not wired)")
 		os.Exit(1)
 	}
+	engineCfg := arbitrage.Config{
+		ChainID:         cfg.Chain.ID,
+		WETH:            weth,
+		MinProfitWei:    minProfit,
+		SafetyMarginWei: safetyMargin,
+		MaxHops:         2,
+		TopK:            topK,
+		Mode:            cfg.Mode.Run,
+		SimulationMode:  simMode,
+	}
 	engine := arbitrage.NewEngine(
-		arbitrage.Config{
-			ChainID:         cfg.Chain.ID,
-			WETH:            weth,
-			MinProfitWei:    minProfit,
-			SafetyMarginWei: safetyMargin,
-			MaxHops:         2,
-			TopK:            topK,
-			Mode:            cfg.Mode.Run,
-		},
+		engineCfg,
 		nil, // Engine 不再直写数据库；结果经 BlockResult 由 CommitBlockResult 事务提交
 		searcher,
 		evaluator,
@@ -671,6 +702,33 @@ func main() {
 			addrs := make([]common.Address, 0, len(pb.Pools))
 			for _, p := range pb.Pools {
 				addrs = append(addrs, common.HexToAddress(p))
+			}
+			if simMode == "latest_observe" {
+				// latest 模式状态对齐：快照与 eth_call 都固定在当前 head H，
+				// 本地利润与链上模拟在同一时点（不允许"本地区块 N + 模拟 N+k"）
+				hd, herr := readCli.HeaderByNumber(ctx, nil)
+				if herr != nil {
+					return fmt.Errorf("latest head: %w", herr)
+				}
+				head := hd.Number.Uint64()
+				cfgCopy := engineCfg
+				cfgCopy.HeadAtSnapshot = head
+				cfgCopy.HeadAtSnapshotMs = time.Now().UnixMilli()
+				engine.SetConfig(cfgCopy)
+				ev := arbitrage.SwapEvent{
+					BlockNumber: pb.Block,
+					BlockHash:   common.HexToHash(pb.Hash),
+					ReceivedAt:  time.Now().UnixMilli(),
+				}
+				processed, err := engine.ProcessBlockAt(ctx, ev, addrs, head)
+				if err != nil {
+					return fmt.Errorf("evaluate block %d (latest): %w", pb.Block, err)
+				}
+				if err := sink.CommitEvaluation(ctx, pb.Block, pb.Hash, processed.Candidates); err != nil {
+					return fmt.Errorf("evaluate block %d commit: %w", pb.Block, err)
+				}
+				lastEvaluated = pb.Block
+				continue
 			}
 			// 历史资金：执行合约在该区块的 WETH 余额（不是 latest）——
 			// 优化器上限必须与历史状态一致；读取失败 = 基础设施（可重试）

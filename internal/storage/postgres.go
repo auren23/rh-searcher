@@ -237,8 +237,8 @@ func insertCandidateTx(ctx context.Context, q interface {
 			calldata_hash, state_block, simulation_block,
 			opportunity_group_id, rank, selected,
 			l1_gas_units, l2_base_fee_wei, l1_base_fee_estimate_wei,
-			gas_estimate_mode
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
+			gas_estimate_mode, simulation_mode, state_quality, state_age_ms, analysis_selected
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)
 		ON CONFLICT (id) DO NOTHING`,
 		c.ID, StrategyArbitrage, c.ObservedBlock, c.ObservedAt, c.SourceEvent,
 		c.BlockHash.Hex(), c.TxHash.Hex(), c.LogIndex, c.RouteJSON,
@@ -251,6 +251,8 @@ func insertCandidateTx(ctx context.Context, q interface {
 		nullableStr(c.OpportunityGroupID), nullableInt(c.Rank), c.Selected,
 		nullableUint64(c.L1GasUnits), nullableBigInt(c.L2BaseFeeWei), nullableBigInt(c.L1BaseFeeEstimateWei),
 		strOr(c.GasEstimateMode, "not_estimated"),
+		strOr(c.SimulationMode, "unknown"), strOr(c.StateQuality, "unknown"),
+		nullableInt64(c.StateAgeMs), c.AnalysisSelected,
 	)
 	return err
 }
@@ -441,12 +443,12 @@ func (d *DB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 }
 
 // requiredSchemaVersion 启动要求的最高迁移版本（0014 统一旧 historical 命名）。
-const requiredSchemaVersion = "0014"
+const requiredSchemaVersion = "0015"
 
 // requiredVersions 启动要求的完整迁移版本集合（任何中间缺失都拒绝启动）。
 var requiredVersions = []string{
 	"0001", "0002", "0003", "0004", "0005", "0006", "0007",
-	"0008", "0009", "0010", "0011", "0012", "0013", "0014",
+	"0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015",
 }
 
 // RollbackToAncestor：reorg 单事务回滚——
@@ -710,6 +712,13 @@ func isUnknownHash(s string) bool {
 		return true
 	}
 	return false
+}
+
+func nullableInt64(v int64) *int64 {
+	if v == 0 {
+		return nil
+	}
+	return &v
 }
 
 func strOr(v, def string) string {
