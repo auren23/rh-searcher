@@ -123,6 +123,17 @@ func (d *DB) checkSchema(ctx context.Context) error {
 	if !hasProv {
 		return fmt.Errorf("database schema out of date: migration 0009 not applied")
 	}
+	// 0010: gas_estimate_mode（成本质量标记）
+	var hasGasMode bool
+	if err := d.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_name='opportunities' AND column_name='gas_estimate_mode')
+	`).Scan(&hasGasMode); err != nil {
+		return fmt.Errorf("schema check: %w", err)
+	}
+	if !hasGasMode {
+		return fmt.Errorf("database schema out of date: migration 0010 not applied")
+	}
 	return nil
 }
 
@@ -163,8 +174,9 @@ func insertCandidateTx(ctx context.Context, q interface {
 			simulated_profit_wei, gas_used, gas_price_wei, gas_cost_wei,
 			calldata_hash, state_block, simulation_block,
 			opportunity_group_id, rank, selected,
-			l1_gas_units, l2_base_fee_wei, l1_base_fee_estimate_wei
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
+			l1_gas_units, l2_base_fee_wei, l1_base_fee_estimate_wei,
+			gas_estimate_mode
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
 		ON CONFLICT (id) DO NOTHING`,
 		c.ID, StrategyArbitrage, c.ObservedBlock, c.ObservedAt, c.SourceEvent,
 		c.BlockHash.Hex(), c.TxHash.Hex(), c.LogIndex, c.RouteJSON,
@@ -176,6 +188,7 @@ func insertCandidateTx(ctx context.Context, q interface {
 		nullableStr(c.CalldataHash), nullableUint64(c.StateBlock), nullableUint64(c.SimulationBlock),
 		nullableStr(c.OpportunityGroupID), nullableInt(c.Rank), c.Selected,
 		nullableUint64(c.L1GasUnits), nullableBigInt(c.L2BaseFeeWei), nullableBigInt(c.L1BaseFeeEstimateWei),
+		strOr(c.GasEstimateMode, "historical"),
 	)
 	return err
 }
@@ -217,10 +230,14 @@ func (d *DB) CommitBlockIngest(ctx context.Context, block uint64, blockHash, par
 		if createdBlock == 0 {
 			createdBlock = block // 观察块兜底（与 hash 一致，不产生矛盾数据）
 		}
+		source := sp.ProvenanceSource
+		if source == "" {
+			source = "observed_swap_fallback"
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
 				canonical, created_block, created_block_hash, provenance_source)
-			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, $8, $9, 'observed_swap_fallback')
+			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, $8, $9, $10)
 			ON CONFLICT (address) DO UPDATE SET
 				exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
 				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
@@ -229,9 +246,14 @@ func (d *DB) CommitBlockIngest(ctx context.Context, block uint64, blockHash, par
 				created_block = CASE WHEN dex_pools.created_block IS NULL
 					THEN EXCLUDED.created_block ELSE dex_pools.created_block END,
 				created_block_hash = CASE WHEN dex_pools.created_block_hash IS NULL
-					THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END`,
+					THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END,
+				provenance_source = CASE
+					WHEN COALESCE(EXCLUDED.provenance_source, '') = 'pool_created_log'
+						AND COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'
+					THEN 'pool_created_log'
+					ELSE dex_pools.provenance_source END`,
 			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing,
-			createdBlock, nullableStr(createdHash)); err != nil {
+			createdBlock, nullableStr(createdHash), source); err != nil {
 			return fmt.Errorf("pool %s: %w", sp.Address, err)
 		}
 	}
@@ -607,6 +629,13 @@ func isUnknownHash(s string) bool {
 		return true
 	}
 	return false
+}
+
+func strOr(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
 }
 
 func nullableUint64(v uint64) *uint64 {

@@ -272,11 +272,40 @@ func TestSnapshotQuotesHistoricalState(t *testing.T) {
 	if got := v3.UnwrapState(reg.Pool(common.Address{1})).SqrtPriceX96.Uint64(); got != 200e6 {
 		t.Fatalf("live registry price=%d want 200e6 (must not be mutated)", got)
 	}
-	// 本地优化在快照上报价：输入 100 → 输出 100（价格 100）→ 无毛利
-	cands := searcher.TopKOptimizeAt(ctx, Route{
+	// 本地优化在快照上报价：价格 100 → 输入 100 输出 100 → 无毛利。
+	// 若错误使用实时 Registry（价格 200）→ 输入 100 输出 200 → 毛利 100。
+	// 候选的 GrossProfit 必须严格来自历史快照（=0），InputAmount 也是历史深度产物。
+	r := Route{
 		Hops: []Hop{{Pool: common.Address{1}, TokenIn: common.Address{2}, TokenOut: common.Address{3}}},
-	}, snap, 3, 100, 0)
-	_ = cands
+	}
+	cands := searcher.TopKOptimizeAt(ctx, r, snap, 3, 100, 0)
+	allZeroProfit := true
+	for _, c := range cands {
+		if c.GrossProfit == nil || c.GrossProfit.Sign() != 0 {
+			allZeroProfit = false
+			t.Logf("candidate gross=%v (must be 0 from block-100 snapshot)", c.GrossProfit)
+		}
+		if c.InputAmount == nil || c.InputAmount.Sign() <= 0 {
+			t.Fatalf("candidate input amount missing")
+		}
+	}
+	if !allZeroProfit {
+		t.Fatalf("gross profit must come from the historical snapshot (price 100 => 0 profit)")
+	}
+	// 重放：同一区块两次评估 → 候选 ID/RouteJSON 完全一致（确定性）
+	snapB, err := searcher.SnapshotRoute(ctx, r, 100)
+	if err != nil {
+		t.Fatalf("snapshotB: %v", err)
+	}
+	candsB := searcher.TopKOptimizeAt(ctx, r, snapB, 3, 100, 0)
+	if len(cands) != len(candsB) {
+		t.Fatalf("replay candidate count %d != %d", len(cands), len(candsB))
+	}
+	for i := range cands {
+		if cands[i].ID != candsB[i].ID || cands[i].RouteJSON != candsB[i].RouteJSON {
+			t.Fatalf("replay candidate %d differs: %s vs %s", i, cands[i].ID, candsB[i].ID)
+		}
+	}
 	// 再次重放：相同快照（确定性）
 	snap2, err := searcher.SnapshotRoute(ctx, Route{
 		Hops: []Hop{{Pool: common.Address{1}, TokenIn: common.Address{2}, TokenOut: common.Address{3}}},

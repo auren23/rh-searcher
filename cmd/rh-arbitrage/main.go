@@ -107,9 +107,14 @@ func main() {
 			slog.Error("restore pools", "err", err)
 			os.Exit(1)
 		}
-		// 旧数据 tick_spacing 为 0：补查
+		// 旧数据 tick_spacing 为 0：补查（Registry 里是 stateAdapter 包装，
+		// 必须 UnwrapState——裸断言会 panic）
 		for _, st := range reg.AllPools() {
-			pool := st.(*v3.Pool)
+			pool := v3.UnwrapState(st)
+			if pool == nil {
+				slog.Error("unsupported pool state", "type", fmt.Sprintf("%T", st))
+				os.Exit(1)
+			}
 			if pool.TickSpacing <= 0 {
 				fresh, err := adapter.PoolByAddress(ctx, pool.Address)
 				if err == nil {
@@ -149,11 +154,14 @@ func main() {
 		allPools := make([]storage.Pool, 0, len(reg.AllPools()))
 		for _, st := range reg.AllPools() {
 			sp := st.Pool()
-			p3 := st.(*v3.Pool)
-			src := p3.ProvenanceSource
-			if src == "" && p3.CreatedBlock > 0 {
-				src = "pool_created_log" // bootstrap 池来自真实 PoolCreated 日志
+			p3 := v3.UnwrapState(st)
+			if p3 == nil {
+				slog.Error("unsupported pool state", "type", fmt.Sprintf("%T", st))
+				os.Exit(1)
 			}
+			// 来源不猜测：DiscoverPools 源头已写 pool_created_log；
+			// 旧库/兜底保持原值（unknown 不被错误升级为权威）
+			src := p3.ProvenanceSource
 			allPools = append(allPools, storage.Pool{
 				Address: sp.ID, Exchange: sp.Exchange, Protocol: "v3",
 				Token0: sp.Token0.Hex(), Token1: sp.Token1.Hex(),
@@ -440,7 +448,14 @@ func main() {
 					reg.UpsertPool(v3.State(pool))
 					graph.AddPool(pool.Pool(), l.Address)
 				} else {
-					pp = &pendingPool{pool: state.(*v3.Pool)}
+					pool := v3.UnwrapState(state)
+					if pool == nil {
+						rollbackTempPools(pending)
+						return nil, nil, nil, fmt.Errorf(
+							"block %d pool %s unsupported state %T",
+							h.Number, l.Address.Hex(), state)
+					}
+					pp = &pendingPool{pool: pool}
 				}
 				pending[l.Address] = pp
 			}

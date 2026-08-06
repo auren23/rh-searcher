@@ -39,6 +39,18 @@ func NewExecutorSimulator(cli *ethclient.Client, contract, from common.Address, 
 }
 
 // SimResult 一次链上模拟的结果。
+// GasEstimateMode 标注 gas 成本来源：
+// "latest_approximation" = EstimateGas 在最新状态估算（公共 RPC 无历史估算）
+// "max_gas_fallback"     = 估算失败用上限（不得进入正式 EV 统计）
+// "historical"           = 未来支持历史估算时使用
+type GasEstimateMode string
+
+const (
+	GasEstimateLatest  GasEstimateMode = "latest_approximation"
+	GasEstimateMax     GasEstimateMode = "max_gas_fallback"
+	GasEstimateHistory GasEstimateMode = "historical"
+)
+
 type SimResult struct {
 	Profit          *big.Int // 合约返回的 WETH 净利（未扣 gas）
 	GasUsed         uint64
@@ -50,6 +62,7 @@ type SimResult struct {
 	L2BaseFeeWei       *big.Int // baseFee
 	L1BaseFeeEstimateWei *big.Int // l1BaseFeeEstimate
 	RevertMsg          string
+	GasEstimateMode   GasEstimateMode
 }
 
 // VerifyBlockHash 校验 sim RPC 在指定高度的区块 hash 与 read RPC 一致
@@ -146,9 +159,21 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 		return &SimResult{RevertMsg: fmt.Sprintf("short return %d bytes", len(out)), CalldataHash: hashHex(calldata)}, nil
 	}
 	profit := new(big.Int).SetBytes(out[:32])
-	gas, err := s.cli.EstimateGas(ctx, msg)
+	// Gas 估算在 latest 状态执行：模拟 calldata 的 deadline 是历史时间（+120s），
+	// 在 latest 状态必然过期 revert（DeadlinePassed）→ 用独立 calldata 估算
+	// （仅 deadline 不同，gas 影响可忽略）。估算仍标记 latest_approximation。
+	gasMode := GasEstimateLatest
+	gas := uint64(0)
+	estMsg := msg
+	if block != nil {
+		if estCalldata, cerr := BuildExecuteV3CycleCalldata(c, chainID); cerr == nil {
+			estMsg = ethereum.CallMsg{From: s.from, To: &s.contract, Gas: s.maxGas, Data: estCalldata}
+		}
+	}
+	gas, err = s.cli.EstimateGas(ctx, estMsg)
 	if err != nil {
-		gas = s.maxGas // 估算失败用上限（保守）
+		gas = s.maxGas // 估算失败用上限（保守）；不得参与正式 EV 统计
+		gasMode = GasEstimateMax
 	}
 	// Gas 价格固定到历史块（Arbitrum L2 base fee，读 header.BaseFee at block）：
 	// 成本必须与池状态/eth_call 同一区块，不能用调用时的 latest 污染历史利润。
@@ -189,7 +214,8 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	}
 	return &SimResult{Profit: profit, GasUsed: gas, GasPriceWei: gasPrice,
 		CalldataHash: hashHex(calldata), SimulationBlock: simBlock,
-		L1GasUnits: l1GasUnits, L2BaseFeeWei: l2BaseFee, L1BaseFeeEstimateWei: l1BaseFeeEstimate}, nil
+		L1GasUnits: l1GasUnits, L2BaseFeeWei: l2BaseFee, L1BaseFeeEstimateWei: l1BaseFeeEstimate,
+		GasEstimateMode: gasMode}, nil
 }
 
 // hashHex keccak256 十六进制（calldata 指纹）。

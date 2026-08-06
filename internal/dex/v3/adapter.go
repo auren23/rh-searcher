@@ -116,6 +116,7 @@ func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock u
 			ObservedBlock: l.BlockNumber,
 			CreatedBlock:  l.BlockNumber,
 			CreatedBlockHash: l.BlockHash,
+			ProvenanceSource: "pool_created_log",
 			ticks:         make(map[int]*Tick),
 			bitmap:        make(map[int64]*big.Int),
 			bitmapLoaded:  make(map[int64]bool),

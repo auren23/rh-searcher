@@ -64,6 +64,7 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 	c.GasCostWei = new(big.Int).Set(gasCostWei)
 	c.CalldataHash = res.CalldataHash
 	c.SimulationBlock = res.SimulationBlock
+	c.GasEstimateMode = string(res.GasEstimateMode)
 	// Arbitrum L1 组件持久化（总费仍按 gasUsed×gasPrice 近似；避免重复扣费）
 	c.L1GasUnits = res.L1GasUnits
 	c.L2BaseFeeWei = res.L2BaseFeeWei

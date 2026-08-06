@@ -46,6 +46,7 @@ type Candidate struct {
 	GasPriceWei        *big.Int
 	GasCostWei         *big.Int
 	CalldataHash       string
+	GasEstimateMode    string // latest_approximation | max_gas_fallback | historical
 	StateBlock         uint64 // 池状态对应区块（0 = 混合/未知）
 	SimulationBlock    uint64 // eth_call 执行时的链头（0 = 未知）
 
