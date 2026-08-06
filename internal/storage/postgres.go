@@ -402,8 +402,8 @@ func (d *DB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	return d.pool.QueryRow(ctx, sql, args...)
 }
 
-// requiredSchemaVersion 启动要求的最高迁移版本（0013 包含旧 historical 数据清洗）。
-const requiredSchemaVersion = "0013"
+// requiredSchemaVersion 启动要求的最高迁移版本（0014 统一旧 historical 命名）。
+const requiredSchemaVersion = "0014"
 
 // RollbackToAncestor：reorg 单事务回滚——
 // 1) processed_blocks 标孤块；2) 本策略候选标孤块（不碰其他策略）；

@@ -3,11 +3,13 @@ package storage
 import (
 	"context"
 	"math/big"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/auren23/rh-searcher/internal/arbitrage"
 )
@@ -503,24 +505,28 @@ func TestSchemaGateRejectsOldMigrationVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer db.Close()
-	// 临时把版本表降到 0012（恢复原值后清理）
+	t.Cleanup(db.Close) // 注册在恢复 Cleanup 之前（LIFO：恢复先执行，池仍打开）
+	// 临时把版本表降到 0012；t.Cleanup 无条件恢复（任何失败路径都不污染其他测试）
 	if _, err := db.pool.Exec(ctx, `
 		DELETE FROM schema_migrations WHERE version > '0012';
 		INSERT INTO schema_migrations (version) VALUES ('0012') ON CONFLICT DO NOTHING;`); err != nil {
 		t.Fatalf("downgrade: %v", err)
 	}
+	t.Cleanup(func() {
+		// 恢复 requiredSchemaVersion（0013 被删时 0014 也可能被删——MAX 门槛即可）
+		_, cerr := db.pool.Exec(context.Background(),
+			`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`,
+			requiredSchemaVersion)
+		if cerr != nil {
+			t.Logf("cleanup restore %s failed: %v", requiredSchemaVersion, cerr)
+		}
+	})
 	_, err = New(ctx, url)
 	if err == nil {
 		t.Fatalf("New() must fail when latest migration version is below required")
 	}
-	if !strings.Contains(err.Error(), "0013") {
+	if !strings.Contains(err.Error(), requiredSchemaVersion) {
 		t.Fatalf("error must mention required version: %v", err)
-	}
-	// 恢复 0013
-	if _, err := db.pool.Exec(ctx, `
-		INSERT INTO schema_migrations (version) VALUES ('0013') ON CONFLICT DO NOTHING;`); err != nil {
-		t.Fatalf("restore: %v", err)
 	}
 }
 
@@ -546,10 +552,11 @@ func TestMigrateRunnerIdempotent(t *testing.T) {
 	if _, err := db.pool.Exec(ctx, `DELETE FROM schema_migrations WHERE version = '0013'`); err != nil {
 		t.Fatalf("unapply: %v", err)
 	}
-	defer func() {
+	t.Cleanup(func() {
 		// 无论结果如何恢复版本（防止污染其他测试的 schema gate）
-		db.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ('0013') ON CONFLICT DO NOTHING`)
-	}()
+		_, _ = db.pool.Exec(context.Background(),
+			`INSERT INTO schema_migrations (version) VALUES ('0013') ON CONFLICT DO NOTHING`)
+	})
 	// 同时把 0013 之前已被 0013 清洗过的数据也清掉，保证 seed 行是"迁移前"状态
 	if _, err := db.pool.Exec(ctx, `DELETE FROM opportunities WHERE id LIKE 'migrate-idem-%'`); err != nil {
 		t.Fatalf("clean: %v", err)
@@ -578,4 +585,129 @@ func TestMigrateRunnerIdempotent(t *testing.T) {
 	if decision != "simulation_accepted" {
 		t.Fatalf("migration must not re-run: decision=%s", decision)
 	}
+}
+
+// P0-1: Fresh DB 完整迁移——空库从 0001 顺序执行到最新，
+// 业务表全部创建，schema gate 通过（独立临时数据库）。
+func TestMigrateFreshDatabase(t *testing.T) {
+	base := os.Getenv("RH_TEST_PG_URL")
+	if base == "" {
+		t.Skip("RH_TEST_PG_URL not set (CI postgres service)")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, base)
+	if err != nil {
+		t.Fatalf("admin connect: %v", err)
+	}
+	defer admin.Close()
+	dbName := "rh_migrate_fresh"
+	if _, err := admin.Exec(ctx, `DROP DATABASE IF EXISTS `+dbName); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+	if _, err := admin.Exec(ctx, `CREATE DATABASE `+dbName); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		admin.Exec(context.Background(), `DROP DATABASE IF EXISTS `+dbName)
+	})
+	// 从 admin 连接派生 fresh URL（替换库名）
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	u.Path = "/" + dbName
+	pool, err := pgxpool.New(ctx, u.String())
+	if err != nil {
+		t.Fatalf("fresh connect: %v", err)
+	}
+	defer pool.Close()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate fresh: %v", err)
+	}
+	// 业务表必须存在
+	for _, table := range []string{"opportunities", "dex_pools", "strategy_checkpoints",
+		"processed_blocks", "block_affected_pools", "schema_migrations"} {
+		var ok bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM information_schema.tables
+				WHERE table_schema='public' AND table_name=$1)`, table).Scan(&ok); err != nil || !ok {
+			t.Fatalf("table %s missing after fresh migrate (err=%v)", table, err)
+		}
+	}
+	// schema gate 通过（New 不报错）
+	if _, err := New(ctx, u.String()); err != nil {
+		t.Fatalf("schema gate after fresh migrate: %v", err)
+	}
+	// 幂等：二次执行无变化
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate fresh twice: %v", err)
+	}
+}
+
+// P0-1: 旧库升级——手工迁移到 0011 的库（无迁移记录）被 baseline 后继续到最新。
+func TestMigrateBaselineLegacyDatabase(t *testing.T) {
+	base := os.Getenv("RH_TEST_PG_URL")
+	if base == "" {
+		t.Skip("RH_TEST_PG_URL not set (CI postgres service)")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, base)
+	if err != nil {
+		t.Fatalf("admin connect: %v", err)
+	}
+	defer admin.Close()
+	dbName := "rh_migrate_legacy"
+	if _, err := admin.Exec(ctx, `DROP DATABASE IF EXISTS `+dbName); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+	if _, err := admin.Exec(ctx, `CREATE DATABASE `+dbName); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		admin.Exec(context.Background(), `DROP DATABASE IF EXISTS `+dbName)
+	})
+	u, _ := url.Parse(base)
+	u.Path = "/" + dbName
+	legacy, err := pgxpool.New(ctx, u.String())
+	if err != nil {
+		t.Fatalf("legacy connect: %v", err)
+	}
+	defer legacy.Close()
+	// 手工执行 0001..0011（模拟旧库），不建 schema_migrations
+	files := []string{"0001", "0002", "0003", "0004", "0005", "0006",
+		"0007", "0008", "0009", "0010", "0011"}
+	for _, v := range files {
+		body, err := migrationFS.ReadFile("migrations/" + v + "_" + migrationName(v))
+		if err != nil {
+			t.Fatalf("read %s: %v", v, err)
+		}
+		if _, err := legacy.Exec(ctx, string(body)); err != nil {
+			t.Fatalf("apply %s: %v", v, err)
+		}
+	}
+	if err := Migrate(ctx, legacy); err != nil {
+		t.Fatalf("migrate legacy: %v", err)
+	}
+	var n int
+	if err := legacy.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n < 13 {
+		t.Fatalf("schema_migrations rows=%d want >=13 (baseline + 0012/0013)", n)
+	}
+	// gate 通过
+	if _, err := New(ctx, u.String()); err != nil {
+		t.Fatalf("schema gate after legacy upgrade: %v", err)
+	}
+}
+
+// migrationName 根据版本前缀找文件名（测试辅助）。
+func migrationName(version string) string {
+	entries, _ := migrationFS.ReadDir("migrations")
+	for _, e := range entries {
+		if len(e.Name()) >= 4 && e.Name()[:4] == version {
+			return e.Name()[5:]
+		}
+	}
+	return ""
 }

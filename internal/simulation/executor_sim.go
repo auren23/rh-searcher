@@ -286,6 +286,8 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	{
 		nodeInterface := common.HexToAddress("0x00000000000000000000000000000000000000C8")
 		intfABI := `[{"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"bool","name":"contractCreation","type":"bool"},{"internalType":"bytes","name":"data","type":"bytes"}],"name":"gasEstimateL1Component","outputs":[{"internalType":"uint64","name":"gasEstimateForL1","type":"uint64"},{"internalType":"uint256","name":"baseFee","type":"uint256"},{"internalType":"uint256","name":"l1BaseFeeEstimate","type":"uint256"}],"stateMutability":"view","type":"function"}]`
+		var l1Err error
+		var l1Res []byte
 		parsed, aerr := abi.JSON(strings.NewReader(intfABI))
 		if aerr == nil {
 			if callData, perr := parsed.Pack("gasEstimateL1Component", msg.To, false, msg.Data); perr == nil {
@@ -294,12 +296,34 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 					l2BaseFee = new(big.Int).SetBytes(res[32:64])
 					l1BaseFeeEstimate = new(big.Int).SetBytes(res[64:96])
 					l1OK = l1GasUnits > 0 && l2BaseFee != nil && l2BaseFee.Sign() > 0
+				} else {
+					l1Err = cerr
+					l1Res = res
 				}
+			} else {
+				l1Err = perr
 			}
+		} else {
+			l1Err = aerr
 		}
-		if !l1OK && gasMode == GasEstimateComplete {
-			// L1 组件不可用 → 成本不完整：降级 latest 近似（不进入正式 EV）
-			gasMode = GasEstimateLatest
+		if !l1OK {
+			// L1 组件错误分类：infra（429/超时/断连）→ 区块保持未评估重试；
+			// 明确不支持 → 降级 latest 近似；其他 → 一致性错误（不静默降级）
+			if l1Err != nil {
+				switch {
+				case isInfraError(l1Err):
+					return nil, fmt.Errorf("historical l1 component (infra): %w", l1Err)
+				case isUnsupportedHistoricalEstimate(l1Err):
+					if gasMode == GasEstimateComplete {
+						gasMode = GasEstimateLatest
+					}
+				default:
+					return nil, fmt.Errorf("historical l1 component (inconsistent): %w", l1Err)
+				}
+			} else if gasMode == GasEstimateComplete {
+				// 调用成功但结果无效/不足 96 字节：一致性错误，不静默降级
+				return nil, fmt.Errorf("historical l1 component: invalid response (len=%d)", len(l1Res))
+			}
 		}
 	}
 	// SimulationBlock = eth_call 实际使用的区块（block 非 nil 时就是它，不是调用完成时的 latest）
