@@ -48,7 +48,7 @@ type Querier interface {
 // Legacy baseline 与启动检查共用同一套判断——不允许两套不一致的结构认知。
 func verifySchemaAt0011(ctx context.Context, q Querier) error {
 	var checks int
-	expect := 12
+	expect := 17
 	// 5 张核心业务表
 	for _, tbl := range []string{"opportunities", "dex_pools", "strategy_checkpoints",
 		"processed_blocks", "block_affected_pools"} {
@@ -62,6 +62,52 @@ func verifySchemaAt0011(ctx context.Context, q Querier) error {
 			checks++
 		}
 	}
+	// block_affected_pools 四列（评估队列运行时依赖）
+	var bapCols int
+	if err := q.QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema='public' AND table_name='block_affected_pools'
+		  AND column_name IN ('strategy', 'block_number', 'block_hash', 'pool_address')
+	`).Scan(&bapCols); err != nil {
+		return err
+	}
+	if bapCols == 4 {
+		checks++
+	}
+	// block_affected_pools 主键 + 查询索引
+	var bapPK, bapIdx bool
+	if err := q.QueryRow(ctx, `
+		SELECT
+			EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='block_affected_pools' AND indexname='block_affected_pools_pkey'),
+			EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='block_affected_pools' AND indexname='idx_bap_strategy_number')
+	`).Scan(&bapPK, &bapIdx); err != nil {
+		return err
+	}
+	if bapPK && bapIdx {
+		checks++
+	}
+	// processed_blocks 关键列
+	var pbCols int
+	if err := q.QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema='public' AND table_name='processed_blocks'
+		  AND column_name IN ('strategy', 'block_number', 'block_hash', 'canonical')
+	`).Scan(&pbCols); err != nil {
+		return err
+	}
+	if pbCols == 4 {
+		checks++
+	}
+	// dex_pools.tick_spacing + opportunities.opportunity_group_id
+	var extra int
+	if err := q.QueryRow(ctx, `
+		SELECT
+			(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='dex_pools' AND column_name='tick_spacing'))::int
+			+ (EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='opportunities' AND column_name='opportunity_group_id'))::int
+	`).Scan(&extra); err != nil {
+		return err
+	}
+	checks += extra
 	// 0004 唯一索引
 	var idx bool
 	if err := q.QueryRow(ctx, `
