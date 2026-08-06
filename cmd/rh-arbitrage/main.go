@@ -63,8 +63,7 @@ func main() {
 		src = ws
 	}
 
-	// Adapter 一律使用独立 HTTP Read RPC（连接池），不复用 WS 客户端：
-	// WS 重连会替换底层连接，Adapter 持有的旧指针会持续失败。
+	// Adapter 用独立 HTTP Read RPC（连接池），不复用 WS 客户端
 	readCli, dialErr := ethclient.Dial(cfg.RPC.Groups.Archive[0])
 	if dialErr != nil {
 		slog.Error("dial read rpc for adapter", "err", dialErr)
@@ -83,28 +82,11 @@ func main() {
 	reg := dex.NewRegistry()
 	graph := dex.NewGraph()
 	ckpt := storage.NewCheckpoint("deployments/checkpoint.json")
-	heights, _ := ckpt.Load()
-	// PG 可用时用 PGCheckpoint（跨进程安全；JSON 文件仅本地 fallback）——在 sink 初始化后接入
+	heights := map[string]uint64{}
 	var pgCkpt *storage.PGCheckpoint
-	fromBlock := heights["pools"]
-	if fromBlock < d.FactoryBlock {
-		fromBlock = d.FactoryBlock
-	}
+	fromBlock := uint64(0)
 
-	// 启动时读链头再引导（已完成的从 checkpoint 续跑；未完成的补全到链头）
-	headNum, err := readCli.BlockNumber(ctx)
-	if err != nil {
-		slog.Error("read chain head", "err", err)
-		os.Exit(1)
-	}
-	lastPoolBlock, err := v3.Bootstrap(ctx, adapter, reg, graph, fromBlock, headNum, v3.BootstrapOptions{})
-	if err != nil {
-		slog.Error("bootstrap failed (pools may be missing)", "err", err)
-		os.Exit(1)
-	}
-	_ = ckpt.Save("pools", lastPoolBlock)
-
-	// 先初始化 DB，再创建 Engine（sink 必须可用，不允许静默丢失候选）
+	// 先初始化 DB（sink 必须可用，不允许静默丢失候选）；PG 是 checkpoint 与池恢复的主事实源
 	var sink *storage.DB
 	if cfg.Storage.PostgresURL != "" {
 		sink, err = storage.New(ctx, cfg.Storage.PostgresURL)
@@ -113,14 +95,9 @@ func main() {
 			os.Exit(1)
 		}
 		defer sink.Close()
-		// PG 可用时切换为 PGCheckpoint（跨进程安全；JSON 仅本地 fallback）
 		pgCkpt = storage.NewPGCheckpoint(sink)
 		if pgHeights, err := pgCkpt.Load(ctx); err == nil && len(pgHeights) > 0 {
 			heights = pgHeights
-			fromBlock = heights["pools"]
-			if fromBlock < d.FactoryBlock {
-				fromBlock = d.FactoryBlock
-			}
 		}
 		// 从数据库恢复全部池（重建 Registry/Graph），再补扫增量
 		if _, err := storage.RestorePools(ctx, sink, reg, graph); err != nil {
@@ -140,13 +117,47 @@ func main() {
 				}
 			}
 		}
+	} else {
+		if jh, err := ckpt.Load(); err == nil {
+			heights = jh // JSON fallback（无 PG 的本地单进程开发）
+		}
+	}
+	if fromBlock == 0 {
+		fromBlock = heights["pools"]
+	}
+	if fromBlock < d.FactoryBlock {
+		fromBlock = d.FactoryBlock
 	}
 
-	weth := common.HexToAddress(cfg.Chain.WETH)
+	// 启动时读链头再引导（PG pools checkpoint 续跑；未完成的补全到链头）
+	headNum, err := readCli.BlockNumber(ctx)
+	if err != nil {
+		slog.Error("read chain head", "err", err)
+		os.Exit(1)
+	}
+	lastPoolBlock, err := v3.Bootstrap(ctx, adapter, reg, graph, fromBlock, headNum, v3.BootstrapOptions{})
+	if err != nil {
+		slog.Error("bootstrap failed (pools may be missing)", "err", err)
+		os.Exit(1)
+	}
+	// 全部已知池统一持久化（bootstrap 只写内存，重启依赖 PG 恢复）+ 更新 pools checkpoint
+	if sink != nil {
+		for _, st := range reg.AllPools() {
+			sp := st.Pool()
+			p3 := st.(*v3.Pool)
+			if err := sink.SavePool(ctx, sp.ID, sp.Exchange, "v3", sp.Token0, sp.Token1, sp.Fee, p3.TickSpacing); err != nil {
+				slog.Warn("save pool", "err", err)
+			}
+		}
+		if pgCkpt != nil {
+			_ = pgCkpt.Save(ctx, "arbitrage:pools", lastPoolBlock)
+		}
+	} else {
+		_ = ckpt.Save("pools", lastPoolBlock)
+	}
 
 	// 链上模拟器：真实 executeV3Cycle calldata + eth_call（sim RPC 组）。
-	// shadow 模式失败关闭：无执行合约 / 无 sim RPC / 合约无代码 → 拒绝启动，
-	// 绝不静默降级成 LocalEvaluator（否则"accepted"只是本地数学，不是可执行验证）。
+	// shadow 模式失败关闭：无执行合约 / 无 sim RPC / 合约无代码 → 拒绝启动。
 	if cfg.Executor.Contract == "" || cfg.Executor.Wallet == "" {
 		slog.Error("executor.contract / executor.wallet not configured (required in shadow mode)")
 		os.Exit(1)
@@ -169,7 +180,7 @@ func main() {
 	sim := simulation.NewExecutorSimulator(simCli, contractAddr,
 		common.HexToAddress(cfg.Executor.Wallet), 5_000_000)
 
-	// P0-5: Executor 启动预检（wallet/weth/factory/paused/余额）→ 余额用于资金限制
+	// Executor 启动预检（wallet/weth/factory/paused/余额）→ 余额用于资金限制
 	contractBal, err := preflightExecutor(ctx, simCli, contractAddr, cfg)
 	if err != nil {
 		slog.Error("executor preflight failed", "err", err)
@@ -195,6 +206,8 @@ func main() {
 	evaluator := simulation.NewSimulationEvaluator(sim, cfg.Chain.ID, safetyMargin)
 	slog.Info("simulation evaluator enabled", "contract", cfg.Executor.Contract,
 		"min_profit_wei", minProfit.String(), "safety_margin_wei", safetyMargin.String(), "top_k", topK)
+
+	weth := common.HexToAddress(cfg.Chain.WETH)
 
 	searcher := arbitrage.NewLocalSearcher(graph, reg, adapter, weth)
 	// 资金限制：max_input_wei / min_input_wei 与执行合约当前 WETH 余额（预检已读取）
@@ -224,17 +237,14 @@ func main() {
 			TopK:            topK,
 			Mode:            cfg.Mode.Run,
 		},
-		sink,
+		nil, // Engine 不再直写数据库；结果经 BlockResult 由 CommitBlockResult 事务提交
 		searcher,
 		evaluator,
 		arbitrage.NewExecutor(),
 	)
 
 	slog.Info("arbitrage engine started", "mode", cfg.Mode.Run, "pools", len(reg.AllPools()))
-	slog.Info("arbitrage engine started", "mode", cfg.Mode.Run, "pools", len(reg.AllPools()))
 	// 区块原子摄取：head 驱动，日志以 HTTP FilterLogs 精确取整块（唯一事实源）。
-	// 每个区块：取日志 → 验证 log.BlockHash == header.Hash → 排序应用 → 评估 → 前进。
-	// 启动时链头（订阅建立前发生的 Swap 由窗口补扫覆盖）
 	startHead, err := readCli.BlockNumber(ctx)
 	if err != nil {
 		slog.Error("read chain head", "err", err)
@@ -261,30 +271,31 @@ func main() {
 		}
 	} else {
 		// 首次实时 Shadow：从当前链头开始，只处理启动后的新块。
-		// 历史回放（--from-block/--to-block）是独立模式，不与实时 Shadow 混用。
 		lastApplied = startHead
 		if hdr, err := readCli.HeaderByNumber(ctx, nil); err == nil {
 			lastAppliedHash = hdr.Hash()
 		}
-		_ = saveCheckpoint("blocks", startHead)
+		if err := saveCheckpoint("blocks", startHead); err != nil {
+			slog.Error("first checkpoint save failed", "err", err)
+			os.Exit(1) // 失败关闭
+		}
 	}
 
-	processBlock := func(h chain.BlockEvent) error {
+	processBlock := func(h chain.BlockEvent) (*arbitrage.BlockResult, error) {
 		logs, err := readCli.FilterLogs(ctx, ethereum.FilterQuery{
 			FromBlock: new(big.Int).SetUint64(h.Number),
 			ToBlock:   new(big.Int).SetUint64(h.Number),
 			Topics:    eventTopics,
 		})
 		if err != nil {
-			return fmt.Errorf("block %d getLogs: %w", h.Number, err)
+			return nil, fmt.Errorf("block %d getLogs: %w", h.Number, err)
 		}
-		// 验证区块一致性（日志必须属于该 header）
 		for _, l := range logs {
 			if l.BlockHash != h.Hash {
-				return fmt.Errorf("block %d hash mismatch: log=%s header=%s", h.Number, l.BlockHash.Hex(), h.Hash.Hex())
+				return nil, fmt.Errorf("block %d hash mismatch: log=%s header=%s", h.Number, l.BlockHash.Hex(), h.Hash.Hex())
 			}
 		}
-		// 排序 + 应用 + 评估（复用区块聚合逻辑）
+		res := &arbitrage.BlockResult{Block: h.Number, BlockHash: h.Hash}
 		sort.Slice(logs, func(i, j int) bool {
 			if logs[i].TxIndex != logs[j].TxIndex {
 				return logs[i].TxIndex < logs[j].TxIndex
@@ -295,7 +306,7 @@ func main() {
 		for _, l := range logs {
 			state := reg.Pool(l.Address)
 			if state == nil {
-				// 启动后新创建的池：动态验证并加入
+				// 启动后新创建的池：动态验证并加入（随事务提交写库）
 				pool, derr := adapter.PoolByAddress(ctx, l.Address)
 				if derr != nil {
 					slog.Debug("unknown pool skipped", "addr", l.Address.Hex(), "err", derr)
@@ -303,8 +314,12 @@ func main() {
 				}
 				reg.UpsertPool(v3.State(pool))
 				graph.AddPool(pool.Pool(), pool.Address)
-				if sink != nil {
-					_ = sink.SavePool(ctx, pool.Address.Hex(), pool.Exchange, "v3", pool.Token0, pool.Token1, pool.Fee, pool.TickSpacing)
+				if pool.TickSpacing > 0 {
+					res.NewPools = append(res.NewPools, arbitrage.PoolMeta{
+						Address: pool.Address, Exchange: pool.Exchange,
+						Token0: pool.Token0, Token1: pool.Token1,
+						Fee: pool.Fee, TickSpacing: pool.TickSpacing,
+					})
 				}
 				state = reg.Pool(l.Address)
 			}
@@ -317,7 +332,6 @@ func main() {
 			if apply != nil {
 				apply()
 			}
-			// Mint/Burn：重读链上 bitmap word 与 active liquidity
 			if l.Topics[0] == eventTopics[0][1] || l.Topics[0] == eventTopics[0][2] {
 				if tl, tu, terr := v3.DecodeTickBounds(l); terr == nil {
 					if err := adapter.ResyncMintBurn(ctx, pool, tl, tu); err != nil {
@@ -334,23 +348,41 @@ func main() {
 			pools = append(pools, p)
 		}
 		if len(pools) > 0 {
-			engine.OnBlockBatch(ctx, arbitrage.SwapEvent{
+			processed := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
 				BlockNumber: h.Number,
 				BlockHash:   h.Hash,
 				ReceivedAt:  time.Now().UnixMilli(),
 			}, pools)
+			res.Candidates = processed.Candidates
 		}
-		return nil
+		return res, nil
 	}
 
+	// 单事务提交（pools + candidates + checkpoint 含 hash）；失败 → 游标不前进
 	processAndCommit := func(h chain.BlockEvent) error {
-		if err := processBlock(h); err != nil {
+		res, err := processBlock(h)
+		if err != nil {
 			return err
 		}
-		if err := saveCheckpoint("blocks", h.Number); err != nil {
-			return err
+		if sink != nil {
+			newPools := make([]storage.Pool, 0, len(res.NewPools))
+			for _, np := range res.NewPools {
+				newPools = append(newPools, storage.Pool{
+					Address: np.Address.Hex(), Exchange: np.Exchange, Protocol: "v3",
+					Token0: np.Token0.Hex(), Token1: np.Token1.Hex(),
+					Fee: np.Fee, TickSpacing: np.TickSpacing,
+				})
+			}
+			if err := sink.CommitBlockResult(ctx, h.Number, h.Hash.Hex(), h.Parent.Hex(), newPools, res.Candidates); err != nil {
+				return fmt.Errorf("commit block %d: %w", h.Number, err)
+			}
+		} else {
+			if err := saveCheckpoint("blocks", h.Number); err != nil {
+				return err
+			}
 		}
 		lastApplied = h.Number
+		lastAppliedHash = h.Hash
 		return nil
 	}
 
@@ -386,10 +418,20 @@ func main() {
 			if h.Number <= lastApplied {
 				continue // 已处理（含轮询源补块重复）
 			}
-			// reorg 检测：新 head 必须与游标 parent 衔接；断裂则从 lastApplied+1 起重新处理
+			// reorg 检测：新 head 必须与游标 parent 衔接；断裂 → 标记孤块 + 回退游标重处理
 			if lastAppliedHash != (common.Hash{}) && h.Number == lastApplied+1 && h.Parent != lastAppliedHash {
-				slog.Warn("reorg detected, reprocessing from", "block", lastApplied+1,
+				rollback := lastApplied
+				slog.Warn("reorg detected", "rollback_from", lastApplied,
 					"parent", h.Parent.Hex(), "expected", lastAppliedHash.Hex())
+				if sink != nil {
+					if _, uerr := sink.Exec(ctx, `
+						UPDATE opportunities SET canonical = FALSE
+						WHERE observed_block = $1 AND block_hash = $2`,
+						rollback, lastAppliedHash.Hex()); uerr != nil {
+						slog.Error("reorg mark failed", "err", uerr)
+					}
+				}
+				lastApplied = rollback - 1 // 从该高度重新处理（新链）
 			}
 			// 顺序处理 lastApplied+1 → h.Number；任一失败即停止推进（失败区块不被跳过）
 			for bn := lastApplied + 1; bn <= h.Number; bn++ {
@@ -408,11 +450,11 @@ func main() {
 					slog.Error("block processing failed, cursor stays at", "block", lastApplied, "err", err)
 					break
 				}
-				lastAppliedHash = ev.Hash
 			}
 		}
 	}
 }
+
 
 // preflightExecutor 校验执行合约配置与链上状态一致（防错地址导致全部模拟 revert）。
 // 返回执行合约的 WETH 余额（资金限制的一部分）。

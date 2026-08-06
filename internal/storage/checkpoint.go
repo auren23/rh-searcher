@@ -88,10 +88,19 @@ func (p *PGCheckpoint) Load(ctx context.Context) (map[string]uint64, error) {
 }
 
 func (p *PGCheckpoint) Save(ctx context.Context, strategy string, block uint64) error {
+	return p.SaveWithHash(ctx, strategy, block, "", "")
+}
+
+// SaveWithHash 保存 checkpoint（含区块 hash，reorg 检测用）。
+func (p *PGCheckpoint) SaveWithHash(ctx context.Context, strategy string, block uint64, blockHash, parentHash string) error {
 	_, err := p.db.pool.Exec(ctx, `
-		INSERT INTO strategy_checkpoints (strategy, block_number, updated_at)
-		VALUES ($1,$2,now())
-		ON CONFLICT (strategy) DO UPDATE SET block_number = EXCLUDED.block_number, updated_at = now()`,
-		strategy, block)
+		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, parent_hash, updated_at)
+		VALUES ($1,$2,$3,$4,now())
+		ON CONFLICT (strategy) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			parent_hash = EXCLUDED.parent_hash,
+			updated_at = now()`,
+		strategy, block, nullableStr(blockHash), nullableStr(parentHash))
 	return err
 }

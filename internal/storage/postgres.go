@@ -9,6 +9,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/auren23/rh-searcher/internal/arbitrage"
@@ -72,7 +73,13 @@ func (d *DB) Close() { d.pool.Close() }
 
 // SaveCandidate 落盘套利候选（含拒绝的；完整可重放字段）。
 func (d *DB) SaveCandidate(ctx context.Context, c *arbitrage.Candidate) error {
-	_, err := d.pool.Exec(ctx, `
+	return insertCandidateTx(ctx, d.pool, c)
+}
+
+func insertCandidateTx(ctx context.Context, q interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}, c *arbitrage.Candidate) error {
+	_, err := q.Exec(ctx, `
 		INSERT INTO opportunities (
 			id, strategy, observed_block, observed_at, source_event,
 			block_hash, tx_hash, log_index, route_json,
@@ -111,6 +118,52 @@ func (d *DB) SaveLiquidationCandidate(ctx context.Context, c *liquidation.Candid
 		nullableBigInt(c.ExpectedNetProfit), c.Decision, c.RejectReason,
 	)
 	return err
+}
+
+// CommitBlockResult 在单个 PostgreSQL 事务内提交一个区块的全部结果：
+// 新池 + 候选 + checkpoint（含 hash）。任一步失败整体回滚 ——
+// 游标只有在事务提交成功后才允许前进（exactly-once 的落盘侧）。
+func (d *DB) CommitBlockResult(ctx context.Context, block uint64, blockHash, parentHash string, pools []Pool, cands []*arbitrage.Candidate) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	for _, sp := range pools {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing)
+			VALUES ($1,$2,$3,$4,$5,$6,$7)
+			ON CONFLICT (address) DO UPDATE SET
+				exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
+				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
+				fee = EXCLUDED.fee, tick_spacing = EXCLUDED.tick_spacing`,
+			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing); err != nil {
+			return fmt.Errorf("pool %s: %w", sp.Address, err)
+		}
+	}
+	for _, c := range cands {
+		if err := insertCandidateTx(ctx, tx, c); err != nil {
+			return fmt.Errorf("candidate %s: %w", c.ID, err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, parent_hash, updated_at)
+		VALUES ('arbitrage:blocks', $1, $2, $3, now())
+		ON CONFLICT (strategy) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			parent_hash = EXCLUDED.parent_hash,
+			updated_at = now()`,
+		block, nullableStr(blockHash), nullableStr(parentHash)); err != nil {
+		return fmt.Errorf("checkpoint: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// Exec 透出连接执行（reorg 标记等运维操作）。
+func (d *DB) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return d.pool.Exec(ctx, sql, args...)
 }
 
 // SaveBlock 记录区块（用于断点恢复与审计）。

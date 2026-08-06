@@ -60,11 +60,10 @@ func (f *fakeSink) SaveCandidate(ctx context.Context, c *Candidate) error {
 
 // 同一组 Top-K 只能有一个 selected=true；其余通过者降级 simulation_valid。
 func TestEngineTopKSingleSelected(t *testing.T) {
-	sink := &fakeSink{}
 	exec := &fakeExecutor{}
 	eng := NewEngine(
 		Config{ChainID: 4663, MinProfitWei: big.NewInt(1), TopK: 3, Mode: "live"},
-		sink,
+		nil,
 		&fakeSearcher{cands: []*Candidate{
 			{InputAmount: big.NewInt(1), GrossProfit: big.NewInt(10), Route: []Hop{{}}, RouteJSON: "[]"},
 			{InputAmount: big.NewInt(2), GrossProfit: big.NewInt(20), Route: []Hop{{}}, RouteJSON: "[]"},
@@ -73,14 +72,14 @@ func TestEngineTopKSingleSelected(t *testing.T) {
 		&fakeEvaluator{},
 		exec,
 	)
-	eng.OnSwap(context.Background(), SwapEvent{
+	res := eng.ProcessBlock(context.Background(), SwapEvent{
 		Pool: common.Address{1}, BlockNumber: 100,
 		BlockHash: common.Hash{1}, TxHash: common.Hash{2}, LogIndex: 3,
-	})
+	}, []common.Address{{1}})
 
 	selected := 0
 	valid := 0
-	for _, c := range sink.saved {
+	for _, c := range res.Candidates {
 		if c.Selected {
 			selected++
 			if c.Decision != SimulationAccepted {
@@ -106,16 +105,17 @@ func TestEngineTopKSingleSelected(t *testing.T) {
 	}
 }
 
-// OnBlockBatch：同一区块多个受影响池去重（每池一次 OnSwap）。
-func TestOnBlockBatchDedupe(t *testing.T) {
+// ProcessBlock：同一区块多个受影响池去重（每条 route 只评估一次）。
+func TestProcessBlockDedupe(t *testing.T) {
 	eng := NewEngine(Config{TopK: 1}, nil,
 		&countingSearcher{}, &fakeEvaluator{}, &fakeExecutor{})
 	poolA := common.Address{0xaa}
 	poolB := common.Address{0xbb}
-	eng.OnBlockBatch(context.Background(), SwapEvent{BlockNumber: 5},
+	res := eng.ProcessBlock(context.Background(), SwapEvent{BlockNumber: 5},
 		[]common.Address{poolA, poolA, poolB})
+	_ = res
 	if cs := eng.searcher.(*countingSearcher).count; cs != 2 {
-		t.Errorf("OnSwap calls=%d want 2 (dedupe A)", cs)
+		t.Errorf("evaluate calls=%d want 2 (dedupe A)", cs)
 	}
 }
 

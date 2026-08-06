@@ -3,17 +3,24 @@ BEGIN;
 
 DROP INDEX IF EXISTS idx_opportunities_selected;
 
--- 旧数据清理：每组只保留净利最高的一条 selected（否则唯一索引创建失败）
-DELETE FROM opportunities o
-WHERE o.selected = TRUE
-  AND o.opportunity_group_id IS NOT NULL
-  AND EXISTS (
-      SELECT 1 FROM opportunities o2
-      WHERE o2.opportunity_group_id = o.opportunity_group_id
-        AND o2.selected = TRUE
-        AND o2.id <> o.id
-        AND COALESCE(o2.expected_net_profit, 0) > COALESCE(o.expected_net_profit, 0)
-  );
+-- 旧数据清理：每组只保留一条 selected（稳定排序：净利降序，同利润按 id 升序取第一）。
+-- 只取消 Selected，不删除候选（保留研究数据）。
+WITH ranked AS (
+    SELECT
+        id,
+        ROW_NUMBER() OVER (
+            PARTITION BY opportunity_group_id
+            ORDER BY expected_net_profit DESC NULLS LAST, id ASC
+        ) AS rn
+    FROM opportunities
+    WHERE selected = TRUE
+      AND opportunity_group_id IS NOT NULL
+)
+UPDATE opportunities o
+SET selected = FALSE
+FROM ranked r
+WHERE o.id = r.id
+  AND r.rn > 1;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_opportunities_group_selected
     ON opportunities(opportunity_group_id)
