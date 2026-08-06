@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/auren23/rh-searcher/internal/config"
+	"github.com/auren23/rh-searcher/internal/storage"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/auren23/rh-searcher/internal/rpc"
 )
 
@@ -37,6 +39,30 @@ func main() {
 			fmt.Printf("v3_dexes: %d\n", len(cfg.Dexes.V3))
 			fmt.Printf("run_mode: %s\n", cfg.Mode.Run)
 			// 不打印任何密钥
+		},
+	})
+
+	root.AddCommand(&cobra.Command{
+		Use:   "migrate",
+		Short: "Run pending DB migrations (idempotent, advisory-locked)",
+		Run: func(cmd *cobra.Command, args []string) {
+			url := os.Getenv("RH_POSTGRES_URL")
+			if url == "" {
+				fmt.Fprintln(os.Stderr, "RH_POSTGRES_URL not set")
+				os.Exit(1)
+			}
+			ctx := context.Background()
+			pool, err := pgxpool.New(ctx, url)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "connect:", err)
+				os.Exit(1)
+			}
+			defer pool.Close()
+			if err := storage.Migrate(ctx, pool); err != nil {
+				fmt.Fprintln(os.Stderr, "migrate:", err)
+				os.Exit(1)
+			}
+			fmt.Println("migrations up to date")
 		},
 	})
 

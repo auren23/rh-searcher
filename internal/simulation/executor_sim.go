@@ -160,6 +160,7 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	// 正式 historical 成本禁止用硬编码默认 gas price）
 	var historicalHeader *types.Header
 	var blockTime int64
+	var err error
 	if block != nil {
 		hdr, herr := s.cli.HeaderByNumber(ctx, block)
 		if herr != nil {
@@ -168,7 +169,13 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 		historicalHeader = hdr
 		blockTime = int64(hdr.Time)
 	}
-	calldata, err := BuildExecuteV3CycleCalldataAt(c, chainID, blockTime)
+	var calldata []byte
+	if block != nil {
+		calldata, err = BuildExecuteV3CycleCalldataAt(c, chainID, blockTime)
+	} else {
+		// latest 模拟：deadline 用当前时间（历史 deadline 在 latest 状态必过期）
+		calldata, err = BuildExecuteV3CycleCalldata(c, chainID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +231,10 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 				}
 				gasPrice = new(big.Int).Set(historicalHeader.BaseFee)
 				gasMode = GasEstimateComplete
+			case isInfraError(err):
+				// 基础设施故障（429/超时/断连/历史状态不可用）优先于 unsupported：
+				// 一次临时故障绝不能把整个进程永久降级成 latest_approximation
+				return nil, fmt.Errorf("historical estimateGas (infra): %w", err)
 			case isUnsupportedHistoricalEstimate(err):
 				// 明确不支持（-32601/-32602/not supported）→ latest 近似，
 				// 并缓存：后续区块直接走 latest
@@ -237,9 +248,6 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 					gas = s.maxGas
 					gasMode = GasEstimateMax
 				}
-			case isInfraError(err):
-				// 基础设施故障：区块保持未评估，由上层重试
-				return nil, fmt.Errorf("historical estimateGas (infra): %w", err)
 			default:
 				// 未知/矛盾错误：宁可重试，不可误认证
 				return nil, fmt.Errorf("historical estimateGas (inconsistent): %w", err)
@@ -269,11 +277,13 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	// 读取失败视为基础设施错误（可重试），不静默 fallback。
 
 	// Arbitrum L1 data 费用：NodeInterface 虚拟合约 (0x...C8) 的 gasEstimateL1Component(to, contractCreation, data)
-	// 返回 (gasEstimateForL1, baseFee, l1BaseFeeEstimate)；eth_gasEstimateL1Component RPC 方法不存在。
+	// 返回 (gasEstimateForL1, baseFee, l1BaseFeeEstimate)，固定到同一历史区块。
+	// historical_complete 准入要求 L1 组件有效（gasEstimateForL1 > 0）——
+	// 缺失时降级近似（不进入正式 EV）。
 	var l1GasUnits uint64
 	var l2BaseFee, l1BaseFeeEstimate *big.Int
+	l1OK := false
 	{
-		// NodeInterface 虚拟合约（0x...C8）的 gasEstimateL1Component(to, contractCreation, data)
 		nodeInterface := common.HexToAddress("0x00000000000000000000000000000000000000C8")
 		intfABI := `[{"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"bool","name":"contractCreation","type":"bool"},{"internalType":"bytes","name":"data","type":"bytes"}],"name":"gasEstimateL1Component","outputs":[{"internalType":"uint64","name":"gasEstimateForL1","type":"uint64"},{"internalType":"uint256","name":"baseFee","type":"uint256"},{"internalType":"uint256","name":"l1BaseFeeEstimate","type":"uint256"}],"stateMutability":"view","type":"function"}]`
 		parsed, aerr := abi.JSON(strings.NewReader(intfABI))
@@ -283,8 +293,13 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 					l1GasUnits = new(big.Int).SetBytes(res[0:32]).Uint64()
 					l2BaseFee = new(big.Int).SetBytes(res[32:64])
 					l1BaseFeeEstimate = new(big.Int).SetBytes(res[64:96])
+					l1OK = l1GasUnits > 0 && l2BaseFee != nil && l2BaseFee.Sign() > 0
 				}
 			}
+		}
+		if !l1OK && gasMode == GasEstimateComplete {
+			// L1 组件不可用 → 成本不完整：降级 latest 近似（不进入正式 EV）
+			gasMode = GasEstimateLatest
 		}
 	}
 	// SimulationBlock = eth_call 实际使用的区块（block 非 nil 时就是它，不是调用完成时的 latest）

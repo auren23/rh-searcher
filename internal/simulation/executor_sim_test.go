@@ -60,8 +60,23 @@ func (m *mockRPCServer) handle(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": fmt.Sprintf("0x%x", m.estGas)}
 		json.NewEncoder(w).Encode(resp)
 	case "eth_call":
-		resp := map[string]any{"jsonrpc": "2.0", "id": req.ID,
-			"result": "0x" + strings.Repeat("00", 31) + "01"} // profit=1
+		var params []json.RawMessage
+		_ = json.Unmarshal(req.Params, &params)
+		result := "0x" + strings.Repeat("00", 31) + "01" // profit=1
+		if len(params) > 0 {
+			var obj struct {
+				To string `json:"to"`
+			}
+			_ = json.Unmarshal(params[0], &obj)
+			if strings.EqualFold(obj.To, "0x00000000000000000000000000000000000000C8") {
+				// NodeInterface.gasEstimateL1Component：96 字节
+				// (gasEstimateForL1=1000, baseFee=1e9, l1BaseFeeEstimate=1e9)
+				result = "0x" + strings.Repeat("00", 31) + "03e8" +
+					strings.Repeat("00", 31) + "01" +
+					strings.Repeat("00", 31) + "01"
+			}
+		}
+		resp := map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result}
 		json.NewEncoder(w).Encode(resp)
 	case "eth_getBlockByNumber":
 		resp := map[string]any{"jsonrpc": "2.0", "id": req.ID,

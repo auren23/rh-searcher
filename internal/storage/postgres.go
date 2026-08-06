@@ -147,16 +147,16 @@ func (d *DB) checkSchema(ctx context.Context) error {
 		return fmt.Errorf("database schema out of date: migration 0011 not applied "+
 			"(gas_estimate_mode default %q, want not_estimated)", def)
 	}
-	// 0012: schema_migrations 版本表（版本门控，不再猜列存在）
+	// 0012/0013: schema_migrations 版本门控（不再猜列存在）
 	var latest string
 	if err := d.pool.QueryRow(ctx, `
 		SELECT COALESCE(MAX(version), '') FROM schema_migrations
 	`).Scan(&latest); err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if latest < "0011" {
-		return fmt.Errorf("database schema out of date: migration 0012 not applied "+
-			"(schema_migrations latest %q)", latest)
+	if latest < requiredSchemaVersion {
+		return fmt.Errorf("database schema out of date: latest=%q want >=%s",
+			latest, requiredSchemaVersion)
 	}
 	return nil
 }
@@ -401,6 +401,9 @@ func (d *DB) LoadPendingAffected(ctx context.Context, fromBlock uint64) ([]Pendi
 func (d *DB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	return d.pool.QueryRow(ctx, sql, args...)
 }
+
+// requiredSchemaVersion 启动要求的最高迁移版本（0013 包含旧 historical 数据清洗）。
+const requiredSchemaVersion = "0013"
 
 // RollbackToAncestor：reorg 单事务回滚——
 // 1) processed_blocks 标孤块；2) 本策略候选标孤块（不碰其他策略）；

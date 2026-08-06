@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/big"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -488,5 +489,93 @@ func TestGasModeDefaultNotEstimated(t *testing.T) {
 	}
 	if mode != "not_estimated" {
 		t.Fatalf("gas_estimate_mode=%q want not_estimated", mode)
+	}
+}
+
+// P1-1: schema_migrations 最高版本低于门槛（0013）→ 启动必须失败。
+func TestSchemaGateRejectsOldMigrationVersion(t *testing.T) {
+	url := os.Getenv("RH_TEST_PG_URL")
+	if url == "" {
+		t.Skip("RH_TEST_PG_URL not set (CI postgres service)")
+	}
+	ctx := context.Background()
+	db, err := New(ctx, url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer db.Close()
+	// 临时把版本表降到 0012（恢复原值后清理）
+	if _, err := db.pool.Exec(ctx, `
+		DELETE FROM schema_migrations WHERE version > '0012';
+		INSERT INTO schema_migrations (version) VALUES ('0012') ON CONFLICT DO NOTHING;`); err != nil {
+		t.Fatalf("downgrade: %v", err)
+	}
+	_, err = New(ctx, url)
+	if err == nil {
+		t.Fatalf("New() must fail when latest migration version is below required")
+	}
+	if !strings.Contains(err.Error(), "0013") {
+		t.Fatalf("error must mention required version: %v", err)
+	}
+	// 恢复 0013
+	if _, err := db.pool.Exec(ctx, `
+		INSERT INTO schema_migrations (version) VALUES ('0013') ON CONFLICT DO NOTHING;`); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+}
+
+// P1-2: 迁移 runner 幂等——已应用版本被跳过；
+// 未应用版本执行一次后记录，二次调用不再执行数据更新脚本。
+func TestMigrateRunnerIdempotent(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	seed := func(id string) {
+		if _, err := db.pool.Exec(ctx, `
+			INSERT INTO opportunities (id, strategy, observed_block, observed_at, source_event,
+				route_json, input_asset, input_amount, gross_profit, gas_estimate, swap_cost,
+				slippage_cost, expected_net_profit, simulation_result, decision, reject_reason,
+				gas_estimate_mode)
+			VALUES ($1, 'weth-2hop', 1, 1, 'block_swap_batch',
+				'[]', '0x0000000000000000000000000000000000000001', '1', '1', '0', '0', '0',
+				'1', 'ok', 'simulation_accepted', '', 'historical')
+			ON CONFLICT (id) DO NOTHING;`, id); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	// 模拟 0013 尚未应用：从版本表删除（连接已建立，gate 只在 New() 检查）
+	if _, err := db.pool.Exec(ctx, `DELETE FROM schema_migrations WHERE version = '0013'`); err != nil {
+		t.Fatalf("unapply: %v", err)
+	}
+	defer func() {
+		// 无论结果如何恢复版本（防止污染其他测试的 schema gate）
+		db.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ('0013') ON CONFLICT DO NOTHING`)
+	}()
+	// 同时把 0013 之前已被 0013 清洗过的数据也清掉，保证 seed 行是"迁移前"状态
+	if _, err := db.pool.Exec(ctx, `DELETE FROM opportunities WHERE id LIKE 'migrate-idem-%'`); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	seed("migrate-idem-1")
+	if err := Migrate(ctx, db.pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	var decision string
+	if err := db.pool.QueryRow(ctx,
+		`SELECT decision FROM opportunities WHERE id='migrate-idem-1'`).Scan(&decision); err != nil {
+		t.Fatal(err)
+	}
+	if decision != "simulation_valid_cost_approx" {
+		t.Fatalf("0013 must sanitize: decision=%s", decision)
+	}
+	// 二次执行：0013 已记录 → 跳过；新插入的旧行保持原状（脚本未重复执行）
+	seed("migrate-idem-2")
+	if err := Migrate(ctx, db.pool); err != nil {
+		t.Fatalf("migrate2: %v", err)
+	}
+	if err := db.pool.QueryRow(ctx,
+		`SELECT decision FROM opportunities WHERE id='migrate-idem-2'`).Scan(&decision); err != nil {
+		t.Fatal(err)
+	}
+	if decision != "simulation_accepted" {
+		t.Fatalf("migration must not re-run: decision=%s", decision)
 	}
 }

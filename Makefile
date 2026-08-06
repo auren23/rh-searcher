@@ -34,7 +34,7 @@ run-liquidator:
 	$(GO) run ./cmd/rh-liquidator -config configs/morpho.yaml
 
 migrate:
-	docker compose -f docker-compose.dev.yml exec -T postgres psql -U rh -d rh -f /docker-entrypoint-initdb.d/0001_init.sql
+	$(GO) run ./cmd/rh-cli migrate
 
 dev: up
 	$(GO) run ./cmd/rh-cli config-check
