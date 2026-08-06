@@ -89,16 +89,28 @@ func (d *DB) checkSchema(ctx context.Context) error {
 	if !hasPb {
 		return fmt.Errorf("database schema out of date: migration 0006 not applied")
 	}
-	// 0007: dex_pools.canonical / created_block（孤池恢复依赖）
-	var hasPoolCanonical bool
+	// 0007: dex_pools 三列完整（部分执行的迁移不能通过）
+	var nPoolCols int
 	if err := d.pool.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM information_schema.columns
-			WHERE table_name='dex_pools' AND column_name='canonical')
-	`).Scan(&hasPoolCanonical); err != nil {
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_name='dex_pools'
+		  AND column_name IN ('canonical', 'created_block', 'created_block_hash')
+	`).Scan(&nPoolCols); err != nil {
 		return fmt.Errorf("schema check: %w", err)
 	}
-	if !hasPoolCanonical {
-		return fmt.Errorf("database schema out of date: migration 0007 not applied")
+	if nPoolCols != 3 {
+		return fmt.Errorf("database schema out of date: migration 0007 not applied "+
+			"(dex_pools has %d/3 canonical columns)", nPoolCols)
+	}
+	// 0008: block_affected_pools（评估队列）
+	var hasBap bool
+	if err := d.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='block_affected_pools')
+	`).Scan(&hasBap); err != nil {
+		return fmt.Errorf("schema check: %w", err)
+	}
+	if !hasBap {
+		return fmt.Errorf("database schema out of date: migration 0008 not applied")
 	}
 	return nil
 }
@@ -174,8 +186,11 @@ func (d *DB) SaveLiquidationCandidate(ctx context.Context, c *liquidation.Candid
 // CommitBlockResult 在单个 PostgreSQL 事务内提交一个区块的全部结果：
 // 新池 + 候选 + checkpoint（含 hash）。任一步失败整体回滚 ——
 // 游标只有在事务提交成功后才允许前进（exactly-once 的落盘侧）。
-func (d *DB) CommitBlockResult(ctx context.Context, block uint64, blockHash, parentHash string, pools []Pool, cands []*arbitrage.Candidate) error {
-	hash := blockHash
+// CommitBlockIngest 在单个事务内提交区块摄取结果：
+// 新池（含 PoolCreated 溯源）+ 受影响池（评估队列）+ 区块 checkpoint（含 hash）
+// + 规范区块历史。任一写入失败整体回滚——ingest 游标不前进。
+func (d *DB) CommitBlockIngest(ctx context.Context, block uint64, blockHash, parentHash string,
+	pools []Pool, affectedPools []string) error {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -183,6 +198,10 @@ func (d *DB) CommitBlockResult(ctx context.Context, block uint64, blockHash, par
 	defer tx.Rollback(ctx)
 
 	for _, sp := range pools {
+		createdHash := sp.CreatedBlockHash
+		if createdHash == "" {
+			createdHash = blockHash // 无真实 PoolCreated 日志时兜底（观察块）
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
 				canonical, created_block, created_block_hash)
@@ -191,16 +210,24 @@ func (d *DB) CommitBlockResult(ctx context.Context, block uint64, blockHash, par
 				exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
 				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
 				fee = EXCLUDED.fee, tick_spacing = EXCLUDED.tick_spacing,
-				canonical = TRUE, created_block = EXCLUDED.created_block,
-				created_block_hash = EXCLUDED.created_block_hash`,
+				canonical = TRUE,
+				created_block = CASE WHEN dex_pools.created_block IS NULL
+					THEN EXCLUDED.created_block ELSE dex_pools.created_block END,
+				created_block_hash = CASE WHEN dex_pools.created_block_hash IS NULL
+					THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END`,
 			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing,
-			block, nullableStr(hash)); err != nil {
+			sp.CreatedBlock, nullableStr(createdHash)); err != nil {
 			return fmt.Errorf("pool %s: %w", sp.Address, err)
 		}
 	}
-	for _, c := range cands {
-		if err := insertCandidateTx(ctx, tx, c); err != nil {
-			return fmt.Errorf("candidate %s: %w", c.ID, err)
+	// 受影响池持久化（评估队列；ingest 提交后崩溃仍可重新聚合评估）
+	for _, pa := range affectedPools {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO block_affected_pools (strategy, block_number, block_hash, pool_address)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (strategy, block_hash, pool_address) DO NOTHING`,
+			CheckpointBlocks, block, blockHash, pa); err != nil {
+			return fmt.Errorf("affected pool %s: %w", pa, err)
 		}
 	}
 	if _, err := tx.Exec(ctx, `
@@ -226,6 +253,69 @@ func (d *DB) CommitBlockResult(ctx context.Context, block uint64, blockHash, par
 		return fmt.Errorf("processed_blocks: %w", err)
 	}
 	return tx.Commit(ctx)
+}
+
+// CommitEvaluation 在单个事务内提交评估结果：
+// 候选 + evaluate checkpoint。失败 → evaluate 游标不前进，重启后重新评估同一批
+// （ingest 已提交的受影响池仍在队列里）。
+func (d *DB) CommitEvaluation(ctx context.Context, block uint64, blockHash string, candidates []*arbitrage.Candidate) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for _, c := range candidates {
+		if err := insertCandidateTx(ctx, tx, c); err != nil {
+			return fmt.Errorf("candidate %s: %w", c.ID, err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, updated_at)
+		VALUES ('` + CheckpointEvaluate + `', $1, $2, now())
+		ON CONFLICT (strategy) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			updated_at = now()`,
+		block, nullableStr(blockHash)); err != nil {
+		return fmt.Errorf("evaluate checkpoint: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// LoadPendingAffected 读取 evaluate 游标之后尚未评估的受影响池
+// （跨区块聚合去重），返回评估终点（最后一块）与池列表。
+func (d *DB) LoadPendingAffected(ctx context.Context, fromBlock uint64) (uint64, string, []string, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT block_number, block_hash, pool_address
+		FROM block_affected_pools
+		WHERE strategy = $1 AND block_number > $2
+		ORDER BY block_number ASC`,
+		CheckpointBlocks, fromBlock)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	defer rows.Close()
+	var last uint64
+	lastHash := ""
+	seen := map[string]struct{}{}
+	out := []string{}
+	for rows.Next() {
+		var n uint64
+		var h, pa string
+		if err := rows.Scan(&n, &h, &pa); err != nil {
+			return 0, "", nil, err
+		}
+		if n > last {
+			last = n
+			lastHash = h
+		}
+		if _, dup := seen[pa]; dup {
+			continue
+		}
+		seen[pa] = struct{}{}
+		out = append(out, pa)
+	}
+	return last, lastHash, out, rows.Err()
 }
 
 // QueryRow 执行单行查询（reorg 祖先查找用）。
@@ -260,18 +350,25 @@ func (d *DB) RollbackToAncestor(ctx context.Context, strategy string, ancestor u
 		return err
 	}
 	// 孤块中创建并持久化的池标记非规范（Restore 时过滤，不进入 Graph）。
-	// 精确判定：池的 created_block_hash 必须落在本事务已标记的孤块列表里
-	// （PoolCreated/首次观察区块），而不是简单按高度比较——池可能创建于
-	// 祖先之前、只是第一次 Swap 在孤块高度。
+	// 精确判定：池的 created_block_hash 必须落在本次孤块列表里（block_number > ancestor）
+	// ——池可能创建于祖先之前、只是首次观察在孤块高度（历史 reorg 留下的
+	// canonical=false 区块 hash 不参与，避免重启后误标）。
 	if _, err := tx.Exec(ctx, `
 		UPDATE dex_pools SET canonical = FALSE
 		WHERE canonical = TRUE
 		  AND created_block_hash IS NOT NULL
 		  AND created_block_hash IN (
 			SELECT block_hash FROM processed_blocks
-			WHERE strategy = $1 AND canonical = FALSE
+			WHERE strategy = $1 AND canonical = FALSE AND block_number > $2
 		  )`,
-		strategy); err != nil {
+		strategy, ancestor); err != nil {
+		return err
+	}
+	// 孤块评估队列清理 + evaluate 游标回退（未评估的批次作废，从祖先重新开始）
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM block_affected_pools
+		WHERE strategy = $1 AND block_number > $2`,
+		strategy, ancestor); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `
@@ -283,6 +380,17 @@ func (d *DB) RollbackToAncestor(ctx context.Context, strategy string, ancestor u
 			parent_hash = EXCLUDED.parent_hash,
 			updated_at = now()`,
 		strategy, ancestor, nullableStr(hash), nullableStr(parent)); err != nil {
+		return err
+	}
+	// evaluate 游标同步回退到祖先（新链重处理后重新评估）
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, updated_at)
+		VALUES ('` + CheckpointEvaluate + `', $1, $2, now())
+		ON CONFLICT (strategy) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			updated_at = now()`,
+		ancestor, nullableStr(hash)); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -315,6 +423,17 @@ func (d *DB) InitializeBlockCheckpoint(ctx context.Context, strategy string, blo
 			parent_hash = EXCLUDED.parent_hash,
 			canonical = TRUE`,
 		strategy, block, hash, nullableStr(parent)); err != nil {
+		return err
+	}
+	// evaluate 游标同步初始化（无待评估批次）
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, updated_at)
+		VALUES ('` + CheckpointEvaluate + `', $1, $2, now())
+		ON CONFLICT (strategy) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			updated_at = now()`,
+		block, nullableStr(hash)); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -376,15 +495,24 @@ func (d *DB) LatestBlock(ctx context.Context) (uint64, error) {
 }
 
 // SavePool 落盘池元数据（dex_pools）。供重启恢复 Registry/Graph。
-func (d *DB) SavePool(ctx context.Context, address string, exchange, protocol string, token0, token1 common.Address, fee uint32, tickSpacing int) error {
+// SavePool 落盘池元数据（dex_pools）。供重启恢复 Registry/Graph。
+// createdBlock/createdHash 来自 Factory PoolCreated 日志（0/空表示未知）。
+func (d *DB) SavePool(ctx context.Context, address string, exchange, protocol string, token0, token1 common.Address, fee uint32, tickSpacing int, createdBlock uint64, createdHash string) error {
 	_, err := d.pool.Exec(ctx, `
-		INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)
+		INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
+			canonical, created_block, created_block_hash)
+		VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, $8, $9)
 		ON CONFLICT (address) DO UPDATE SET
 			exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
 			token0 = EXCLUDED.token0, token1 = EXCLUDED.token1, fee = EXCLUDED.fee,
-			tick_spacing = EXCLUDED.tick_spacing`,
-		address, exchange, protocol, token0.Hex(), token1.Hex(), fee, tickSpacing)
+			tick_spacing = EXCLUDED.tick_spacing,
+			canonical = TRUE,
+			created_block = CASE WHEN dex_pools.created_block IS NULL
+				THEN EXCLUDED.created_block ELSE dex_pools.created_block END,
+			created_block_hash = CASE WHEN dex_pools.created_block_hash IS NULL
+				THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END`,
+		address, exchange, protocol, token0.Hex(), token1.Hex(), fee, tickSpacing,
+		createdBlock, nullableStr(createdHash))
 	return err
 }
 
@@ -397,6 +525,9 @@ type Pool struct {
 	Token1      string
 	Fee         uint32
 	TickSpacing int
+	// 创建溯源（来自 Factory PoolCreated；空表示未知）
+	CreatedBlock     uint64
+	CreatedBlockHash string
 }
 
 // LoadPools 读取全部池元数据（启动恢复）。tick_spacing 缺失时（旧数据）返回 0，由调用方补查。

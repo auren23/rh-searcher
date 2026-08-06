@@ -36,6 +36,10 @@ type Pool struct {
 	Liquidity    *big.Int
 	SqrtPriceX96 *big.Int
 
+	// 创建溯源：来自 Factory PoolCreated 日志（reorg 池回滚的精确依据）
+	CreatedBlock     uint64
+	CreatedBlockHash common.Hash
+
 	ticks        map[int]*Tick     // tick -> 流动性数据
 	bitmap       map[int64]*big.Int // wordPos -> 256bit 位图（仅已加载的 word）
 	bitmapLoaded map[int64]bool    // 区分"未加载"与"真实为 0"；未加载的 word 不得当作空

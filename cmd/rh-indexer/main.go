@@ -144,7 +144,8 @@ func main() {
 		for _, st := range reg.AllPools() {
 			p := st.Pool()
 			sp := st.(*v3.Pool) // TickSpacing 在 v3 状态上
-			if err := db.SavePool(ctx, p.ID, p.Exchange, p.Protocol, p.Token0, p.Token1, p.Fee, sp.TickSpacing); err != nil {
+			if err := db.SavePool(ctx, p.ID, p.Exchange, p.Protocol, p.Token0, p.Token1, p.Fee, sp.TickSpacing,
+				sp.CreatedBlock, sp.CreatedBlockHash.Hex()); err != nil {
 				slog.Warn("save pool", "err", err)
 			}
 		}
@@ -197,7 +198,8 @@ func main() {
 			reg.UpsertPool(v3.State(p))
 			graph.AddPool(p.Pool(), p.Address)
 			if db != nil {
-				_ = db.SavePool(ctx, p.Address.Hex(), p.Exchange, "v3", p.Token0, p.Token1, p.Fee, p.TickSpacing)
+				_ = db.SavePool(ctx, p.Address.Hex(), p.Exchange, "v3", p.Token0, p.Token1, p.Fee, p.TickSpacing,
+					p.CreatedBlock, p.CreatedBlockHash.Hex())
 			}
 			slog.Info("new pool", "addr", p.Address.Hex(), "t0", p.Token0.Hex(), "t1", p.Token1.Hex(), "fee", p.Fee)
 		}

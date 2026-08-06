@@ -57,7 +57,11 @@ func TestCommitBlockResultFreshDB(t *testing.T) {
 		DELETE FROM strategy_checkpoints;`); err != nil {
 		t.Fatalf("clean: %v", err)
 	}
-	err := db.CommitBlockResult(ctx, 100, "0xaaa", "0x999", nil,
+	err := db.CommitBlockIngest(ctx, 100, "0xaaa", "0x999", nil, []string{"0xaa01"})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	err = db.CommitEvaluation(ctx, 100, "0xaaa",
 		[]*arbitrage.Candidate{testCandidate("fresh-db-1", 100, "0xaaa")})
 	if err != nil {
 		t.Fatalf("commit: %v", err)
@@ -87,7 +91,8 @@ func TestMarkOrphansTwoLevelReorg(t *testing.T) {
 	if _, err := db.pool.Exec(ctx, `
 		DELETE FROM opportunities;
 		DELETE FROM processed_blocks;
-		DELETE FROM strategy_checkpoints;`); err != nil {
+		DELETE FROM strategy_checkpoints;
+		DELETE FROM dex_pools;`); err != nil {
 		t.Fatalf("clean: %v", err)
 	}
 	var prev string
@@ -99,10 +104,14 @@ func TestMarkOrphansTwoLevelReorg(t *testing.T) {
 		poolAddr := common.BigToHash(new(big.Int).SetUint64(1000 + i)).Hex()[24:]
 		pools := []Pool{{Address: "0x" + poolAddr, Exchange: "uniswap-v3",
 			Protocol: "v3", Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}}
-		if err := db.CommitBlockResult(ctx, i, h, parent, pools,
+		if err := db.CommitBlockIngest(ctx, i, h, parent, pools,
+			[]string{"0xaa01"}); err != nil {
+			t.Fatalf("ingest %d: %v", i, err)
+		}
+		if err := db.CommitEvaluation(ctx, i, h,
 			[]*arbitrage.Candidate{testCandidate(
-				"reorg-cand-"+h, i, h)}); err != nil {
-			t.Fatalf("commit %d: %v", i, err)
+				"reorg-cand-" + h, i, h)}); err != nil {
+			t.Fatalf("evaluate %d: %v", i, err)
 		}
 	}
 	if err := db.RollbackToAncestor(ctx, CheckpointBlocks, 3, "0x3", "0x2"); err != nil {
@@ -171,9 +180,12 @@ func TestCommitBlockResultRollsBackOnCandidateFailure(t *testing.T) {
 		DELETE FROM strategy_checkpoints;`); err != nil {
 		t.Fatalf("clean: %v", err)
 	}
-	if err := db.CommitBlockResult(ctx, 200, "0xbbb", "0x999", nil,
+	if err := db.CommitBlockIngest(ctx, 200, "0xbbb", "0x999", nil, nil); err != nil {
+		t.Fatalf("first ingest: %v", err)
+	}
+	if err := db.CommitEvaluation(ctx, 200, "0xbbb",
 		[]*arbitrage.Candidate{testCandidate("rollback-dupe", 200, "0xbbb")}); err != nil {
-		t.Fatalf("first commit: %v", err)
+		t.Fatalf("first evaluate: %v", err)
 	}
 	// 同 group 两个不同 id 的新行都 selected=true → 唯一索引必须拒绝整组（事务回滚）
 	dup := testCandidate("rollback-dup-id-2", 200, "0xbbb")
@@ -182,8 +194,7 @@ func TestCommitBlockResultRollsBackOnCandidateFailure(t *testing.T) {
 	good := testCandidate("rollback-dup-id-1", 200, "0xbbb")
 	good.OpportunityGroupID = "g1"
 	good.Selected = true
-	err := db.CommitBlockResult(ctx, 200, "0xbbb", "0x999", nil,
-		[]*arbitrage.Candidate{good, dup})
+	err := db.CommitEvaluation(ctx, 200, "0xbbb", []*arbitrage.Candidate{good, dup})
 	if err == nil {
 		t.Fatalf("duplicate selected in one group must fail the transaction")
 	}

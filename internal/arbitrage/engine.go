@@ -126,6 +126,9 @@ type PoolMeta struct {
 	Token1      common.Address
 	Fee         uint32
 	TickSpacing int
+	// 创建溯源：动态发现的池从 Factory PoolCreated 日志查询（非首次观察块）
+	CreatedBlock     uint64
+	CreatedBlockHash common.Hash
 }
 
 // finalizeCandidate 补全候选元数据（ID/BlockHash/GroupID/SourceEvent/StateBlock）。

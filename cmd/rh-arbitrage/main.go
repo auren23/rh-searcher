@@ -154,6 +154,8 @@ func main() {
 				Address: sp.ID, Exchange: sp.Exchange, Protocol: "v3",
 				Token0: sp.Token0.Hex(), Token1: sp.Token1.Hex(),
 				Fee: sp.Fee, TickSpacing: p3.TickSpacing,
+				// 创建溯源：bootstrap 的 DiscoverPools 直接从 PoolCreated 日志读取
+				CreatedBlock: p3.CreatedBlock, CreatedBlockHash: p3.CreatedBlockHash.Hex(),
 			})
 		}
 		if err := sink.CommitPools(ctx, allPools, lastPoolBlock); err != nil {
@@ -312,6 +314,14 @@ func main() {
 			}
 		}
 	}
+	// evaluate 游标：评估进度（≤ ingest 游标）。ingest 已提交但评估崩溃 →
+	// 重启从这里重新评估，候选不丢失。
+	lastEvaluated := lastApplied
+	if pgCkpt != nil {
+		if eh, _, err := pgCkpt.LoadWithHash(ctx, storage.CheckpointEvaluate); err == nil {
+			lastEvaluated = eh
+		}
+	}
 	if lastApplied > 0 && lastAppliedHash == (common.Hash{}) {
 		// JSON checkpoint 无 hash：重读当前链该高度（离线 reorg 无法识别，保守处理）
 		if hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(lastApplied)); err == nil {
@@ -379,6 +389,10 @@ func main() {
 						return nil, nil, nil, fmt.Errorf("block %d pool %s verify: %w", h.Number, l.Address.Hex(), derr)
 					}
 					if pool.TickSpacing > 0 {
+						// 创建溯源：动态发现的池无 PoolCreated 日志（地址在 data 不在
+						// topics，全量扫描成本高），用观察块兜底；bootstrap 池带真实
+						// 创建块（DiscoverPools 直接读 PoolCreated）。被误标的池会在
+						// 下次 bootstrap 全量扫描时恢复 canonical。
 						newPoolMetas = append(newPoolMetas, arbitrage.PoolMeta{
 							Address: pool.Address, Exchange: pool.Exchange,
 							Token0: pool.Token0, Token1: pool.Token1,
@@ -451,10 +465,10 @@ func main() {
 		}
 	}
 
-	// DB 提交 + 成功后应用内存 + 推进游标（processAndCommit 与补扫共用）
-	// 提交失败 → 回滚本区块临时注册的新池（幽灵池不能留下：重试同一区块时
-	// 会被误判为旧池而不再写入 dex_pools）
-	commitResult := func(h chain.BlockEvent, res *arbitrage.BlockResult, pending map[common.Address]*pendingPool) error {
+	// DB 提交（ingest：池 + 受影响池队列 + checkpoint + 历史）+ 成功后应用内存
+	// + 推进 ingest 游标。提交失败 → 回滚本区块临时注册的新池（幽灵池不能留下：
+	// 重试同一区块时会被误判为旧池而不再写入 dex_pools）
+	commitResult := func(h chain.BlockEvent, res *arbitrage.BlockResult, pending map[common.Address]*pendingPool, affected map[common.Address]struct{}) error {
 		if sink != nil {
 			newPools := make([]storage.Pool, 0, len(res.NewPools))
 			for _, np := range res.NewPools {
@@ -462,9 +476,14 @@ func main() {
 					Address: np.Address.Hex(), Exchange: np.Exchange, Protocol: "v3",
 					Token0: np.Token0.Hex(), Token1: np.Token1.Hex(),
 					Fee: np.Fee, TickSpacing: np.TickSpacing,
+					CreatedBlock: np.CreatedBlock, CreatedBlockHash: np.CreatedBlockHash.Hex(),
 				})
 			}
-			if err := sink.CommitBlockResult(ctx, h.Number, h.Hash.Hex(), h.Parent.Hex(), newPools, res.Candidates); err != nil {
+			affectedList := make([]string, 0, len(affected))
+			for p := range affected {
+				affectedList = append(affectedList, p.Hex())
+			}
+			if err := sink.CommitBlockIngest(ctx, h.Number, h.Hash.Hex(), h.Parent.Hex(), newPools, affectedList); err != nil {
 				rollbackTempPools(pending)
 				return fmt.Errorf("commit block %d: %w", h.Number, err)
 			}
@@ -542,6 +561,7 @@ func main() {
 		}
 		lastApplied = ancestor
 		lastAppliedHash = common.HexToHash(ancestorHash) // 重处理期间继续衔接校验
+		lastEvaluated = ancestor // evaluate 游标已随事务回退
 		return nil
 	}
 
@@ -553,67 +573,71 @@ func main() {
 	}()
 
 	// backfill：从 lastApplied+1 顺序补扫到 to（含）。逐块校验 parent 衔接
-	// （离线/漏 head 的 reorg 在第一块即被发现），逐块提交历史并应用内存状态，
-	// 但不评估——返回聚合的 affected pools，由调用方统一评估一次
-	// （避免对同一当前 RPC 状态重复评估，污染机会频率统计）。
-	backfill := func(to uint64) (map[common.Address]struct{}, error) {
-		affected := map[common.Address]struct{}{}
+	// （离线/漏 head 的 reorg 在第一块即被发现），逐块提交 ingest（历史 +
+	// 受影响池评估队列 + checkpoint）并应用内存状态，但不评估。
+	// 评估由 evaluatePending 从数据库队列聚合执行——ingest 提交后进程崩溃，
+	// 重启仍能重新评估（双游标，候选不丢失）。
+	backfill := func(to uint64) error {
 		for lastApplied < to {
 			bn := lastApplied + 1
 			hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
 			if err != nil {
-				return affected, fmt.Errorf("backfill header %d: %w", bn, err)
+				return fmt.Errorf("backfill header %d: %w", bn, err)
 			}
 			if lastAppliedHash != (common.Hash{}) && hdr.ParentHash != lastAppliedHash {
 				if err := handleReorg(); err != nil {
-					return affected, err
+					return err
 				}
 				continue // 回退后重新计算 bn
 			}
 			ev := chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash}
 			res, a, pending, err := processBlock(ev, false)
 			if err != nil {
-				return affected, fmt.Errorf("backfill block %d: %w", bn, err)
+				return fmt.Errorf("backfill block %d: %w", bn, err)
 			}
-			if err := commitResult(ev, res, pending); err != nil {
-				return affected, err
-			}
-			for p := range a {
-				affected[p] = struct{}{}
+			if err := commitResult(ev, res, pending, a); err != nil {
+				return err
 			}
 		}
-		return affected, nil
+		return nil
 	}
-	// 对聚合 affected pools 统一评估一次并落盘（候选观察区块 = 补扫终点）
-	evaluateBackfill := func(affected map[common.Address]struct{}) error {
-		if len(affected) == 0 || sink == nil {
+	// evaluatePending：从 evaluate 游标之后读取尚未评估的受影响池
+	// （跨区块聚合去重），对当前状态统一评估一次，与 evaluate checkpoint
+	// 同事务提交。失败 → 游标不前进，下次调用重试同一批（不丢机会）。
+	evaluatePending := func() error {
+		if sink == nil {
 			return nil
 		}
-		pools := make([]common.Address, 0, len(affected))
-		for p := range affected {
-			pools = append(pools, p)
+		evalBlock, evalHash, pools, err := sink.LoadPendingAffected(ctx, lastEvaluated)
+		if err != nil {
+			return fmt.Errorf("load pending affected: %w", err)
 		}
-		ev := chain.BlockEvent{Number: lastApplied, Hash: lastAppliedHash}
+		if len(pools) == 0 {
+			return nil
+		}
+		addrs := make([]common.Address, 0, len(pools))
+		for _, p := range pools {
+			addrs = append(addrs, common.HexToAddress(p))
+		}
 		processed := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
-			BlockNumber: ev.Number,
-			BlockHash:   ev.Hash,
+			BlockNumber: evalBlock,
+			BlockHash:   common.HexToHash(evalHash),
 			ReceivedAt:  time.Now().UnixMilli(),
-		}, pools)
-		if len(processed.Candidates) == 0 {
-			return nil
+		}, addrs)
+		if err := sink.CommitEvaluation(ctx, evalBlock, evalHash, processed.Candidates); err != nil {
+			return err
 		}
-		// 独立候选提交：不重写 checkpoint/processed_blocks（parent hash 已逐块保存）
-		return sink.CommitCandidatesForExistingBlock(ctx, ev.Number, ev.Hash.Hex(), processed.Candidates)
+		lastEvaluated = evalBlock
+		return nil
 	}
 
-	// 启动窗口补扫：失败即停止推进（不跳块）；结束后统一评估一次
-	backfillAffected, err := backfill(startHead)
-	if err != nil {
+	// 启动：先补 ingest 到链头，再评估未处理批次（崩溃恢复路径同此）
+	if err := backfill(startHead); err != nil {
 		slog.Error("startup backfill failed, cursor stays at", "block", lastApplied, "err", err)
 		os.Exit(1)
 	}
-	if err := evaluateBackfill(backfillAffected); err != nil {
-		slog.Error("backfill evaluation commit failed", "err", err)
+	if err := evaluatePending(); err != nil {
+		slog.Error("startup evaluation failed (cursor stays; retried next head)", "err", err)
 	}
 
 	for {
@@ -628,14 +652,13 @@ func main() {
 			if h.Number <= lastApplied {
 				continue // 已处理（含轮询源补块重复）
 			}
-			// 顺序补扫到新 head（含 reorg 检测），随后统一评估一次（同启动补扫语义）
-			affected, err := backfill(h.Number)
-			if err != nil {
+			// 顺序补扫到新 head（含 reorg 检测），随后评估未处理批次
+			if err := backfill(h.Number); err != nil {
 				slog.Error("backfill failed, cursor stays at", "block", lastApplied, "err", err)
 				os.Exit(1) // 失败关闭：任一区块失败即停止，不跳块
 			}
-			if err := evaluateBackfill(affected); err != nil {
-				slog.Error("evaluation commit failed", "err", err)
+			if err := evaluatePending(); err != nil {
+				slog.Error("evaluation commit failed (cursor stays; retried next head)", "err", err)
 			}
 		}
 	}

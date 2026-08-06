@@ -13,8 +13,9 @@ import (
 
 // Checkpoint 策略名（唯一事实源；启动读取与事务提交必须用同一组名字）。
 const (
-	CheckpointBlocks = "arbitrage:blocks"
-	CheckpointPools  = "arbitrage:pools"
+	CheckpointBlocks   = "arbitrage:blocks"
+	CheckpointPools    = "arbitrage:pools"
+	CheckpointEvaluate = "arbitrage:evaluate"
 )
 
 // StrategyArbitrage 是 opportunities.strategy 值（与 checkpoint 策略名不同命名空间）。

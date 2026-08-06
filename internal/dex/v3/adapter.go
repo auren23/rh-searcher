@@ -114,6 +114,8 @@ func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock u
 			Fee:           uint32(new(big.Int).SetBytes(l.Topics[3][29:]).Uint64()),
 			TickSpacing:   tickSpacing,
 			ObservedBlock: l.BlockNumber,
+			CreatedBlock:  l.BlockNumber,
+			CreatedBlockHash: l.BlockHash,
 			ticks:         make(map[int]*Tick),
 			bitmap:        make(map[int64]*big.Int),
 			bitmapLoaded:  make(map[int64]bool),
