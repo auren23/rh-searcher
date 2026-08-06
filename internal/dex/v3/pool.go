@@ -48,9 +48,16 @@ type Pool struct {
 
 // NewPoolFromMeta 从持久化元数据构造池（ticks/bitmap 惰性初始化）。
 func NewPoolFromMeta(address common.Address, exchange string, token0, token1 common.Address, fee uint32, tickSpacing int) *Pool {
+	return NewPoolFromMetaWithCreated(address, exchange, token0, token1, fee, tickSpacing, 0, common.Hash{})
+}
+
+// NewPoolFromMetaWithCreated 恢复池时携带真实创建溯源（历史资格过滤依赖）。
+func NewPoolFromMetaWithCreated(address common.Address, exchange string, token0, token1 common.Address,
+	fee uint32, tickSpacing int, createdBlock uint64, createdHash common.Hash) *Pool {
 	return &Pool{
 		Address: address, Exchange: exchange,
 		Token0: token0, Token1: token1, Fee: fee, TickSpacing: tickSpacing,
+		CreatedBlock: createdBlock, CreatedBlockHash: createdHash,
 		ticks:        make(map[int]*Tick),
 		bitmap:       make(map[int64]*big.Int),
 		bitmapLoaded: make(map[int64]bool),
@@ -124,14 +131,15 @@ func (p *Pool) compressedTick(tick int) int {
 
 // updateTick 更新 tick 的 gross/net 流动性；gross 跨零边界时翻转 initialized 位。
 // 与官方 Tick.update + TickBitmap.flipTick 语义一致。
-func (p *Pool) updateTick(tick int, delta *big.Int) {
+// updateTick 按 gross/net 分别更新（Mint/Burn 语义不同，见 ApplyMintBurn）。
+func (p *Pool) updateTick(tick int, grossDelta, netDelta *big.Int) {
 	t := p.ticks[tick]
 	if t == nil {
 		t = &Tick{LiquidityGross: new(big.Int), LiquidityNet: new(big.Int)}
 		p.ticks[tick] = t
 	}
 	grossBefore := new(big.Int).Set(t.LiquidityGross)
-	t.LiquidityGross.Add(t.LiquidityGross, delta)
+	t.LiquidityGross.Add(t.LiquidityGross, grossDelta)
 	if grossBefore.Sign() == 0 && t.LiquidityGross.Sign() != 0 {
 		// 0 → 非0：打开 initialized
 		p.setBit(tick, true)
@@ -139,7 +147,7 @@ func (p *Pool) updateTick(tick int, delta *big.Int) {
 		// 非0 → 0：关闭 initialized
 		p.setBit(tick, false)
 	}
-	t.LiquidityNet.Add(t.LiquidityNet, delta)
+	t.LiquidityNet.Add(t.LiquidityNet, netDelta)
 }
 
 // setBit 设置/清除 bit（不影响 bitmapLoaded：只对已加载 word 操作）。
@@ -226,18 +234,31 @@ func (p *Pool) ApplySwap(log types.Log, sqrtPriceX96, liquidity *big.Int, tick i
 }
 
 // ApplyMintBurn 应用 Mint/Burn：更新 tick gross/net；active liquidity 仅当前 tick 在区间内时变化。
+// ApplyMintBurn 应用 Mint/Burn 事件（Uniswap V3 语义）：
+//
+//	Mint:  lower gross +a, net +a；upper gross +a, net -a
+//	Burn:  lower gross -a, net -a；upper gross -a, net +a
+//
+// gross 永远非负增长（只按位置累积），net 才是方向性的。
 func (p *Pool) ApplyMintBurn(log types.Log, tickLower, tickUpper int, amount *big.Int, isMint bool) {
-	delta := new(big.Int).Set(amount)
-	if !isMint {
-		delta.Neg(delta)
+	a := new(big.Int).Set(amount)
+	if isMint {
+		p.updateTick(tickLower, a, a)
+		p.updateTick(tickUpper, a, new(big.Int).Neg(a))
+	} else {
+		neg := new(big.Int).Neg(a)
+		p.updateTick(tickLower, neg, neg)
+		p.updateTick(tickUpper, neg, a)
 	}
-	p.updateTick(tickLower, delta)
-	p.updateTick(tickUpper, new(big.Int).Neg(delta))
 	if p.Tick >= tickLower && p.Tick < tickUpper {
 		if p.Liquidity == nil {
 			p.Liquidity = new(big.Int)
 		}
-		p.Liquidity.Add(p.Liquidity, delta)
+		if isMint {
+			p.Liquidity.Add(p.Liquidity, a)
+		} else {
+			p.Liquidity.Sub(p.Liquidity, a)
+		}
 	}
 	p.ObservedBlock = log.BlockNumber
 }

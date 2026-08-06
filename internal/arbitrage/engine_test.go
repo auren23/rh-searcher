@@ -28,8 +28,8 @@ func (f *fakeSearcher) RefreshRoute(ctx context.Context, r Route, block uint64) 
 // 假 Evaluator：全部 simulation_accepted
 type fakeEvaluator struct{}
 
-func (f *fakeEvaluator) Evaluate(ctx context.Context, c *Candidate, cfg Config) (string, string, *big.Int) {
-	return SimulationAccepted, "", big.NewInt(100)
+func (f *fakeEvaluator) Evaluate(ctx context.Context, c *Candidate, cfg Config) (string, string, *big.Int, error) {
+	return SimulationAccepted, "", big.NewInt(100), nil
 }
 
 // 假 Executor：记录调用
@@ -72,7 +72,7 @@ func TestEngineTopKSingleSelected(t *testing.T) {
 		&fakeEvaluator{},
 		exec,
 	)
-	res := eng.ProcessBlock(context.Background(), SwapEvent{
+	res, _ := eng.ProcessBlock(context.Background(), SwapEvent{
 		Pool: common.Address{1}, BlockNumber: 100,
 		BlockHash: common.Hash{1}, TxHash: common.Hash{2}, LogIndex: 3,
 	}, []common.Address{{1}})
@@ -111,7 +111,7 @@ func TestProcessBlockDedupe(t *testing.T) {
 		&countingSearcher{}, &fakeEvaluator{}, &fakeExecutor{})
 	poolA := common.Address{0xaa}
 	poolB := common.Address{0xbb}
-	res := eng.ProcessBlock(context.Background(), SwapEvent{BlockNumber: 5},
+	res, _ := eng.ProcessBlock(context.Background(), SwapEvent{BlockNumber: 5},
 		[]common.Address{poolA, poolA, poolB})
 	_ = res
 	if cs := eng.searcher.(*countingSearcher).count; cs != 2 {
@@ -164,8 +164,8 @@ func TestEngineNoSelectedWhenAllRejected(t *testing.T) {
 
 type rejectEvaluator struct{}
 
-func (r *rejectEvaluator) Evaluate(ctx context.Context, c *Candidate, cfg Config) (string, string, *big.Int) {
-	return "simulation_rejected", "revert: test", big.NewInt(0)
+func (r *rejectEvaluator) Evaluate(ctx context.Context, c *Candidate, cfg Config) (string, string, *big.Int, error) {
+	return "simulation_rejected", "revert: test", big.NewInt(0), nil
 }
 
 // Engine 的 read/sim hash 校验必须真实执行（接口断言 + 转发）。
@@ -173,8 +173,8 @@ type verifyingEvaluator struct {
 	checked bool
 }
 
-func (v *verifyingEvaluator) Evaluate(ctx context.Context, c *Candidate, cfg Config) (string, string, *big.Int) {
-	return SimulationAccepted, "", big.NewInt(100)
+func (v *verifyingEvaluator) Evaluate(ctx context.Context, c *Candidate, cfg Config) (string, string, *big.Int, error) {
+	return SimulationAccepted, "", big.NewInt(100), nil
 }
 func (v *verifyingEvaluator) VerifyBlockHash(ctx context.Context, block uint64, want common.Hash) error {
 	v.checked = true

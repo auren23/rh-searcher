@@ -112,6 +112,17 @@ func (d *DB) checkSchema(ctx context.Context) error {
 	if !hasBap {
 		return fmt.Errorf("database schema out of date: migration 0008 not applied")
 	}
+	// 0009: provenance_source（溯源覆盖规则依赖）
+	var hasProv bool
+	if err := d.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_name='dex_pools' AND column_name='provenance_source')
+	`).Scan(&hasProv); err != nil {
+		return fmt.Errorf("schema check: %w", err)
+	}
+	if !hasProv {
+		return fmt.Errorf("database schema out of date: migration 0009 not applied")
+	}
 	return nil
 }
 
@@ -202,10 +213,14 @@ func (d *DB) CommitBlockIngest(ctx context.Context, block uint64, blockHash, par
 		if isUnknownHash(createdHash) {
 			createdHash = blockHash // 无真实 PoolCreated 日志时兜底（观察块）
 		}
+		createdBlock := sp.CreatedBlock
+		if createdBlock == 0 {
+			createdBlock = block // 观察块兜底（与 hash 一致，不产生矛盾数据）
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
-				canonical, created_block, created_block_hash)
-			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, $8, $9)
+				canonical, created_block, created_block_hash, provenance_source)
+			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, $8, $9, 'observed_swap_fallback')
 			ON CONFLICT (address) DO UPDATE SET
 				exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
 				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
@@ -216,7 +231,7 @@ func (d *DB) CommitBlockIngest(ctx context.Context, block uint64, blockHash, par
 				created_block_hash = CASE WHEN dex_pools.created_block_hash IS NULL
 					THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END`,
 			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing,
-			sp.CreatedBlock, nullableStr(createdHash)); err != nil {
+			createdBlock, nullableStr(createdHash)); err != nil {
 			return fmt.Errorf("pool %s: %w", sp.Address, err)
 		}
 	}
@@ -473,21 +488,27 @@ func (d *DB) CommitPools(ctx context.Context, pools []Pool, checkpointBlock uint
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
-				canonical, created_block, created_block_hash)
-			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, NULLIF($8, 0), NULLIF($9, ''))
+				canonical, created_block, created_block_hash, provenance_source)
+			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, NULLIF($8, 0), NULLIF($9, ''), 'pool_created_log')
 			ON CONFLICT (address) DO UPDATE SET
 				exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
 				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
 				fee = EXCLUDED.fee, tick_spacing = EXCLUDED.tick_spacing,
 				canonical = TRUE,
-				-- 真实 Bootstrap 信息覆盖未知/零占位（NULL 或 0 块或全零 hash）
-				created_block = CASE WHEN dex_pools.created_block IS NULL
-					OR dex_pools.created_block = 0
+				-- 覆盖规则：PoolCreated 日志（权威）覆盖非权威占位。
+				-- 占位包括 NULL/0/全零 hash（未知）与观察块兜底
+				created_block = CASE WHEN COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'
+					AND (dex_pools.created_block IS NULL OR dex_pools.created_block = 0
+						OR dex_pools.provenance_source = 'observed_swap_fallback')
 					THEN EXCLUDED.created_block ELSE dex_pools.created_block END,
-				created_block_hash = CASE WHEN dex_pools.created_block_hash IS NULL
-					OR dex_pools.created_block_hash = ''
-					OR dex_pools.created_block_hash = '0x0000000000000000000000000000000000000000000000000000000000000000'
-					THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END`,
+				created_block_hash = CASE WHEN COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'
+					AND (dex_pools.created_block_hash IS NULL
+						OR dex_pools.created_block_hash = ''
+						OR dex_pools.created_block_hash = '0x0000000000000000000000000000000000000000000000000000000000000000'
+						OR dex_pools.provenance_source = 'observed_swap_fallback')
+					THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END,
+				provenance_source = CASE WHEN COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'
+					THEN 'pool_created_log' ELSE dex_pools.provenance_source END`,
 			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing,
 			createdBlock, nullableStr(createdHash)); err != nil {
 			return fmt.Errorf("pool %s: %w", sp.Address, err)
@@ -524,17 +545,19 @@ func (d *DB) LatestBlock(ctx context.Context) (uint64, error) {
 func (d *DB) SavePool(ctx context.Context, address string, exchange, protocol string, token0, token1 common.Address, fee uint32, tickSpacing int, createdBlock uint64, createdHash string) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
-			canonical, created_block, created_block_hash)
-		VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, $8, $9)
+			canonical, created_block, created_block_hash, provenance_source)
+		VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, $8, $9, 'pool_created_log')
 		ON CONFLICT (address) DO UPDATE SET
 			exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
 			token0 = EXCLUDED.token0, token1 = EXCLUDED.token1, fee = EXCLUDED.fee,
 			tick_spacing = EXCLUDED.tick_spacing,
 			canonical = TRUE,
-			created_block = CASE WHEN dex_pools.created_block IS NULL
+			created_block = CASE WHEN COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'
 				THEN EXCLUDED.created_block ELSE dex_pools.created_block END,
-			created_block_hash = CASE WHEN dex_pools.created_block_hash IS NULL
-				THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END`,
+			created_block_hash = CASE WHEN COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'
+				THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END,
+			provenance_source = CASE WHEN COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'
+				THEN 'pool_created_log' ELSE dex_pools.provenance_source END`,
 		address, exchange, protocol, token0.Hex(), token1.Hex(), fee, tickSpacing,
 		createdBlock, nullableStr(createdHash))
 	return err
@@ -552,11 +575,14 @@ type Pool struct {
 	// 创建溯源（来自 Factory PoolCreated；空表示未知）
 	CreatedBlock     uint64
 	CreatedBlockHash string
+	// ProvenanceSource: "pool_created_log" | "observed_swap_fallback" | ""
+	ProvenanceSource string
 }
 
 // LoadPools 读取全部池元数据（启动恢复）。tick_spacing 缺失时（旧数据）返回 0，由调用方补查。
 func (d *DB) LoadPools(ctx context.Context) ([]Pool, error) {
-	rows, err := d.pool.Query(ctx, `SELECT address, exchange, protocol, token0, token1, fee, COALESCE(tick_spacing, 0)
+	rows, err := d.pool.Query(ctx, `SELECT address, exchange, protocol, token0, token1, fee,
+		COALESCE(tick_spacing, 0), COALESCE(created_block, 0), COALESCE(created_block_hash, ''), COALESCE(provenance_source, '')
 		FROM dex_pools WHERE canonical = TRUE`)
 	if err != nil {
 		return nil, err
@@ -565,7 +591,8 @@ func (d *DB) LoadPools(ctx context.Context) ([]Pool, error) {
 	out := []Pool{}
 	for rows.Next() {
 		var p Pool
-		if err := rows.Scan(&p.Address, &p.Exchange, &p.Protocol, &p.Token0, &p.Token1, &p.Fee, &p.TickSpacing); err != nil {
+		if err := rows.Scan(&p.Address, &p.Exchange, &p.Protocol, &p.Token0, &p.Token1, &p.Fee,
+			&p.TickSpacing, &p.CreatedBlock, &p.CreatedBlockHash, &p.ProvenanceSource); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

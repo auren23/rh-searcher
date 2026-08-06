@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -150,13 +151,15 @@ func (e *Engine) finalizeCandidate(c *Candidate, ev SwapEvent, r Route, stateBlo
 // 按池序列全局去重，每条 route 只评估一次（避免两池同区块 Swap 时重复模拟）。
 // ProcessBlock 按评估区块高度固定状态评估（stateBlock = ev.BlockNumber）。
 // 不再存在"跨区块聚合到 latest 状态"的路径：每个队列区块独立固定评估。
-func (e *Engine) ProcessBlock(ctx context.Context, ev SwapEvent, affectedPools []common.Address) *BlockResult {
+func (e *Engine) ProcessBlock(ctx context.Context, ev SwapEvent, affectedPools []common.Address) (*BlockResult, error) {
 	return e.ProcessBlockAt(ctx, ev, affectedPools, ev.BlockNumber)
 }
 
 // ProcessBlockAt 与 ProcessBlock 相同，但状态区块可显式指定
 // （恢复路径：评估终点可能低于事件区块）。
-func (e *Engine) ProcessBlockAt(ctx context.Context, ev SwapEvent, affectedPools []common.Address, stateBlock uint64) *BlockResult {
+// 返回 error = 可重试基础设施错误：调用方不得提交该区块的候选，
+// 评估游标必须保持（下轮重试整个区块）。
+func (e *Engine) ProcessBlockAt(ctx context.Context, ev SwapEvent, affectedPools []common.Address, stateBlock uint64) (*BlockResult, error) {
 	res := &BlockResult{Block: ev.BlockNumber, BlockHash: ev.BlockHash}
 	allRoutes := make([]Route, 0, len(affectedPools)*2)
 	seenRoutes := make(map[string]struct{})
@@ -171,9 +174,13 @@ func (e *Engine) ProcessBlockAt(ctx context.Context, ev SwapEvent, affectedPools
 		}
 	}
 	for _, r := range allRoutes {
-		res.Candidates = append(res.Candidates, e.evaluateRoute(ctx, ev, r, stateBlock)...)
+		cands, err := e.evaluateRoute(ctx, ev, r, stateBlock)
+		if err != nil {
+			return res, err
+		}
+		res.Candidates = append(res.Candidates, cands...)
 	}
-	return res
+	return res, nil
 }
 
 // OnSwap 收到 Swap 事件后调用：找循环 → 优化 → 评估 → 落盘（含拒绝）。
@@ -185,31 +192,33 @@ func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 }
 
 // evaluateRoute 单条路由的 Top-K 模拟与统一落盘。返回本路由产生的候选（不写数据库）。
-func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, stateBlock uint64) []*Candidate {
+func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, stateBlock uint64) ([]*Candidate, error) {
 	// 执行 Shadow 模式：固定状态区块（逐块评估 = 队列区块本身），
 	// 路由所有池的状态读取都在该高度
 	stateHead, stateHash, err := e.searcher.RefreshRoute(ctx, r, stateBlock)
 	if err != nil {
-		// 状态不可用：打指标并记录 group 级拒绝（不静默从漏斗消失）
+		if errors.Is(err, ErrInfra) {
+			// 基础设施错误（RPC 超时/限流/历史状态不可用）：
+			// 区块保持未评估，由上层重试——不能落成永久拒绝
+			return nil, err
+		}
+		// 确定性错误（池不存在等）：正常拒绝候选
 		routeRefreshFailures.Inc()
 		slog.Warn("route state refresh failed", "route", routeID(r), "err", err)
 		rej := emptyCandidate(r, ev.BlockNumber, ev.ReceivedAt, e.cfg.WETH)
 		rej.Decision = "local_rejected"
 		rej.RejectReason = "state-incomplete: " + err.Error()
 		e.finalizeCandidate(rej, ev, r, 0)
-		return []*Candidate{rej}
+		return []*Candidate{rej}, nil
 	}
-	// read RPC 与 sim RPC 的区块 hash 一致性校验（不一致 → 整组拒绝）
+	// read RPC 与 sim RPC 的区块 hash 一致性校验：
+	// 不一致 = sim 节点落后/分歧（基础设施），区块保持未评估等待追平
 	if v, ok := e.evaluator.(interface {
 		VerifyBlockHash(ctx context.Context, block uint64, want common.Hash) error
 	}); ok {
 		if err := v.VerifyBlockHash(ctx, stateHead, stateHash); err != nil {
 			slog.Warn("read/sim block hash mismatch", "route", routeID(r), "err", err)
-			c := emptyCandidate(r, ev.BlockNumber, ev.ReceivedAt, e.cfg.WETH)
-			c.Decision = "simulation_rejected"
-			c.RejectReason = "read_sim_block_hash_mismatch"
-			e.finalizeCandidate(c, ev, r, stateHead)
-			return []*Candidate{c}
+			return nil, fmt.Errorf("read/sim block hash mismatch at %d: %w", stateHead, err)
 		}
 	}
 	// Top-K 输入量逐个链上模拟，选模拟净利最高者；先全部模拟，再统一落盘
@@ -244,7 +253,10 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 		}
 		simCfg := e.cfg
 		simCfg.StateBlock = new(big.Int).SetUint64(stateHead)
-		verdict, reason, profit := e.evaluator.Evaluate(ctx, c, simCfg)
+		verdict, reason, profit, err := e.evaluator.Evaluate(ctx, c, simCfg)
+		if err != nil {
+			return nil, fmt.Errorf("evaluate route %s: %w", routeID(r), err)
+		}
 		c.Decision = verdict
 		c.RejectReason = reason
 		c.ExpectedNetProfit = profit
@@ -268,7 +280,7 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 		}
 	}
 	if best == nil {
-		return cands
+		return cands, nil
 	}
 	// 仅 Selected 候选可发送
 	if best.Decision == SimulationAccepted && e.cfg.Mode == "live" {
@@ -277,8 +289,12 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 	slog.Info("route evaluated", "block", ev.BlockNumber, "best", best.Decision,
 		"net_profit_wei", best.ExpectedNetProfit.String(), "amount_in", best.InputAmount.String(),
 		"route", routeID(r))
-	return cands
+	return cands, nil
 }
+
+// ErrInfra 标记可重试的基础设施错误（RPC 超时/限流/节点落后/历史状态不可用）。
+// 区别于确定性的合约/路由错误——前者必须保持区块未评估，后者落成拒绝候选。
+var ErrInfra = errors.New("infrastructure error")
 func routeID(r Route) string {
 	out := ""
 	for _, h := range r.Hops {
@@ -342,7 +358,9 @@ type Searcher interface {
 
 // Evaluator 评估：模拟验证 + 成本核算。
 type Evaluator interface {
-	Evaluate(ctx context.Context, c *Candidate, cfg Config) (decision, reason string, netProfit *big.Int)
+	// Evaluate 返回 err 表示基础设施错误（可重试）：调用方必须让整个区块
+	// 保持未评估（游标不前进），不能落成永久拒绝。
+	Evaluate(ctx context.Context, c *Candidate, cfg Config) (decision, reason string, netProfit *big.Int, err error)
 }
 
 // Executor 执行：构建、签名、广播、确认。

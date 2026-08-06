@@ -18,9 +18,10 @@ func RestorePools(ctx context.Context, db *DB, reg *dex.Registry, graph *dex.Gra
 		return 0, err
 	}
 	for _, sp := range saved {
-		p := v3.NewPoolFromMeta(
+		p := v3.NewPoolFromMetaWithCreated(
 			common.HexToAddress(sp.Address), sp.Exchange,
-			common.HexToAddress(sp.Token0), common.HexToAddress(sp.Token1), sp.Fee, sp.TickSpacing)
+			common.HexToAddress(sp.Token0), common.HexToAddress(sp.Token1), sp.Fee, sp.TickSpacing,
+			sp.CreatedBlock, common.HexToHash(sp.CreatedBlockHash))
 		reg.UpsertPool(v3.State(p))
 		graph.AddPool(p.Pool(), p.Address)
 	}

@@ -64,8 +64,43 @@ func (s *ExecutorSimulator) VerifyBlockHash(ctx context.Context, block uint64, w
 	return nil
 }
 
+// isInfraError 判断是否为可重试的基础设施错误（RPC 超时/限流/断连/节点落后），
+// 而非确定性的合约执行结果。基础设施错误必须让区块保持未评估（游标不前进），
+// 不能落成 simulation_rejected 永久拒绝。
+func isInfraError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"timeout", "deadline exceeded", "connection reset", "connection refused",
+		"eof", "429", "rate limit", "too many requests", "server error",
+		"service unavailable", "execution aborted", "no historical state",
+		"header not found", "not found", "archive",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// isRevertError 判断 eth_call 错误是否为确定性的合约 revert（可安全落盘拒绝）。
+func isRevertError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "execution reverted") ||
+		strings.Contains(msg, "revert") ||
+		strings.Contains(msg, "vm execution error") ||
+		strings.Contains(msg, "insufficient funds")
+}
+
 // Simulate 构建并模拟 executeV3Cycle 调用。
 // block 非 nil 时 eth_call 固定在该高度（与状态读取同一区块，区块原子性）。
+// 返回 error = 基础设施错误（可重试，调用方不得推进游标）；
+// RevertMsg 非空 = 真实 revert（确定性拒绝，可落盘）。
 func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate, chainID uint64, block *big.Int) (*SimResult, error) {
 	calldata, err := BuildExecuteV3CycleCalldata(c, chainID)
 	if err != nil {
@@ -79,7 +114,10 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	}
 	out, err := s.cli.CallContract(ctx, msg, block)
 	if err != nil {
-		return &SimResult{RevertMsg: err.Error(), CalldataHash: hashHex(calldata)}, nil
+		if isRevertError(err) {
+			return &SimResult{RevertMsg: err.Error(), CalldataHash: hashHex(calldata)}, nil
+		}
+		return nil, fmt.Errorf("sim eth_call: %w", err) // 基础设施 → 可重试
 	}
 	if len(out) < 32 {
 		return &SimResult{RevertMsg: fmt.Sprintf("short return %d bytes", len(out)), CalldataHash: hashHex(calldata)}, nil
@@ -89,10 +127,20 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	if err != nil {
 		gas = s.maxGas // 估算失败用上限（保守）
 	}
-	// 动态 gas 价格（eth_gasPrice；失败时保守默认）
-	gasPrice, err := s.cli.SuggestGasPrice(ctx)
-	if err != nil || gasPrice.Sign() <= 0 {
-		gasPrice = big.NewInt(1e8) // 0.1 gwei 兜底
+	// Gas 价格固定到历史块（Arbitrum L2 base fee，读 header.BaseFee at block）：
+	// 成本必须与池状态/eth_call 同一区块，不能用调用时的 latest 污染历史利润。
+	// 读取失败视为基础设施错误（可重试），不静默 fallback。
+	gasPrice := big.NewInt(1e8) // 0.1 gwei 保守默认
+	if block != nil {
+		hdr, herr := s.cli.HeaderByNumber(ctx, block)
+		if herr != nil {
+			return nil, fmt.Errorf("gas price header at %d: %w", block.Uint64(), herr)
+		}
+		if hdr.BaseFee != nil && hdr.BaseFee.Sign() > 0 {
+			gasPrice = hdr.BaseFee
+		}
+	} else if g, gerr := s.cli.SuggestGasPrice(ctx); gerr == nil && g.Sign() > 0 {
+		gasPrice = g
 	}
 	// Arbitrum L1 data 费用：NodeInterface 虚拟合约 (0x...C8) 的 gasEstimateL1Component(to, contractCreation, data)
 	// 返回 (gasEstimateForL1, baseFee, l1BaseFeeEstimate)；eth_gasEstimateL1Component RPC 方法不存在。
@@ -105,7 +153,7 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 		parsed, aerr := abi.JSON(strings.NewReader(intfABI))
 		if aerr == nil {
 			if callData, perr := parsed.Pack("gasEstimateL1Component", msg.To, false, msg.Data); perr == nil {
-				if res, cerr := s.cli.CallContract(ctx, ethereum.CallMsg{To: &nodeInterface, Data: callData}, nil); cerr == nil && len(res) >= 96 {
+				if res, cerr := s.cli.CallContract(ctx, ethereum.CallMsg{To: &nodeInterface, Data: callData}, block); cerr == nil && len(res) >= 96 {
 					l1GasUnits = new(big.Int).SetBytes(res[0:32]).Uint64()
 					l2BaseFee = new(big.Int).SetBytes(res[32:64])
 					l1BaseFeeEstimate = new(big.Int).SetBytes(res[64:96])

@@ -194,7 +194,8 @@ func (s *LocalSearcher) prepareRoute(ctx context.Context, r Route) error {
 func (s *LocalSearcher) RefreshRoute(ctx context.Context, r Route, block uint64) (uint64, common.Hash, error) {
 	header, err := s.v3.HeaderAt(ctx, new(big.Int).SetUint64(block))
 	if err != nil {
-		return 0, common.Hash{}, fmt.Errorf("header %d: %w", block, err)
+		// 历史 header 不可读 = 基础设施/archive 问题（可重试）
+		return 0, common.Hash{}, fmt.Errorf("%w: header %d: %v", ErrInfra, block, err)
 	}
 	for _, h := range r.Hops {
 		state := s.registry.Pool(h.Pool)
@@ -205,8 +206,17 @@ func (s *LocalSearcher) RefreshRoute(ctx context.Context, r Route, block uint64)
 		if !ok {
 			return 0, common.Hash{}, fmt.Errorf("pool %s unsupported", h.Pool.Hex())
 		}
-		if err := s.v3.RefreshPoolStateAt(ctx, p, new(big.Int).SetUint64(block)); err != nil {
-			return 0, common.Hash{}, fmt.Errorf("pool %s refresh: %w", h.Pool.Hex(), err)
+		// 历史资格：评估区块早于池创建（未来池）→ 确定拒绝该路由
+		if p.CreatedBlock > 0 && p.CreatedBlock > block {
+			return 0, common.Hash{}, fmt.Errorf("pool %s created at %d (after evaluation block %d)",
+				h.Pool.Hex(), p.CreatedBlock, block)
+		}
+		// 评估 overlay：在克隆上刷新，绝不修改实时 Registry 的内存状态
+		// （历史回放不能污染 ingest 游标之后的事件应用）
+		cp := p.Clone()
+		if err := s.v3.RefreshPoolStateAt(ctx, cp, new(big.Int).SetUint64(block)); err != nil {
+			return 0, common.Hash{}, fmt.Errorf("%w: pool %s refresh at %d: %v",
+				ErrInfra, h.Pool.Hex(), block, err)
 		}
 	}
 	return header.Number.Uint64(), header.Hash(), nil

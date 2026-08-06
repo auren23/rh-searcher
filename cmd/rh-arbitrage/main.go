@@ -220,14 +220,16 @@ func main() {
 	weth := common.HexToAddress(cfg.Chain.WETH)
 
 	searcher := arbitrage.NewLocalSearcher(graph, reg, adapter, weth)
-	// 资金限制：max_input_wei / min_input_wei 与执行合约当前 WETH 余额（预检已读取）
+	// 资金限制：max_input_wei / min_input_wei 与执行合约当前 WETH 余额（预检已读取）。
+	// 逐块评估时会用该区块的历史余额重新 SetFunding（见 evaluatePending）。
+	var maxInputWei *big.Int
 	if cfg.Arbitrage.MaxInputWei != "" {
 		if v, ok := new(big.Int).SetString(cfg.Arbitrage.MaxInputWei, 10); ok {
-			searcher.SetFunding(v, contractBal)
+			maxInputWei = v
 		}
-	} else {
-		searcher.SetFunding(nil, contractBal)
 	}
+	executorAddr := contractAddr
+	searcher.SetFunding(maxInputWei, contractBal)
 	if cfg.Arbitrage.MinInputWei != "" {
 		if v, ok := new(big.Int).SetString(cfg.Arbitrage.MinInputWei, 10); ok {
 			searcher.SetMinInput(v)
@@ -398,15 +400,22 @@ func main() {
 						return nil, nil, nil, fmt.Errorf("block %d pool %s verify: %w", h.Number, l.Address.Hex(), derr)
 					}
 					if pool.TickSpacing > 0 {
-						// 创建溯源：动态发现的池无 PoolCreated 日志（地址在 data 不在
-						// topics，全量扫描成本高），用观察块兜底；bootstrap 池带真实
-						// 创建块（DiscoverPools 直接读 PoolCreated）。被误标的池会在
-						// 下次 bootstrap 全量扫描时恢复 canonical。
-						newPoolMetas = append(newPoolMetas, arbitrage.PoolMeta{
+						meta := arbitrage.PoolMeta{
 							Address: pool.Address, Exchange: pool.Exchange,
 							Token0: pool.Token0, Token1: pool.Token1,
 							Fee: pool.Fee, TickSpacing: pool.TickSpacing,
-						})
+						}
+						// 创建溯源：按 PoolCreated(token0, token1, fee) 三个 indexed
+						// 参数精确查询（节点端 topics 过滤，无需全量扫描）。
+						// 失败降级观察块兜底（observed_swap_fallback），下次
+						// bootstrap 的 pool_created_log 会覆盖。
+						if cb, ch, cerr := adapter.PoolCreatedByTokens(ctx, pool.Token0, pool.Token1, pool.Fee); cerr == nil {
+							meta.CreatedBlock = cb
+							meta.CreatedBlockHash = ch
+							pool.CreatedBlock = cb
+							pool.CreatedBlockHash = ch
+						}
+						newPoolMetas = append(newPoolMetas, meta)
 					}
 					pp = &pendingPool{pool: pool, isNew: true}
 					// P1: 新池先临时进 Registry/Graph——Engine 评估（RefreshRoute 查
@@ -445,11 +454,14 @@ func main() {
 			pools = append(pools, p)
 		}
 		if evaluate && len(pools) > 0 {
-			processed := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
+			processed, err := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
 				BlockNumber: h.Number,
 				BlockHash:   h.Hash,
 				ReceivedAt:  time.Now().UnixMilli(),
 			}, pools)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("block %d evaluate: %w", h.Number, err)
+			}
 			res.Candidates = processed.Candidates
 		}
 		return res, affected, pending, nil
@@ -629,13 +641,24 @@ func main() {
 			for _, p := range pb.Pools {
 				addrs = append(addrs, common.HexToAddress(p))
 			}
-			processed := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
+			// 历史资金：执行合约在该区块的 WETH 余额（不是 latest）——
+			// 优化器上限必须与历史状态一致；读取失败 = 基础设施（可重试）
+			bal, err := wethBalanceAt(ctx, readCli, weth, executorAddr, pb.Block)
+			if err != nil {
+				return fmt.Errorf("balance at %d: %w", pb.Block, err)
+			}
+			searcher.SetFunding(maxInputWei, bal)
+			processed, err := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
 				BlockNumber: pb.Block,
 				BlockHash:   common.HexToHash(pb.Hash),
 				ReceivedAt:  time.Now().UnixMilli(),
 			}, addrs)
-			if err := sink.CommitEvaluation(ctx, pb.Block, pb.Hash, processed.Candidates); err != nil {
+			if err != nil {
+				// 基础设施错误：区块保持未评估，游标不前进（下轮重试整块）
 				return fmt.Errorf("evaluate block %d: %w", pb.Block, err)
+			}
+			if err := sink.CommitEvaluation(ctx, pb.Block, pb.Hash, processed.Candidates); err != nil {
+				return fmt.Errorf("evaluate block %d commit: %w", pb.Block, err)
 			}
 			lastEvaluated = pb.Block
 		}
@@ -734,6 +757,21 @@ func preflightExecutor(ctx context.Context, cli *ethclient.Client, contract comm
 }
 
 func wethAddr(cfg *config.Config) common.Address { return common.HexToAddress(cfg.Chain.WETH) }
+
+// wethBalanceAt 读取执行合约在指定历史区块的 WETH 余额（eth_call 固定高度）。
+// 历史资金限制：优化器上限必须与该区块一致（latest 余额会高估/低估历史机会）。
+func wethBalanceAt(ctx context.Context, cli *ethclient.Client, weth common.Address, executor common.Address, block uint64) (*big.Int, error) {
+	callData := crypto.Keccak256([]byte("balanceOf(address)"))[:4]
+	args := append(append([]byte{}, callData...), common.LeftPadBytes(executor.Bytes(), 32)...)
+	out, err := cli.CallContract(ctx, ethereum.CallMsg{To: &weth, Data: args}, new(big.Int).SetUint64(block))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) < 32 {
+		return nil, fmt.Errorf("short balance response %d", len(out))
+	}
+	return new(big.Int).SetBytes(out[0:32]), nil
+}
 
 // ancParent 返回祖先 header 的 parent hash（nil 时为空串；JSON fallback 模式无历史）。
 func ancParent(h *types.Header) string {

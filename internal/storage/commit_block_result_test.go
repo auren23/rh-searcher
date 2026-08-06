@@ -366,3 +366,53 @@ func TestCommitPoolsExactProvenance(t *testing.T) {
 		t.Fatalf("created after recommit = %d %v, want 42 0x2a", cb, ch)
 	}
 }
+
+// P0-4: 观察块兜底（observed_swap_fallback）必须被 bootstrap 的真实
+// pool_created_log 信息覆盖（覆盖规则按 provenance_source，不靠猜零值）。
+func TestCommitPoolsOverridesFallbackProvenance(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	if _, err := db.pool.Exec(ctx, `DELETE FROM dex_pools; DELETE FROM strategy_checkpoints;`); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	addr := "0x0000000000000000000000000000000000000cc1"
+	// 模拟动态发现：CommitBlockIngest 写观察块兜底（observed_swap_fallback）
+	if err := db.CommitBlockIngest(ctx, 110, "0x6e", "0x6d",
+		[]Pool{{Address: addr, Exchange: "uniswap-v3", Protocol: "v3",
+			Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}}, nil); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	var cb uint64
+	var ch, prov *string
+	q := func() {
+		if err := db.pool.QueryRow(ctx,
+			`SELECT created_block, created_block_hash, provenance_source FROM dex_pools WHERE address=$1`, addr).
+			Scan(&cb, &ch, &prov); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q()
+	if cb != 110 || ch == nil || prov == nil || *prov != "observed_swap_fallback" {
+		t.Fatalf("fallback = %d %v %v, want 110 observed_swap_fallback", cb, ch, prov)
+	}
+	// bootstrap 真实信息（pool_created_log）必须覆盖
+	if err := db.CommitPools(ctx, []Pool{{Address: addr, Exchange: "uniswap-v3", Protocol: "v3",
+		Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60,
+		CreatedBlock: 42, CreatedBlockHash: "0x2a"}}, 9999); err != nil {
+		t.Fatalf("commitpools: %v", err)
+	}
+	q()
+	if cb != 42 || ch == nil || *ch != "0x2a" || prov == nil || *prov != "pool_created_log" {
+		t.Fatalf("after bootstrap = %d %v %v, want 42 0x2a pool_created_log", cb, ch, prov)
+	}
+	// 已确认的 pool_created_log 不允许被新观察块覆盖（提交不同观察块）
+	if err := db.CommitBlockIngest(ctx, 200, "0xc8", "0xc7",
+		[]Pool{{Address: addr, Exchange: "uniswap-v3", Protocol: "v3",
+			Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}}, nil); err != nil {
+		t.Fatalf("ingest2: %v", err)
+	}
+	q()
+	if cb != 42 || ch == nil || *ch != "0x2a" {
+		t.Fatalf("provenance overwritten: %d %v", cb, ch)
+	}
+}

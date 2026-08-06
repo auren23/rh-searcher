@@ -2,6 +2,7 @@ package simulation
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math/big"
 
@@ -31,23 +32,24 @@ func (e *SimulationEvaluator) VerifyBlockHash(ctx context.Context, block uint64,
 	return e.sim.VerifyBlockHash(ctx, block, want)
 }
 
-func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candidate, cfg arbitrage.Config) (string, string, *big.Int) {
+func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candidate, cfg arbitrage.Config) (string, string, *big.Int, error) {
 	// 第一层：本地评估（毛利润 > 0 才值得上链模拟）
 	if c.GrossProfit == nil || c.GrossProfit.Sign() <= 0 {
-		return DecisionLocalCandidate, "non-positive gross profit", big.NewInt(0)
+		return DecisionLocalCandidate, "non-positive gross profit", big.NewInt(0), nil
 	}
 
 	// 第二层：真实链上模拟（固定到 cfg.StateBlock，与状态读取同一区块）
 	res, err := e.sim.Simulate(ctx, c, e.chainID, cfg.StateBlock)
 	if err != nil {
-		slog.Warn("simulate error", "err", err)
-		return DecisionSimulationRejected, "simulate error: " + err.Error(), big.NewInt(0)
+		// 基础设施错误（RPC 超时/限流/节点落后）：区块必须保持未评估，
+		// 由上层重试——不能落成 simulation_rejected 永久拒绝
+		return "", "", nil, fmt.Errorf("simulate: %w", err)
 	}
 	if res.RevertMsg != "" {
-		return DecisionSimulationRejected, "revert: " + truncate(res.RevertMsg, 120), big.NewInt(0)
+		return DecisionSimulationRejected, "revert: " + truncate(res.RevertMsg, 120), big.NewInt(0), nil
 	}
 	if res.Profit == nil {
-		return DecisionSimulationRejected, "no profit returned", big.NewInt(0)
+		return DecisionSimulationRejected, "no profit returned", big.NewInt(0), nil
 	}
 
 	// 完整记录：profit / gasUsed / gasPrice / gasCost / calldata hash（供复盘与误差分析）
@@ -82,9 +84,9 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 		"calldata_hash", res.CalldataHash)
 
 	if net.Cmp(cfg.MinProfitWei) < 0 {
-		return DecisionSimulationRejected, "below min profit after gas", net
+		return DecisionSimulationRejected, "below min profit after gas", net, nil
 	}
-	return DecisionSimulationOK, "", net
+	return DecisionSimulationOK, "", net, nil
 }
 
 func weiString(v *big.Int) string {

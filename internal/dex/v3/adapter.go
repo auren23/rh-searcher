@@ -510,6 +510,36 @@ func (a *Adapter) PoolByAddress(ctx context.Context, addr common.Address) (*Pool
 	return p, nil
 }
 
+// PoolCreatedByTokens 按 PoolCreated 的三个 indexed 参数（token0, token1, fee）
+// 精确查询池的真实创建区块——无需扫描全量日志（节点端 topics 过滤）。
+// 返回 (创建块, 创建块 hash, error)。
+func (a *Adapter) PoolCreatedByTokens(ctx context.Context, token0, token1 common.Address, fee uint32) (uint64, common.Hash, error) {
+	feeTopic := common.BytesToHash(common.LeftPadBytes(new(big.Int).SetUint64(uint64(fee)).Bytes(), 32))
+	q := ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(a.factoryBlock),
+		ToBlock:   nil, // latest
+		Addresses: []common.Address{a.factory},
+		Topics: [][]common.Hash{{
+			PoolCreatedTopic(),
+		}, {
+			common.BytesToHash(token0.Bytes()),
+		}, {
+			common.BytesToHash(token1.Bytes()),
+		}, {
+			feeTopic,
+		}},
+	}
+	logs, err := a.cli.FilterLogs(ctx, q)
+	if err != nil {
+		return 0, common.Hash{}, err
+	}
+	if len(logs) == 0 {
+		return 0, common.Hash{}, fmt.Errorf("no PoolCreated log for %s/%s/%d", token0.Hex(), token1.Hex(), fee)
+	}
+	l := logs[len(logs)-1]
+	return l.BlockNumber, l.BlockHash, nil
+}
+
 // BuildSwap 构建 swap calldata。按 router kind 分支：
 //   - swaprouter: SwapRouter.exactInputSingle
 //   - universal:  UniversalRouter.execute(commands, inputs) 的 V3_SWAP_EXACT_IN (0x08)
