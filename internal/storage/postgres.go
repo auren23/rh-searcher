@@ -66,6 +66,18 @@ func (d *DB) checkSchema(ctx context.Context) error {
 		return fmt.Errorf("database schema out of date: migration 0004 " +
 			"(uq_opportunities_group_selected) not applied")
 	}
+	// 0005 字段（block_hash / canonical）必须存在
+	var hasHash, hasCanonical bool
+	if err := d.pool.QueryRow(ctx, `
+		SELECT
+			EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='strategy_checkpoints' AND column_name='block_hash'),
+			EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='opportunities' AND column_name='canonical')
+	`).Scan(&hasHash, &hasCanonical); err != nil {
+		return fmt.Errorf("schema check: %w", err)
+	}
+	if !hasHash || !hasCanonical {
+		return fmt.Errorf("database schema out of date: migration 0005 not applied")
+	}
 	return nil
 }
 
@@ -149,7 +161,7 @@ func (d *DB) CommitBlockResult(ctx context.Context, block uint64, blockHash, par
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, parent_hash, updated_at)
-		VALUES ('arbitrage:blocks', $1, $2, $3, now())
+		VALUES ('` + CheckpointBlocks + `', $1, $2, $3, now())
 		ON CONFLICT (strategy) DO UPDATE SET
 			block_number = EXCLUDED.block_number,
 			block_hash = EXCLUDED.block_hash,
@@ -164,6 +176,36 @@ func (d *DB) CommitBlockResult(ctx context.Context, block uint64, blockHash, par
 // Exec 透出连接执行（reorg 标记等运维操作）。
 func (d *DB) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	return d.pool.Exec(ctx, sql, args...)
+}
+
+// CommitPools 在单个事务内保存全部池 + 更新 pools checkpoint。
+// 任一池失败整体回滚 → pools 游标不会越过未落库的池。
+func (d *DB) CommitPools(ctx context.Context, pools []Pool, checkpointBlock uint64) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for _, sp := range pools {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing)
+			VALUES ($1,$2,$3,$4,$5,$6,$7)
+			ON CONFLICT (address) DO UPDATE SET
+				exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
+				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
+				fee = EXCLUDED.fee, tick_spacing = EXCLUDED.tick_spacing`,
+			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing); err != nil {
+			return fmt.Errorf("pool %s: %w", sp.Address, err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO strategy_checkpoints (strategy, block_number, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (strategy) DO UPDATE SET block_number = EXCLUDED.block_number, updated_at = now()`,
+		CheckpointPools, checkpointBlock); err != nil {
+		return fmt.Errorf("pools checkpoint: %w", err)
+	}
+	return tx.Commit(ctx)
 }
 
 // SaveBlock 记录区块（用于断点恢复与审计）。

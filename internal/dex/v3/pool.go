@@ -61,8 +61,8 @@ func (p *Pool) Pool() dex.Pool {
 	}
 }
 
-// clone 深拷贝（事件应用前使用，避免并发读竞争）。
-func (p *Pool) clone() *Pool {
+// Clone 深拷贝（事件应用前使用；commit 成功前不污染 Registry 状态）。
+func (p *Pool) Clone() *Pool {
 	np := *p
 	np.Liquidity = new(big.Int).Set(p.Liquidity)
 	np.SqrtPriceX96 = new(big.Int).Set(p.SqrtPriceX96)

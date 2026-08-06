@@ -140,17 +140,22 @@ func main() {
 		slog.Error("bootstrap failed (pools may be missing)", "err", err)
 		os.Exit(1)
 	}
-	// 全部已知池统一持久化（bootstrap 只写内存，重启依赖 PG 恢复）+ 更新 pools checkpoint
+	// 全部已知池统一持久化（bootstrap 只写内存，重启依赖 PG 恢复）
+	// 池批量保存与 pools checkpoint 在同一事务：任一池失败，pools 游标不推进
 	if sink != nil {
+		allPools := make([]storage.Pool, 0, len(reg.AllPools()))
 		for _, st := range reg.AllPools() {
 			sp := st.Pool()
 			p3 := st.(*v3.Pool)
-			if err := sink.SavePool(ctx, sp.ID, sp.Exchange, "v3", sp.Token0, sp.Token1, sp.Fee, p3.TickSpacing); err != nil {
-				slog.Warn("save pool", "err", err)
-			}
+			allPools = append(allPools, storage.Pool{
+				Address: sp.ID, Exchange: sp.Exchange, Protocol: "v3",
+				Token0: sp.Token0.Hex(), Token1: sp.Token1.Hex(),
+				Fee: sp.Fee, TickSpacing: p3.TickSpacing,
+			})
 		}
-		if pgCkpt != nil {
-			_ = pgCkpt.Save(ctx, "arbitrage:pools", lastPoolBlock)
+		if err := sink.CommitPools(ctx, allPools, lastPoolBlock); err != nil {
+			slog.Error("pool persistence failed, pools cursor not advanced", "err", err)
+			os.Exit(1)
 		}
 	} else {
 		_ = ckpt.Save("pools", lastPoolBlock)
@@ -264,11 +269,14 @@ func main() {
 	// 游标：高度 + 区块 hash（reorg 检测：新 head 必须 parent 衔接）
 	var lastApplied uint64
 	var lastAppliedHash common.Hash
-	if h, ok := heights["blocks"]; ok {
-		lastApplied = h
-		if hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(h)); err == nil {
-			lastAppliedHash = hdr.Hash()
+	if pgCkpt != nil {
+		// 用 checkpoint 里存的 hash（上次真正处理过的区块），不重读当前链
+		if h, hh, err := pgCkpt.LoadWithHash(ctx, storage.CheckpointBlocks); err == nil {
+			lastApplied = h
+			lastAppliedHash = hh
 		}
+	} else if h, ok := heights[storage.CheckpointBlocks]; ok {
+		lastApplied = h
 	} else {
 		// 首次实时 Shadow：从当前链头开始，只处理启动后的新块。
 		lastApplied = startHead
@@ -281,18 +289,22 @@ func main() {
 		}
 	}
 
-	processBlock := func(h chain.BlockEvent) (*arbitrage.BlockResult, error) {
+	type appliedPool struct {
+		pool  *v3.Pool
+		isNew bool
+	}
+	processBlock := func(h chain.BlockEvent) (*arbitrage.BlockResult, map[common.Address]*appliedPool, error) {
 		logs, err := readCli.FilterLogs(ctx, ethereum.FilterQuery{
 			FromBlock: new(big.Int).SetUint64(h.Number),
 			ToBlock:   new(big.Int).SetUint64(h.Number),
 			Topics:    eventTopics,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("block %d getLogs: %w", h.Number, err)
+			return nil, nil, fmt.Errorf("block %d getLogs: %w", h.Number, err)
 		}
 		for _, l := range logs {
 			if l.BlockHash != h.Hash {
-				return nil, fmt.Errorf("block %d hash mismatch: log=%s header=%s", h.Number, l.BlockHash.Hex(), h.Hash.Hex())
+				return nil, nil, fmt.Errorf("block %d hash mismatch: log=%s header=%s", h.Number, l.BlockHash.Hex(), h.Hash.Hex())
 			}
 		}
 		res := &arbitrage.BlockResult{Block: h.Number, BlockHash: h.Hash}
@@ -302,29 +314,35 @@ func main() {
 			}
 			return logs[i].Index < logs[j].Index
 		})
+		// 内存原子性：所有日志应用到池的克隆上；数据库事务提交成功后才写回 Registry。
+		applied := map[common.Address]*appliedPool{}
+		newPoolMetas := []arbitrage.PoolMeta{}
 		affected := map[common.Address]struct{}{}
 		for _, l := range logs {
-			state := reg.Pool(l.Address)
-			if state == nil {
-				// 启动后新创建的池：动态验证并加入（随事务提交写库）
-				pool, derr := adapter.PoolByAddress(ctx, l.Address)
-				if derr != nil {
-					slog.Debug("unknown pool skipped", "addr", l.Address.Hex(), "err", derr)
-					continue
+			ap, ok := applied[l.Address]
+			if !ok {
+				state := reg.Pool(l.Address)
+				if state == nil {
+					// 启动后新创建的池：验证归属（暂不加入 Registry，commit 成功后再加入）
+					pool, derr := adapter.PoolByAddress(ctx, l.Address)
+					if derr != nil {
+						slog.Debug("unknown pool skipped", "addr", l.Address.Hex(), "err", derr)
+						continue
+					}
+					if pool.TickSpacing > 0 {
+						newPoolMetas = append(newPoolMetas, arbitrage.PoolMeta{
+							Address: pool.Address, Exchange: pool.Exchange,
+							Token0: pool.Token0, Token1: pool.Token1,
+							Fee: pool.Fee, TickSpacing: pool.TickSpacing,
+						})
+					}
+					ap = &appliedPool{pool: pool, isNew: true}
+				} else {
+					ap = &appliedPool{pool: state.(*v3.Pool).Clone()}
 				}
-				reg.UpsertPool(v3.State(pool))
-				graph.AddPool(pool.Pool(), pool.Address)
-				if pool.TickSpacing > 0 {
-					res.NewPools = append(res.NewPools, arbitrage.PoolMeta{
-						Address: pool.Address, Exchange: pool.Exchange,
-						Token0: pool.Token0, Token1: pool.Token1,
-						Fee: pool.Fee, TickSpacing: pool.TickSpacing,
-					})
-				}
-				state = reg.Pool(l.Address)
+				applied[l.Address] = ap
 			}
-			pool := state.(*v3.Pool)
-			apply, derr := adapter.DecodeLog(pool, l)
+			apply, derr := adapter.DecodeLog(ap.pool, l)
 			if derr != nil {
 				slog.Warn("decode log", "err", derr)
 				continue
@@ -334,15 +352,15 @@ func main() {
 			}
 			if l.Topics[0] == eventTopics[0][1] || l.Topics[0] == eventTopics[0][2] {
 				if tl, tu, terr := v3.DecodeTickBounds(l); terr == nil {
-					if err := adapter.ResyncMintBurn(ctx, pool, tl, tu); err != nil {
-						slog.Warn("resync mint/burn", "pool", pool.Address.Hex(), "err", err)
+					if err := adapter.ResyncMintBurn(ctx, ap.pool, tl, tu); err != nil {
+						slog.Warn("resync mint/burn", "pool", ap.pool.Address.Hex(), "err", err)
 					}
 				}
 			} else {
 				affected[l.Address] = struct{}{} // 仅 Swap 触发评估
 			}
-			reg.UpsertPool(state)
 		}
+		res.NewPools = newPoolMetas
 		pools := make([]common.Address, 0, len(affected))
 		for p := range affected {
 			pools = append(pools, p)
@@ -355,12 +373,12 @@ func main() {
 			}, pools)
 			res.Candidates = processed.Candidates
 		}
-		return res, nil
+		return res, applied, nil
 	}
 
 	// 单事务提交（pools + candidates + checkpoint 含 hash）；失败 → 游标不前进
 	processAndCommit := func(h chain.BlockEvent) error {
-		res, err := processBlock(h)
+		res, applied, err := processBlock(h)
 		if err != nil {
 			return err
 		}
@@ -377,8 +395,15 @@ func main() {
 				return fmt.Errorf("commit block %d: %w", h.Number, err)
 			}
 		} else {
-			if err := saveCheckpoint("blocks", h.Number); err != nil {
+			if err := saveCheckpoint(storage.CheckpointBlocks, h.Number); err != nil {
 				return err
+			}
+		}
+		// 事务成功：写回内存（幂等：新池注册、克隆状态替换）
+		for addr, ap := range applied {
+			reg.UpsertPool(v3.State(ap.pool))
+			if ap.isNew {
+				graph.AddPool(ap.pool.Pool(), addr)
 			}
 		}
 		lastApplied = h.Number
@@ -418,20 +443,38 @@ func main() {
 			if h.Number <= lastApplied {
 				continue // 已处理（含轮询源补块重复）
 			}
-			// reorg 检测：新 head 必须与游标 parent 衔接；断裂 → 标记孤块 + 回退游标重处理
+			// reorg 检测：新 head 必须与游标 parent 衔接；断裂 → 找共同祖先 → 标记孤块 → 回退重处理
 			if lastAppliedHash != (common.Hash{}) && h.Number == lastApplied+1 && h.Parent != lastAppliedHash {
 				rollback := lastApplied
-				slog.Warn("reorg detected", "rollback_from", lastApplied,
+				slog.Warn("reorg detected", "at", lastApplied,
 					"parent", h.Parent.Hex(), "expected", lastAppliedHash.Hex())
+				// 沿新链 parent 向后找共同祖先（最多 64 层）
+				ancestor := rollback
+				curHash := h.Parent
+				for depth := 0; depth < 64; depth++ {
+					if curHash == lastAppliedHash {
+						ancestor = rollback - uint64(depth)
+						break
+					}
+					hdr, err := readCli.HeaderByHash(ctx, curHash)
+					if err != nil || hdr == nil {
+						break
+					}
+					curHash = hdr.ParentHash
+				}
+				if ancestor < rollback {
+					slog.Warn("reorg common ancestor", "rollback_to", ancestor)
+				}
+				// 孤块候选标记 canonical=false（保留数据；新链重处理时恢复）
 				if sink != nil {
 					if _, uerr := sink.Exec(ctx, `
 						UPDATE opportunities SET canonical = FALSE
-						WHERE observed_block = $1 AND block_hash = $2`,
-						rollback, lastAppliedHash.Hex()); uerr != nil {
+						WHERE observed_block > $1`,
+						ancestor); uerr != nil {
 						slog.Error("reorg mark failed", "err", uerr)
 					}
 				}
-				lastApplied = rollback - 1 // 从该高度重新处理（新链）
+				lastApplied = ancestor // 从共同祖先重新处理（新链）
 			}
 			// 顺序处理 lastApplied+1 → h.Number；任一失败即停止推进（失败区块不被跳过）
 			for bn := lastApplied + 1; bn <= h.Number; bn++ {

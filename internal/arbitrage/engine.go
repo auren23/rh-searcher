@@ -128,6 +128,21 @@ type PoolMeta struct {
 	TickSpacing int
 }
 
+// finalizeCandidate 补全候选元数据（ID/BlockHash/GroupID/SourceEvent/StateBlock）。
+// 所有路径（含拒绝）都必须经过：空 ID 或零 hash 的候选会在落盘时被 ON CONFLICT 吞掉。
+func (e *Engine) finalizeCandidate(c *Candidate, ev SwapEvent, r Route, stateBlock uint64) {
+	c.BlockHash = ev.BlockHash
+	c.TxHash = ev.TxHash
+	c.LogIndex = ev.LogIndex
+	c.SourceEvent = "block_swap_batch"
+	c.StateBlock = stateBlock
+	c.OpportunityGroupID = fmt.Sprintf("%d/%s/%s", e.cfg.ChainID, ev.BlockHash.Hex(), routeID(r))
+	c.RouteJSON = MarshalRoute(c.Route)
+	if c.ID == "" {
+		c.ID = CandidateID(e.cfg.ChainID, ev.BlockHash, ev.TxHash, ev.LogIndex, c.RouteJSON, c.InputAmount)
+	}
+}
+
 // ProcessBlock 区块级评估：应用完整区块的日志后，收集所有受影响池的路由，
 // 按池序列全局去重，每条 route 只评估一次（避免两池同区块 Swap 时重复模拟）。
 func (e *Engine) ProcessBlock(ctx context.Context, ev SwapEvent, affectedPools []common.Address) *BlockResult {
@@ -166,21 +181,11 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route) []*Ca
 		// 状态不可用：打指标并记录 group 级拒绝（不静默从漏斗消失）
 		routeRefreshFailures.Inc()
 		slog.Warn("route state refresh failed", "route", routeID(r), "err", err)
-		return []*Candidate{{
-			ID:            CandidateID(e.cfg.ChainID, ev.BlockHash, ev.TxHash, ev.LogIndex, MarshalRoute(r.Hops), big.NewInt(0)),
-			ObservedBlock: ev.BlockNumber,
-			ObservedAt:    ev.ReceivedAt,
-			Route:         cloneHops(r.Hops),
-			RouteJSON:     MarshalRoute(r.Hops),
-			InputAmount:   new(big.Int),
-			GrossProfit:   new(big.Int),
-			GasEstimate:   new(big.Int),
-			SwapCost:      new(big.Int),
-			SlippageCost:  new(big.Int),
-			ExpectedNetProfit: new(big.Int),
-			Decision:      "local_rejected",
-			RejectReason:  "state-incomplete: " + err.Error(),
-		}}
+		rej := emptyCandidate(r, ev.BlockNumber, ev.ReceivedAt, e.cfg.WETH)
+		rej.Decision = "local_rejected"
+		rej.RejectReason = "state-incomplete: " + err.Error()
+		e.finalizeCandidate(rej, ev, r, 0)
+		return []*Candidate{rej}
 	}
 	// read RPC 与 sim RPC 的区块 hash 一致性校验（不一致 → 整组拒绝）
 	if v, ok := e.evaluator.(interface {
@@ -191,6 +196,7 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route) []*Ca
 			c := emptyCandidate(r, ev.BlockNumber, ev.ReceivedAt, e.cfg.WETH)
 			c.Decision = "simulation_rejected"
 			c.RejectReason = "read_sim_block_hash_mismatch"
+			e.finalizeCandidate(c, ev, r, stateHead)
 			return []*Candidate{c}
 		}
 	}
@@ -210,23 +216,14 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route) []*Ca
 		}
 		return gi.Cmp(gj) > 0
 	})
-	// GroupID：chainID + blockHash + route（重组后同高度新块不会与旧块同组）
-	groupID := fmt.Sprintf("%d/%s/%s", e.cfg.ChainID, ev.BlockHash.Hex(), routeID(r))
 	var best *Candidate
 	for rank, c := range cands {
 		if c == nil || c.InputAmount == nil {
 			slog.Error("searcher returned incomplete candidate", "route", routeID(r))
 			continue // 记录并跳过，绝不 panic
 		}
-		c.BlockHash = ev.BlockHash
-		c.TxHash = ev.TxHash
-		c.LogIndex = ev.LogIndex
-		c.SourceEvent = "block_swap_batch"
-		c.StateBlock = stateHead
-		c.RouteJSON = MarshalRoute(c.Route) // 用候选自己的路由（含每跳金额）
-		c.OpportunityGroupID = groupID
+		e.finalizeCandidate(c, ev, r, stateHead)
 		c.Rank = rank + 1 // 1 起（存储层 0 视为 NULL）
-		c.ID = CandidateID(e.cfg.ChainID, ev.BlockHash, ev.TxHash, ev.LogIndex, c.RouteJSON, c.InputAmount)
 		if c.RejectReason != "" {
 			// searcher 已判定（state-incomplete / route quote failed）：不再交给模拟器覆盖
 			c.Decision = "local_rejected"

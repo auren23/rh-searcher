@@ -7,6 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+)
+
+// Checkpoint 策略名（唯一事实源；启动读取与事务提交必须用同一组名字）。
+const (
+	CheckpointBlocks = "arbitrage:blocks"
+	CheckpointPools  = "arbitrage:pools"
 )
 
 // Checkpoint 断点：记录各索引器已处理到哪个区块，重启后恢复。
@@ -85,6 +93,23 @@ func (p *PGCheckpoint) Load(ctx context.Context) (map[string]uint64, error) {
 		out[s] = n
 	}
 	return out, rows.Err()
+}
+
+// LoadWithHash 读取指定策略的 checkpoint（含上次真正处理过的区块 hash）。
+// 重启恢复必须用它：离线期间的 reorg 只能靠"上次处理的 hash"识别。
+func (p *PGCheckpoint) LoadWithHash(ctx context.Context, strategy string) (uint64, common.Hash, error) {
+	var n uint64
+	var h *string
+	err := p.db.pool.QueryRow(ctx,
+		`SELECT block_number, block_hash FROM strategy_checkpoints WHERE strategy = $1`,
+		strategy).Scan(&n, &h)
+	if err != nil {
+		return 0, common.Hash{}, err
+	}
+	if h == nil || *h == "" {
+		return n, common.Hash{}, nil
+	}
+	return n, common.HexToHash(*h), nil
 }
 
 func (p *PGCheckpoint) Save(ctx context.Context, strategy string, block uint64) error {
