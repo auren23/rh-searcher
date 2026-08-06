@@ -130,6 +130,8 @@ type PoolMeta struct {
 	// 创建溯源：动态发现的池从 Factory PoolCreated 日志查询（非首次观察块）
 	CreatedBlock     uint64
 	CreatedBlockHash common.Hash
+	// ProvenanceSource: "pool_created_log" | "observed_swap_fallback" | ""
+	ProvenanceSource string
 }
 
 // finalizeCandidate 补全候选元数据（ID/BlockHash/GroupID/SourceEvent/StateBlock）。
@@ -194,17 +196,17 @@ func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 // evaluateRoute 单条路由的 Top-K 模拟与统一落盘。返回本路由产生的候选（不写数据库）。
 func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, stateBlock uint64) ([]*Candidate, error) {
 	// 执行 Shadow 模式：固定状态区块（逐块评估 = 队列区块本身），
-	// 路由所有池的状态读取都在该高度
-	stateHead, stateHash, err := e.searcher.RefreshRoute(ctx, r, stateBlock)
+	// 构建不可变快照（克隆池已刷新到该高度）供整个本地报价链使用
+	snapshot, err := e.searcher.SnapshotRoute(ctx, r, stateBlock)
 	if err != nil {
 		if errors.Is(err, ErrInfra) {
 			// 基础设施错误（RPC 超时/限流/历史状态不可用）：
 			// 区块保持未评估，由上层重试——不能落成永久拒绝
 			return nil, err
 		}
-		// 确定性错误（池不存在等）：正常拒绝候选
+		// 确定性错误（池不存在/未来池等）：正常拒绝候选
 		routeRefreshFailures.Inc()
-		slog.Warn("route state refresh failed", "route", routeID(r), "err", err)
+		slog.Warn("route snapshot failed", "route", routeID(r), "err", err)
 		rej := emptyCandidate(r, ev.BlockNumber, ev.ReceivedAt, e.cfg.WETH)
 		rej.Decision = "local_rejected"
 		rej.RejectReason = "state-incomplete: " + err.Error()
@@ -216,13 +218,14 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 	if v, ok := e.evaluator.(interface {
 		VerifyBlockHash(ctx context.Context, block uint64, want common.Hash) error
 	}); ok {
-		if err := v.VerifyBlockHash(ctx, stateHead, stateHash); err != nil {
+		if err := v.VerifyBlockHash(ctx, snapshot.Block, snapshot.BlockHash); err != nil {
 			slog.Warn("read/sim block hash mismatch", "route", routeID(r), "err", err)
-			return nil, fmt.Errorf("read/sim block hash mismatch at %d: %w", stateHead, err)
+			return nil, fmt.Errorf("read/sim block hash mismatch at %d: %w", snapshot.Block, err)
 		}
 	}
-	// Top-K 输入量逐个链上模拟，选模拟净利最高者；先全部模拟，再统一落盘
-	cands := e.searcher.TopKOptimize(ctx, r, e.cfg.TopK, ev.BlockNumber, ev.ReceivedAt)
+	// Top-K 输入量逐个链上模拟，选模拟净利最高者；先全部模拟，再统一落盘。
+	// 本地报价链显式使用 snapshot（历史状态），不触碰实时 Registry。
+	cands := e.searcher.TopKOptimizeAt(ctx, r, snapshot, e.cfg.TopK, ev.BlockNumber, ev.ReceivedAt)
 	// Rank 必须是真实利润排名：按本地毛利降序
 	sort.Slice(cands, func(i, j int) bool {
 		if cands[i] == nil || cands[j] == nil {
@@ -243,7 +246,7 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 			slog.Error("searcher returned incomplete candidate", "route", routeID(r))
 			continue // 记录并跳过，绝不 panic
 		}
-		e.finalizeCandidate(c, ev, r, stateHead)
+		e.finalizeCandidate(c, ev, r, snapshot.Block)
 		c.Rank = rank + 1 // 1 起（存储层 0 视为 NULL）
 		if c.RejectReason != "" {
 			// searcher 已判定（state-incomplete / route quote failed）：不再交给模拟器覆盖
@@ -252,7 +255,7 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 			continue
 		}
 		simCfg := e.cfg
-		simCfg.StateBlock = new(big.Int).SetUint64(stateHead)
+		simCfg.StateBlock = new(big.Int).SetUint64(snapshot.Block)
 		verdict, reason, profit, err := e.evaluator.Evaluate(ctx, c, simCfg)
 		if err != nil {
 			return nil, fmt.Errorf("evaluate route %s: %w", routeID(r), err)
@@ -344,16 +347,15 @@ type Route struct {
 	Hops []Hop
 }
 
-// Searcher 候选搜索：路径发现 + 输入量优化。
+// Searcher 候选搜索：路径发现 + 固定区块快照 + 快照内优化。
 type Searcher interface {
 	FindRoutes(ctx context.Context, pool common.Address, weth common.Address, maxHops int) []Route
-	Optimize(ctx context.Context, r Route, block uint64, ts int64) *Candidate
-	// TopKOptimize 返回本地毛利最高的 k 个输入量候选（供逐个链上模拟后选优）。
-	TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate
-	// RefreshRoute 执行 Shadow 模式：把路由所有池的状态固定读取到 block 高度。
-	// 返回 (stateBlock, stateHash, err)。逐块评估时 block 必须是该队列区块本身，
-	// 不能读取 latest——否则双游标恢复的只是"哪些池受影响"，不是"当时的机会"。
-	RefreshRoute(ctx context.Context, r Route, block uint64) (uint64, common.Hash, error)
+	// SnapshotRoute 把路由所有池的状态固定读取到 block 高度并克隆成不可变视图。
+	// 逐块评估时 block 必须是该队列区块本身，不能读取 latest。
+	SnapshotRoute(ctx context.Context, r Route, block uint64) (*RouteSnapshot, error)
+	// TopKOptimizeAt 在固定 snapshot 上返回本地毛利最高的 k 个输入量候选
+	// （供逐个链上模拟后选优）。报价链必须只用 snapshot，不得触碰实时 Registry。
+	TopKOptimizeAt(ctx context.Context, r Route, snapshot *RouteSnapshot, k int, block uint64, ts int64) []*Candidate
 }
 
 // Evaluator 评估：模拟验证 + 成本核算。

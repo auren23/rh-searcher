@@ -489,7 +489,7 @@ func (d *DB) CommitPools(ctx context.Context, pools []Pool, checkpointBlock uint
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
 				canonical, created_block, created_block_hash, provenance_source)
-			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, NULLIF($8, 0), NULLIF($9, ''), 'pool_created_log')
+			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, NULLIF($8, 0), NULLIF($9, ''), NULLIF($10, ''))
 			ON CONFLICT (address) DO UPDATE SET
 				exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
 				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
@@ -508,9 +508,10 @@ func (d *DB) CommitPools(ctx context.Context, pools []Pool, checkpointBlock uint
 						OR dex_pools.provenance_source = 'observed_swap_fallback')
 					THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END,
 				provenance_source = CASE WHEN COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'
+					AND COALESCE(EXCLUDED.provenance_source, '') = 'pool_created_log'
 					THEN 'pool_created_log' ELSE dex_pools.provenance_source END`,
 			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing,
-			createdBlock, nullableStr(createdHash)); err != nil {
+			createdBlock, nullableStr(createdHash), sp.ProvenanceSource); err != nil {
 			return fmt.Errorf("pool %s: %w", sp.Address, err)
 		}
 	}

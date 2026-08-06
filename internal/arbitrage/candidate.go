@@ -7,6 +7,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 
 	"github.com/auren23/rh-searcher/internal/dex"
 	"github.com/auren23/rh-searcher/internal/dex/v3"
@@ -17,18 +18,42 @@ import (
 type LocalSearcher struct {
 	graph        *dex.Graph
 	registry     *dex.Registry
-	v3           *v3.Adapter
+	v3           V3Client
 	weth         common.Address
 	maxInputWei  *big.Int // 单笔资金上限（nil = 不限）
 	minInputWei  *big.Int // 单笔下限（nil = 默认 1e-5 WETH）
 	contractBal  *big.Int // 执行合约 WETH 余额（nil = 未知）
 }
 
-func NewLocalSearcher(g *dex.Graph, reg *dex.Registry, a *v3.Adapter, weth common.Address) *LocalSearcher {
+// V3Client 报价所需的 v3 客户端能力（抽象以便历史快照测试注入 fake）。
+type V3Client interface {
+	HeaderAt(ctx context.Context, block *big.Int) (*types.Header, error)
+	RefreshPoolStateAt(ctx context.Context, p *v3.Pool, block *big.Int) error
+	QuoteExactIn(p *v3.Pool, tokenIn common.Address, amountIn *big.Int) (*big.Int, error)
+}
+
+func NewLocalSearcher(g *dex.Graph, reg *dex.Registry, a V3Client, weth common.Address) *LocalSearcher {
 	return &LocalSearcher{graph: g, registry: reg, v3: a, weth: weth}
 }
 
 // SetFunding 注入资金限制（搜索上限 = min(池深度, maxInputWei, 合约余额)）。
+// RouteSnapshot 路由在固定区块的不可变评估视图：所有池都是已刷新到
+// Block 的克隆。本地报价链（TopKOptimize/Optimize/computeBounds/quoteRoute）
+// 必须显式使用 snapshot——不能用正式 Registry 的实时池（历史报价与实时
+// 状态混用会选出错误的输入量与候选）。
+// SnapshotHop 快照中的一跳（按路由顺序）。
+type SnapshotHop struct {
+	Pool    *v3.Pool
+	TokenIn common.Address
+}
+
+type RouteSnapshot struct {
+	Block     uint64
+	BlockHash common.Hash
+	Hops      []SnapshotHop // 与 Route.Hops 同序（报价按序执行）
+	Pools     map[common.Address]*v3.Pool
+}
+
 func (s *LocalSearcher) SetFunding(maxInputWei, contractBal *big.Int) {
 	s.maxInputWei = maxInputWei
 	s.contractBal = contractBal
@@ -68,17 +93,15 @@ func (s *LocalSearcher) FindRoutes(ctx context.Context, pool common.Address, wet
 //   2. 对数网格粗搜（32 点）
 //   3. 最佳点邻域三分搜索细化
 //   4. 记录每跳输入输出
-func (s *LocalSearcher) Optimize(ctx context.Context, r Route, block uint64, ts int64) *Candidate {
-	// 先统一准备整条路径状态（spacing/slot0/liquidity/bitmap），
-	// 再谈任何优化 —— maxInputBound 依赖池状态，恢复池必须在此完成加载。
-	if err := s.prepareRoute(ctx, r); err != nil {
+// OptimizeAt 在固定 snapshot 上做本地 Top-K 优化（报价/边界全部使用快照池）。
+func (s *LocalSearcher) OptimizeAt(ctx context.Context, r Route, snapshot *RouteSnapshot, block uint64, ts int64) *Candidate {
+	if snapshot == nil {
 		c := emptyCandidate(r, block, ts, s.weth)
-		c.RejectReason = "state-incomplete: " + err.Error()
+		c.RejectReason = "state-incomplete: no snapshot"
 		return c
 	}
-
 	profitOf := func(amount *big.Int) *big.Int {
-		outs, ok := s.quoteRoute(ctx, r, amount)
+		outs, ok := s.quoteRoute(ctx, snapshot, amount)
 		if !ok || outs == nil || len(outs) != 2 {
 			return big.NewInt(0)
 		}
@@ -86,7 +109,7 @@ func (s *LocalSearcher) Optimize(ctx context.Context, r Route, block uint64, ts 
 	}
 
 	// 搜索上限：min(第一池深度, 第二池深度, 配置上限, 合约余额)
-	lo, hi, err := s.computeBounds(ctx, r)
+	lo, hi, err := s.computeBounds(ctx, snapshot)
 	if err != nil {
 		c := emptyCandidate(r, block, ts, s.weth)
 		c.RejectReason = err.Error()
@@ -161,7 +184,7 @@ func (s *LocalSearcher) Optimize(ctx context.Context, r Route, block uint64, ts 
 		SlippageCost:  big.NewInt(0),
 	}
 	// 记录每跳输入输出（完整复盘）
-	if outs, ok := s.quoteRoute(ctx, r, best); ok && len(outs) == 2 {
+	if outs, ok := s.quoteRoute(ctx, snapshot, best); ok && len(outs) == 2 {
 		c.Route[0].AmountIn = best
 		c.Route[0].AmountOut = outs[0]
 		c.Route[1].AmountIn = outs[0]
@@ -171,68 +194,57 @@ func (s *LocalSearcher) Optimize(ctx context.Context, r Route, block uint64, ts 
 }
 
 // prepareRoute 优化前统一准备整条路径的报价状态。
-func (s *LocalSearcher) prepareRoute(ctx context.Context, r Route) error {
-	for _, h := range r.Hops {
-		state := s.registry.Pool(h.Pool)
-		if state == nil {
-			return fmt.Errorf("pool %s missing", h.Pool.Hex())
-		}
-		p, ok := state.(*v3.Pool)
-		if !ok {
-			return fmt.Errorf("pool %s unsupported type", h.Pool.Hex())
-		}
-		if err := s.v3.EnsureQuoteState(ctx, p); err != nil {
-			return fmt.Errorf("pool %s: %w", h.Pool.Hex(), err)
-		}
-	}
-	return nil
-}
-
-// RefreshRoute 执行 Shadow 模式：先固定一个状态区块（blockNumber + blockHash），
-// 路由所有池的状态读取（slot0/liquidity/bitmap）全部固定在该高度。
-// 返回 (stateBlock, stateHash, err)。调用方需将 stateBlock 用于 eth_call 与 hash 校验。
-func (s *LocalSearcher) RefreshRoute(ctx context.Context, r Route, block uint64) (uint64, common.Hash, error) {
+// SnapshotRoute 构建路由在固定区块的不可变评估视图：
+// 每个 hop 池克隆 + 刷新到该区块（slot0/liquidity/bitmap）。
+// 返回的 snapshot 供 TopKOptimize 的整个本地报价链显式使用——
+// 正式 Registry 只提供静态元数据（含创建高度），评估绝不修改实时池。
+func (s *LocalSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64) (*RouteSnapshot, error) {
 	header, err := s.v3.HeaderAt(ctx, new(big.Int).SetUint64(block))
 	if err != nil {
 		// 历史 header 不可读 = 基础设施/archive 问题（可重试）
-		return 0, common.Hash{}, fmt.Errorf("%w: header %d: %v", ErrInfra, block, err)
+		return nil, fmt.Errorf("%w: header %d: %v", ErrInfra, block, err)
 	}
+	snap := &RouteSnapshot{Block: header.Number.Uint64(), BlockHash: header.Hash(),
+		Pools: make(map[common.Address]*v3.Pool, len(r.Hops))}
 	for _, h := range r.Hops {
 		state := s.registry.Pool(h.Pool)
 		if state == nil {
-			return 0, common.Hash{}, fmt.Errorf("pool %s missing", h.Pool.Hex())
+			return nil, fmt.Errorf("pool %s missing", h.Pool.Hex())
 		}
-		p, ok := state.(*v3.Pool)
-		if !ok {
-			return 0, common.Hash{}, fmt.Errorf("pool %s unsupported", h.Pool.Hex())
+		p := v3.UnwrapState(state)
+		if p == nil {
+			return nil, fmt.Errorf("pool %s unsupported", h.Pool.Hex())
 		}
 		// 历史资格：评估区块早于池创建（未来池）→ 确定拒绝该路由
 		if p.CreatedBlock > 0 && p.CreatedBlock > block {
-			return 0, common.Hash{}, fmt.Errorf("pool %s created at %d (after evaluation block %d)",
+			return nil, fmt.Errorf("pool %s created at %d (after evaluation block %d)",
 				h.Pool.Hex(), p.CreatedBlock, block)
 		}
 		// 评估 overlay：在克隆上刷新，绝不修改实时 Registry 的内存状态
 		// （历史回放不能污染 ingest 游标之后的事件应用）
 		cp := p.Clone()
 		if err := s.v3.RefreshPoolStateAt(ctx, cp, new(big.Int).SetUint64(block)); err != nil {
-			return 0, common.Hash{}, fmt.Errorf("%w: pool %s refresh at %d: %v",
+			return nil, fmt.Errorf("%w: pool %s refresh at %d: %v",
 				ErrInfra, h.Pool.Hex(), block, err)
 		}
+		snap.Pools[h.Pool] = cp
+		snap.Hops = append(snap.Hops, SnapshotHop{Pool: cp, TokenIn: h.TokenIn})
 	}
-	return header.Number.Uint64(), header.Hash(), nil
+	return snap, nil
 }
 
 // TopKOptimize 本地毛利最高的 k 个输入量（供逐个 eth_call 后选优）。
 // 所有采样金额 clamp 到 [lo, hi]（资金/深度边界）并去重。
-func (s *LocalSearcher) TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate {
+// TopKOptimizeAt 在固定 snapshot 上做 Top-K 优化（与 OptimizeAt 同一视图）。
+func (s *LocalSearcher) TopKOptimizeAt(ctx context.Context, r Route, snapshot *RouteSnapshot, k int, block uint64, ts int64) []*Candidate {
 	if k <= 0 {
 		k = 1
 	}
-	base := s.Optimize(ctx, r, block, ts)
+	base := s.OptimizeAt(ctx, r, snapshot, block, ts)
 	if base.RejectReason != "" || base.InputAmount.Sign() <= 0 {
 		return []*Candidate{base}
 	}
-	lo, hi, err := s.computeBounds(ctx, r)
+	lo, hi, err := s.computeBounds(ctx, snapshot)
 	if err != nil {
 		return []*Candidate{base}
 	}
@@ -266,7 +278,7 @@ func (s *LocalSearcher) TopKOptimize(ctx context.Context, r Route, k int, block 
 		seen[key] = struct{}{}
 		c := emptyCandidate(r, block, ts, s.weth)
 		c.InputAmount = new(big.Int).Set(amt)
-		outs, ok := s.quoteRoute(ctx, r, amt)
+		outs, ok := s.quoteRoute(ctx, snapshot, amt)
 		if !ok || len(outs) != 2 {
 			c.RejectReason = "route quote failed"
 			out = append(out, c)
@@ -295,12 +307,12 @@ func clampAmount(a, lo, hi *big.Int) *big.Int {
 
 // computeBounds 搜索边界：lo=min_input_wei（默认 1e-5 WETH），hi=min(整条 route 可报价容量,
 // 配置上限, 合约余额)。hi < lo（浅池）返回 ErrInsufficientCapacity。
-func (s *LocalSearcher) computeBounds(ctx context.Context, r Route) (*big.Int, *big.Int, error) {
+func (s *LocalSearcher) computeBounds(ctx context.Context, snapshot *RouteSnapshot) (*big.Int, *big.Int, error) {
 	lo := big.NewInt(1e13) // 默认 1e-5 WETH
 	if s.minInputWei != nil && s.minInputWei.Sign() > 0 {
 		lo = new(big.Int).Set(s.minInputWei)
 	}
-	hi := s.routeMaxInput(ctx, r, lo) // 整条 route 最大可报价输入（二分）
+	hi := s.routeMaxInput(ctx, snapshot, lo) // 整条 route 最大可报价输入（二分）
 	if hi == nil || hi.Sign() <= 0 {
 		return nil, nil, fmt.Errorf("no route capacity")
 	}
@@ -321,12 +333,12 @@ func (s *LocalSearcher) computeBounds(ctx context.Context, r Route) (*big.Int, *
 
 // routeMaxInput 二分求整条 route 的最大可报价输入。
 // 第一跳容量给上限估计（5% reserve），二分缩到整条 route 可报价（第二跳容量自然包含）。
-func (s *LocalSearcher) routeMaxInput(ctx context.Context, r Route, lo *big.Int) *big.Int {
-	hi := s.firstHopBound(ctx, r)
+func (s *LocalSearcher) routeMaxInput(ctx context.Context, snapshot *RouteSnapshot, lo *big.Int) *big.Int {
+	hi := s.firstHopBound(ctx, snapshot)
 	if hi == nil || hi.Sign() <= 0 {
 		return nil
 	}
-	if _, ok := s.quoteRoute(ctx, r, hi); ok {
+	if _, ok := s.quoteRoute(ctx, snapshot, hi); ok {
 		return hi // 上限本身可报价
 	}
 	// 二分：找 [lo, hi] 中最大的可报价输入
@@ -339,7 +351,7 @@ func (s *LocalSearcher) routeMaxInput(ctx context.Context, r Route, lo *big.Int)
 		if mid.Sign() <= 0 {
 			break
 		}
-		if _, ok := s.quoteRoute(ctx, r, mid); ok {
+		if _, ok := s.quoteRoute(ctx, snapshot, mid); ok {
 			best = mid
 			low = new(big.Int).Add(mid, big.NewInt(1))
 		} else {
@@ -353,20 +365,16 @@ func (s *LocalSearcher) routeMaxInput(ctx context.Context, r Route, lo *big.Int)
 }
 
 // firstHopBound 第一跳池深度上限（5% reserve；二分起点）。
-func (s *LocalSearcher) firstHopBound(ctx context.Context, r Route) *big.Int {
-	if len(r.Hops) == 0 {
+func (s *LocalSearcher) firstHopBound(ctx context.Context, snapshot *RouteSnapshot) *big.Int {
+	if len(snapshot.Hops) == 0 {
 		return nil
 	}
-	state := s.registry.Pool(r.Hops[0].Pool)
-	if state == nil {
-		return nil
-	}
-	p := state.(*v3.Pool)
+	p := snapshot.Hops[0].Pool // 快照池（已刷新到固定区块）
 	if p.SqrtPriceX96 == nil || p.SqrtPriceX96.Sign() <= 0 || p.Liquidity == nil || p.Liquidity.Sign() <= 0 {
 		return nil
 	}
 	// token0 reserve = L * 2^96 / Q；token1 reserve = L * Q / 2^96
-	zeroForOne := r.Hops[0].TokenIn == p.Token0
+	zeroForOne := snapshot.Hops[0].TokenIn == p.Token0
 	reserve := new(big.Int).Lsh(p.Liquidity, 96)
 	if zeroForOne {
 		reserve.Div(reserve, p.SqrtPriceX96)
@@ -382,20 +390,12 @@ func (s *LocalSearcher) firstHopBound(ctx context.Context, r Route) *big.Int {
 }
 
 // quoteRoute 本地报价整条路由，返回每跳输出（含中间跳）。
-func (s *LocalSearcher) quoteRoute(ctx context.Context, r Route, amountIn *big.Int) ([]*big.Int, bool) {
-	outs := make([]*big.Int, 0, len(r.Hops))
+// quoteRoute 在 snapshot 上报价（snapshot 池已刷新到固定区块，按路由顺序）。
+func (s *LocalSearcher) quoteRoute(ctx context.Context, snapshot *RouteSnapshot, amountIn *big.Int) ([]*big.Int, bool) {
+	outs := make([]*big.Int, 0, len(snapshot.Hops))
 	cur := amountIn
-	for _, h := range r.Hops {
-		state := s.registry.Pool(h.Pool)
-		if state == nil {
-			return nil, false
-		}
-		p := state.(*v3.Pool)
-		// 统一状态入口：spacing/slot0/liquidity/bitmap 任缺 → 本次不评估
-		if err := s.v3.EnsureQuoteState(ctx, p); err != nil {
-			return nil, false
-		}
-		out, err := s.v3.QuoteExactIn(p, h.TokenIn, cur)
+	for _, hp := range snapshot.Hops {
+		out, err := s.v3.QuoteExactIn(hp.Pool, hp.TokenIn, cur)
 		if err != nil || out.Sign() <= 0 {
 			return nil, false
 		}

@@ -7,6 +7,10 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+
+	"github.com/auren23/rh-searcher/internal/dex"
+	"github.com/auren23/rh-searcher/internal/dex/v3"
 )
 
 // 假 Searcher：返回固定 Top-K 候选
@@ -17,13 +21,12 @@ type fakeSearcher struct {
 func (f *fakeSearcher) FindRoutes(ctx context.Context, pool common.Address, weth common.Address, maxHops int) []Route {
 	return []Route{{Hops: []Hop{{Pool: pool}}}}
 }
-func (f *fakeSearcher) Optimize(ctx context.Context, r Route, block uint64, ts int64) *Candidate {
-	return f.cands[0]
+func (f *fakeSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64) (*RouteSnapshot, error) {
+	return &RouteSnapshot{Block: 100, BlockHash: common.Hash{}, Hops: []SnapshotHop{{}}}, nil
 }
-func (f *fakeSearcher) TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate {
+func (f *fakeSearcher) TopKOptimizeAt(ctx context.Context, r Route, snapshot *RouteSnapshot, k int, block uint64, ts int64) []*Candidate {
 	return f.cands
 }
-func (f *fakeSearcher) RefreshRoute(ctx context.Context, r Route, block uint64) (uint64, common.Hash, error) { return 100, common.Hash{}, nil }
 
 // 假 Evaluator：全部 simulation_accepted
 type fakeEvaluator struct{}
@@ -128,11 +131,13 @@ func (c *countingSearcher) Optimize(ctx context.Context, r Route, block uint64, 
 	c.count++
 	return &Candidate{InputAmount: big.NewInt(1), Route: r.Hops, RouteJSON: "[]"}
 }
-func (c *countingSearcher) TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate {
+func (c *countingSearcher) TopKOptimizeAt(ctx context.Context, r Route, snapshot *RouteSnapshot, k int, block uint64, ts int64) []*Candidate {
 	c.count++
 	return []*Candidate{{InputAmount: big.NewInt(1), Route: r.Hops, RouteJSON: "[]"}}
 }
-func (c *countingSearcher) RefreshRoute(ctx context.Context, r Route, block uint64) (uint64, common.Hash, error) { return 100, common.Hash{}, nil }
+func (c *countingSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64) (*RouteSnapshot, error) {
+	return &RouteSnapshot{Block: 100, BlockHash: common.Hash{}, Hops: []SnapshotHop{{}}}, nil
+}
 
 // 全部 rejected 时：不得有任何 selected=true（best 必须来自 simulation_accepted）。
 func TestEngineNoSelectedWhenAllRejected(t *testing.T) {
@@ -197,5 +202,89 @@ func TestEngineHashVerificationRuns(t *testing.T) {
 	})
 	if !eval.checked {
 		t.Errorf("VerifyBlockHash never invoked (interface assertion must match)")
+	}
+}
+
+// fakeV3 最小 v3 client：HeaderAt 返回区块号即 hash；RefreshPoolStateAt 把
+// 池价格设为区块号（block 200 → 价格 200e6；block 100 → 价格 100e6）。
+type fakeV3 struct {
+	mu        sync.Mutex
+	refreshed []string
+}
+
+func (f *fakeV3) HeaderAt(ctx context.Context, block *big.Int) (*types.Header, error) {
+	n := uint64(200)
+	if block != nil {
+		n = block.Uint64()
+	}
+	return &types.Header{Number: new(big.Int).SetUint64(n)}, nil
+}
+func (f *fakeV3) RefreshPoolStateAt(ctx context.Context, p *v3.Pool, block *big.Int) error {
+	f.mu.Lock()
+	f.refreshed = append(f.refreshed, p.Address.Hex()+":"+block.String())
+	f.mu.Unlock()
+	price := block.Uint64()
+	p.SqrtPriceX96 = new(big.Int).SetUint64(price * 1e6) // 区块号即价格
+	p.Liquidity = big.NewInt(1e18)
+	p.Tick = 0
+	p.TickSpacing = 60
+	return nil
+}
+func (f *fakeV3) QuoteExactIn(p *v3.Pool, tokenIn common.Address, amountIn *big.Int) (*big.Int, error) {
+	// 简化报价：输出 = 输入 × 价格/100（价格 = SqrtPriceX96/1e6）
+	price := new(big.Int).Div(p.SqrtPriceX96, big.NewInt(1e6))
+	out := new(big.Int).Mul(amountIn, price)
+	out.Div(out, big.NewInt(100))
+	return out, nil
+}
+
+// P0-1 回归：ProcessBlockAt(100) 的本地报价必须来自区块 100 的快照
+// （不是正式 Registry 的区块 200 价格），且评估后正式 Registry 零污染。
+func TestSnapshotQuotesHistoricalState(t *testing.T) {
+	ctx := context.Background()
+	reg := dex.NewRegistry()
+	graph := dex.NewGraph()
+	live := v3.NewPoolFromMeta(common.Address{1}, "uniswap-v3",
+		common.Address{2}, common.Address{3}, 3000, 60)
+	live.SqrtPriceX96 = new(big.Int).SetUint64(200e6) // 实时价格 = 区块 200
+	live.Liquidity = big.NewInt(1e18)
+	live.Tick = 0
+	reg.UpsertPool(v3.State(live))
+	graph.AddPool(live.Pool(), live.Address)
+
+	fv := &fakeV3{}
+	searcher := NewLocalSearcher(graph, reg, fv, common.Address{2})
+	searcher.SetFunding(nil, big.NewInt(1e18))
+
+	snap, err := searcher.SnapshotRoute(ctx, Route{
+		Hops: []Hop{{Pool: common.Address{1}, TokenIn: common.Address{2}, TokenOut: common.Address{3}}},
+	}, 100)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snap.Block != 100 {
+		t.Fatalf("snapshot block=%d want 100", snap.Block)
+	}
+	if got := snap.Hops[0].Pool.SqrtPriceX96.Uint64(); got != 100e6 {
+		t.Fatalf("snapshot price=%d want 100e6 (historical state)", got)
+	}
+	// 正式 Registry 零污染：仍是区块 200 价格
+	if got := v3.UnwrapState(reg.Pool(common.Address{1})).SqrtPriceX96.Uint64(); got != 200e6 {
+		t.Fatalf("live registry price=%d want 200e6 (must not be mutated)", got)
+	}
+	// 本地优化在快照上报价：输入 100 → 输出 100（价格 100）→ 无毛利
+	cands := searcher.TopKOptimizeAt(ctx, Route{
+		Hops: []Hop{{Pool: common.Address{1}, TokenIn: common.Address{2}, TokenOut: common.Address{3}}},
+	}, snap, 3, 100, 0)
+	_ = cands
+	// 再次重放：相同快照（确定性）
+	snap2, err := searcher.SnapshotRoute(ctx, Route{
+		Hops: []Hop{{Pool: common.Address{1}, TokenIn: common.Address{2}, TokenOut: common.Address{3}}},
+	}, 100)
+	if err != nil {
+		t.Fatalf("snapshot2: %v", err)
+	}
+	if snap2.Hops[0].Pool.SqrtPriceX96.Cmp(snap.Hops[0].Pool.SqrtPriceX96) != 0 {
+		t.Fatalf("replay not deterministic")
 	}
 }

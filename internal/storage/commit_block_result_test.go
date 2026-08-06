@@ -26,6 +26,13 @@ func testDB(t *testing.T) *DB {
 	return db
 }
 
+func deref(s *string) string {
+	if s == nil {
+		return "<nil>"
+	}
+	return *s
+}
+
 func testCandidate(id string, block uint64, hash string) *arbitrage.Candidate {
 	return &arbitrage.Candidate{
 		ID:            id,
@@ -339,7 +346,8 @@ func TestCommitPoolsExactProvenance(t *testing.T) {
 	}
 	p := Pool{Address: "0x0000000000000000000000000000000000000bb1",
 		Exchange: "uniswap-v3", Protocol: "v3", Token0: "0xaaa", Token1: "0xbbb",
-		Fee: 3000, TickSpacing: 60, CreatedBlock: 42, CreatedBlockHash: "0x2a"}
+		Fee: 3000, TickSpacing: 60, CreatedBlock: 42, CreatedBlockHash: "0x2a",
+		ProvenanceSource: "pool_created_log"}
 	if err := db.CommitPools(ctx, []Pool{p}, 9999); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
@@ -398,12 +406,12 @@ func TestCommitPoolsOverridesFallbackProvenance(t *testing.T) {
 	// bootstrap 真实信息（pool_created_log）必须覆盖
 	if err := db.CommitPools(ctx, []Pool{{Address: addr, Exchange: "uniswap-v3", Protocol: "v3",
 		Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60,
-		CreatedBlock: 42, CreatedBlockHash: "0x2a"}}, 9999); err != nil {
+		CreatedBlock: 42, CreatedBlockHash: "0x2a", ProvenanceSource: "pool_created_log"}}, 9999); err != nil {
 		t.Fatalf("commitpools: %v", err)
 	}
 	q()
 	if cb != 42 || ch == nil || *ch != "0x2a" || prov == nil || *prov != "pool_created_log" {
-		t.Fatalf("after bootstrap = %d %v %v, want 42 0x2a pool_created_log", cb, ch, prov)
+		t.Fatalf("after bootstrap = %d %q %q, want 42 0x2a pool_created_log", cb, deref(ch), deref(prov))
 	}
 	// 已确认的 pool_created_log 不允许被新观察块覆盖（提交不同观察块）
 	if err := db.CommitBlockIngest(ctx, 200, "0xc8", "0xc7",

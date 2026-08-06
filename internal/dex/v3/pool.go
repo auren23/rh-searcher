@@ -39,6 +39,8 @@ type Pool struct {
 	// 创建溯源：来自 Factory PoolCreated 日志（reorg 池回滚的精确依据）
 	CreatedBlock     uint64
 	CreatedBlockHash common.Hash
+	// ProvenanceSource: "pool_created_log" | "observed_swap_fallback" | ""
+	ProvenanceSource string
 
 	ticks        map[int]*Tick     // tick -> 流动性数据
 	bitmap       map[int64]*big.Int // wordPos -> 256bit 位图（仅已加载的 word）
@@ -48,16 +50,17 @@ type Pool struct {
 
 // NewPoolFromMeta 从持久化元数据构造池（ticks/bitmap 惰性初始化）。
 func NewPoolFromMeta(address common.Address, exchange string, token0, token1 common.Address, fee uint32, tickSpacing int) *Pool {
-	return NewPoolFromMetaWithCreated(address, exchange, token0, token1, fee, tickSpacing, 0, common.Hash{})
+	return NewPoolFromMetaWithCreated(address, exchange, token0, token1, fee, tickSpacing, 0, common.Hash{}, "")
 }
 
 // NewPoolFromMetaWithCreated 恢复池时携带真实创建溯源（历史资格过滤依赖）。
 func NewPoolFromMetaWithCreated(address common.Address, exchange string, token0, token1 common.Address,
-	fee uint32, tickSpacing int, createdBlock uint64, createdHash common.Hash) *Pool {
+	fee uint32, tickSpacing int, createdBlock uint64, createdHash common.Hash, provenanceSource string) *Pool {
 	return &Pool{
 		Address: address, Exchange: exchange,
 		Token0: token0, Token1: token1, Fee: fee, TickSpacing: tickSpacing,
 		CreatedBlock: createdBlock, CreatedBlockHash: createdHash,
+		ProvenanceSource: provenanceSource,
 		ticks:        make(map[int]*Tick),
 		bitmap:       make(map[int64]*big.Int),
 		bitmapLoaded: make(map[int64]bool),

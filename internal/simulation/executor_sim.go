@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"strings"
 	"time"
 
@@ -71,6 +72,14 @@ func isInfraError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// typed 优先：context 超时 / 网络错误
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
 	msg := strings.ToLower(err.Error())
 	for _, s := range []string{
 		"timeout", "deadline exceeded", "connection reset", "connection refused",
@@ -102,7 +111,16 @@ func isRevertError(err error) bool {
 // 返回 error = 基础设施错误（可重试，调用方不得推进游标）；
 // RevertMsg 非空 = 真实 revert（确定性拒绝，可落盘）。
 func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate, chainID uint64, block *big.Int) (*SimResult, error) {
-	calldata, err := BuildExecuteV3CycleCalldata(c, chainID)
+	// deadline 固定到历史区块时间（重放确定性）
+	var blockTime int64
+	if block != nil {
+		hdr, herr := s.cli.HeaderByNumber(ctx, block)
+		if herr != nil {
+			return nil, fmt.Errorf("header at %d: %w", block.Uint64(), herr)
+		}
+		blockTime = int64(hdr.Time)
+	}
+	calldata, err := BuildExecuteV3CycleCalldataAt(c, chainID, blockTime)
 	if err != nil {
 		return nil, err
 	}
@@ -114,10 +132,15 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	}
 	out, err := s.cli.CallContract(ctx, msg, block)
 	if err != nil {
+		// 分类顺序：先明确的基础设施错误（typed：DeadlineExceeded/net/429/5xx），
+		// 再确定性 revert；未知错误保守按可重试处理（宁可重试，不可错杀）
+		if isInfraError(err) {
+			return nil, fmt.Errorf("sim eth_call (infra): %w", err)
+		}
 		if isRevertError(err) {
 			return &SimResult{RevertMsg: err.Error(), CalldataHash: hashHex(calldata)}, nil
 		}
-		return nil, fmt.Errorf("sim eth_call: %w", err) // 基础设施 → 可重试
+		return nil, fmt.Errorf("sim eth_call (unknown): %w", err)
 	}
 	if len(out) < 32 {
 		return &SimResult{RevertMsg: fmt.Sprintf("short return %d bytes", len(out)), CalldataHash: hashHex(calldata)}, nil
@@ -132,11 +155,7 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	// 读取失败视为基础设施错误（可重试），不静默 fallback。
 	gasPrice := big.NewInt(1e8) // 0.1 gwei 保守默认
 	if block != nil {
-		hdr, herr := s.cli.HeaderByNumber(ctx, block)
-		if herr != nil {
-			return nil, fmt.Errorf("gas price header at %d: %w", block.Uint64(), herr)
-		}
-		if hdr.BaseFee != nil && hdr.BaseFee.Sign() > 0 {
+		if hdr, herr := s.cli.HeaderByNumber(ctx, block); herr == nil && hdr.BaseFee != nil && hdr.BaseFee.Sign() > 0 {
 			gasPrice = hdr.BaseFee
 		}
 	} else if g, gerr := s.cli.SuggestGasPrice(ctx); gerr == nil && g.Sign() > 0 {
@@ -181,7 +200,18 @@ func hashHex(data []byte) string {
 
 // BuildExecuteV3CycleCalldata 构建 ArbitrageExecutor.executeV3Cycle 的 ABI calldata。
 // Hop 结构：struct Hop { address pool; address tokenIn; address tokenOut; uint24 fee; }
+// BuildExecuteV3CycleCalldata 构建执行 calldata。deadline 默认用当前时间；
+// BuildExecuteV3CycleCalldataAt 用历史区块时间（重放确定性，同一历史区块
+// 每次评估产出相同 calldata hash / L1 成本）。
 func BuildExecuteV3CycleCalldata(c *arbitrage.Candidate, chainID uint64) ([]byte, error) {
+	return buildExecuteV3CycleCalldata(c, chainID, time.Now().Add(2*time.Minute).Unix())
+}
+
+func BuildExecuteV3CycleCalldataAt(c *arbitrage.Candidate, chainID uint64, blockTime int64) ([]byte, error) {
+	return buildExecuteV3CycleCalldata(c, chainID, blockTime+120)
+}
+
+func buildExecuteV3CycleCalldata(c *arbitrage.Candidate, chainID uint64, deadlineUnix int64) ([]byte, error) {
 	if len(c.Route) < 2 || len(c.Route) > 3 {
 		return nil, errors.New("route must have 2-3 hops")
 	}
@@ -204,6 +234,5 @@ func BuildExecuteV3CycleCalldata(c *arbitrage.Candidate, chainID uint64) ([]byte
 	if c.ExpectedNetProfit != nil && c.ExpectedNetProfit.Sign() > 0 {
 		minProfit = new(big.Int).Set(c.ExpectedNetProfit)
 	}
-	deadline := big.NewInt(time.Now().Add(2 * time.Minute).Unix())
-	return parsed.Pack("executeV3Cycle", hops, c.InputAmount, minProfit, deadline)
+	return parsed.Pack("executeV3Cycle", hops, c.InputAmount, minProfit, big.NewInt(deadlineUnix))
 }

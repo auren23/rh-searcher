@@ -150,12 +150,17 @@ func main() {
 		for _, st := range reg.AllPools() {
 			sp := st.Pool()
 			p3 := st.(*v3.Pool)
+			src := p3.ProvenanceSource
+			if src == "" && p3.CreatedBlock > 0 {
+				src = "pool_created_log" // bootstrap 池来自真实 PoolCreated 日志
+			}
 			allPools = append(allPools, storage.Pool{
 				Address: sp.ID, Exchange: sp.Exchange, Protocol: "v3",
 				Token0: sp.Token0.Hex(), Token1: sp.Token1.Hex(),
 				Fee: sp.Fee, TickSpacing: p3.TickSpacing,
 				// 创建溯源：bootstrap 的 DiscoverPools 直接从 PoolCreated 日志读取
 				CreatedBlock: p3.CreatedBlock, CreatedBlockHash: p3.CreatedBlockHash.Hex(),
+				ProvenanceSource: src,
 			})
 		}
 		if err := sink.CommitPools(ctx, allPools, lastPoolBlock); err != nil {
@@ -407,13 +412,23 @@ func main() {
 						}
 						// 创建溯源：按 PoolCreated(token0, token1, fee) 三个 indexed
 						// 参数精确查询（节点端 topics 过滤，无需全量扫描）。
-						// 失败降级观察块兜底（observed_swap_fallback），下次
-						// bootstrap 的 pool_created_log 会覆盖。
+						// 失败降级观察块兜底（observed_swap_fallback）——内存与
+						// 数据库必须一致（fallback 也同步 pool 对象，否则评估游标
+						// 落后时未来池过滤失效）。
 						if cb, ch, cerr := adapter.PoolCreatedByTokens(ctx, pool.Token0, pool.Token1, pool.Fee); cerr == nil {
 							meta.CreatedBlock = cb
 							meta.CreatedBlockHash = ch
+							meta.ProvenanceSource = "pool_created_log"
 							pool.CreatedBlock = cb
 							pool.CreatedBlockHash = ch
+							pool.ProvenanceSource = "pool_created_log"
+						} else {
+							meta.CreatedBlock = h.Number
+							meta.CreatedBlockHash = h.Hash
+							meta.ProvenanceSource = "observed_swap_fallback"
+							pool.CreatedBlock = h.Number
+							pool.CreatedBlockHash = h.Hash
+							pool.ProvenanceSource = "observed_swap_fallback"
 						}
 						newPoolMetas = append(newPoolMetas, meta)
 					}
@@ -498,6 +513,7 @@ func main() {
 					Token0: np.Token0.Hex(), Token1: np.Token1.Hex(),
 					Fee: np.Fee, TickSpacing: np.TickSpacing,
 					CreatedBlock: np.CreatedBlock, CreatedBlockHash: np.CreatedBlockHash.Hex(),
+					ProvenanceSource: np.ProvenanceSource,
 				})
 			}
 			affectedList := make([]string, 0, len(affected))

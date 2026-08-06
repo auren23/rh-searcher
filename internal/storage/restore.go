@@ -21,7 +21,7 @@ func RestorePools(ctx context.Context, db *DB, reg *dex.Registry, graph *dex.Gra
 		p := v3.NewPoolFromMetaWithCreated(
 			common.HexToAddress(sp.Address), sp.Exchange,
 			common.HexToAddress(sp.Token0), common.HexToAddress(sp.Token1), sp.Fee, sp.TickSpacing,
-			sp.CreatedBlock, common.HexToHash(sp.CreatedBlockHash))
+			sp.CreatedBlock, common.HexToHash(sp.CreatedBlockHash), sp.ProvenanceSource)
 		reg.UpsertPool(v3.State(p))
 		graph.AddPool(p.Pool(), p.Address)
 	}
