@@ -318,8 +318,17 @@ func main() {
 	// 重启从这里重新评估，候选不丢失。
 	lastEvaluated := lastApplied
 	if pgCkpt != nil {
-		if eh, _, err := pgCkpt.LoadWithHash(ctx, storage.CheckpointEvaluate); err == nil {
+		eh, _, err := pgCkpt.LoadWithHash(ctx, storage.CheckpointEvaluate)
+		switch {
+		case err == nil:
 			lastEvaluated = eh
+		case errors.Is(err, pgx.ErrNoRows):
+			// 0008 迁移未补种 evaluate 游标：静默回退会永久跳过未评估队列
+			slog.Error("evaluate checkpoint missing: migration 0008 incomplete")
+			os.Exit(1)
+		default:
+			slog.Error("load evaluate checkpoint", "err", err)
+			os.Exit(1)
 		}
 	}
 	if lastApplied > 0 && lastAppliedHash == (common.Hash{}) {
@@ -561,7 +570,10 @@ func main() {
 		}
 		lastApplied = ancestor
 		lastAppliedHash = common.HexToHash(ancestorHash) // 重处理期间继续衔接校验
-		lastEvaluated = ancestor // evaluate 游标已随事务回退
+		// evaluate 只退不进（LEAST 语义，与事务一致）
+		if lastEvaluated > ancestor {
+			lastEvaluated = ancestor
+		}
 		return nil
 	}
 
@@ -601,33 +613,32 @@ func main() {
 		}
 		return nil
 	}
-	// evaluatePending：从 evaluate 游标之后读取尚未评估的受影响池
-	// （跨区块聚合去重），对当前状态统一评估一次，与 evaluate checkpoint
-	// 同事务提交。失败 → 游标不前进，下次调用重试同一批（不丢机会）。
+	// evaluatePending：从 evaluate 游标之后逐块评估（固定 stateBlock = 队列区块）。
+	// 每块独立事务（候选 + evaluate checkpoint）；失败 → 该块游标不前进，
+	// 下次调用从同一块重试（不丢机会、无 look-ahead）。
 	evaluatePending := func() error {
 		if sink == nil {
 			return nil
 		}
-		evalBlock, evalHash, pools, err := sink.LoadPendingAffected(ctx, lastEvaluated)
+		pending, err := sink.LoadPendingAffected(ctx, lastEvaluated)
 		if err != nil {
 			return fmt.Errorf("load pending affected: %w", err)
 		}
-		if len(pools) == 0 {
-			return nil
+		for _, pb := range pending {
+			addrs := make([]common.Address, 0, len(pb.Pools))
+			for _, p := range pb.Pools {
+				addrs = append(addrs, common.HexToAddress(p))
+			}
+			processed := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
+				BlockNumber: pb.Block,
+				BlockHash:   common.HexToHash(pb.Hash),
+				ReceivedAt:  time.Now().UnixMilli(),
+			}, addrs)
+			if err := sink.CommitEvaluation(ctx, pb.Block, pb.Hash, processed.Candidates); err != nil {
+				return fmt.Errorf("evaluate block %d: %w", pb.Block, err)
+			}
+			lastEvaluated = pb.Block
 		}
-		addrs := make([]common.Address, 0, len(pools))
-		for _, p := range pools {
-			addrs = append(addrs, common.HexToAddress(p))
-		}
-		processed := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
-			BlockNumber: evalBlock,
-			BlockHash:   common.HexToHash(evalHash),
-			ReceivedAt:  time.Now().UnixMilli(),
-		}, addrs)
-		if err := sink.CommitEvaluation(ctx, evalBlock, evalHash, processed.Candidates); err != nil {
-			return err
-		}
-		lastEvaluated = evalBlock
 		return nil
 	}
 

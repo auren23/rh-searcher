@@ -11,3 +11,10 @@ CREATE TABLE IF NOT EXISTS block_affected_pools (
 );
 CREATE INDEX IF NOT EXISTS idx_bap_strategy_number
     ON block_affected_pools (strategy, block_number);
+
+-- 旧库升级补种 evaluate 游标（缺它时启动会报错，不会静默跳过队列）
+INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, parent_hash, updated_at)
+SELECT 'arbitrage:evaluate', block_number, block_hash, parent_hash, now()
+FROM strategy_checkpoints
+WHERE strategy = 'arbitrage:blocks'
+ON CONFLICT (strategy) DO NOTHING;

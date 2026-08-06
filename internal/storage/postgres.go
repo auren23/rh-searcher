@@ -199,7 +199,7 @@ func (d *DB) CommitBlockIngest(ctx context.Context, block uint64, blockHash, par
 
 	for _, sp := range pools {
 		createdHash := sp.CreatedBlockHash
-		if createdHash == "" {
+		if isUnknownHash(createdHash) {
 			createdHash = blockHash // 无真实 PoolCreated 日志时兜底（观察块）
 		}
 		if _, err := tx.Exec(ctx, `
@@ -282,40 +282,48 @@ func (d *DB) CommitEvaluation(ctx context.Context, block uint64, blockHash strin
 	return tx.Commit(ctx)
 }
 
-// LoadPendingAffected 读取 evaluate 游标之后尚未评估的受影响池
-// （跨区块聚合去重），返回评估终点（最后一块）与池列表。
-func (d *DB) LoadPendingAffected(ctx context.Context, fromBlock uint64) (uint64, string, []string, error) {
+// PendingBlock 一个待评估区块（固定状态评估的单位）。
+type PendingBlock struct {
+	Block uint64
+	Hash  string
+	Pools []string // 块内去重
+}
+
+// LoadPendingAffected 读取 evaluate 游标之后尚未评估的区块队列（按块升序）。
+// 每块独立评估（固定 stateBlock = 该块）——不能跨块聚合，
+// 否则丢失"当时的机会"且双游标恢复不完整。
+func (d *DB) LoadPendingAffected(ctx context.Context, fromBlock uint64) ([]PendingBlock, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT block_number, block_hash, pool_address
 		FROM block_affected_pools
 		WHERE strategy = $1 AND block_number > $2
-		ORDER BY block_number ASC`,
+		ORDER BY block_number ASC, pool_address ASC`,
 		CheckpointBlocks, fromBlock)
 	if err != nil {
-		return 0, "", nil, err
+		return nil, err
 	}
 	defer rows.Close()
-	var last uint64
-	lastHash := ""
-	seen := map[string]struct{}{}
-	out := []string{}
+	out := []PendingBlock{}
+	idx := map[uint64]int{}
 	for rows.Next() {
 		var n uint64
 		var h, pa string
 		if err := rows.Scan(&n, &h, &pa); err != nil {
-			return 0, "", nil, err
+			return nil, err
 		}
-		if n > last {
-			last = n
-			lastHash = h
+		i, ok := idx[n]
+		if !ok {
+			i = len(out)
+			idx[n] = i
+			out = append(out, PendingBlock{Block: n, Hash: h})
 		}
-		if _, dup := seen[pa]; dup {
+		pools := out[i].Pools
+		if len(pools) > 0 && pools[len(pools)-1] == pa {
 			continue
 		}
-		seen[pa] = struct{}{}
-		out = append(out, pa)
+		out[i].Pools = append(pools, pa)
 	}
-	return last, lastHash, out, rows.Err()
+	return out, rows.Err()
 }
 
 // QueryRow 执行单行查询（reorg 祖先查找用）。
@@ -382,14 +390,14 @@ func (d *DB) RollbackToAncestor(ctx context.Context, strategy string, ancestor u
 		strategy, ancestor, nullableStr(hash), nullableStr(parent)); err != nil {
 		return err
 	}
-	// evaluate 游标同步回退到祖先（新链重处理后重新评估）
+	// evaluate 游标只退不进：落后于祖先的部分保留（仍要评估），
+	// 只有超过祖先的部分回退（LEAST）
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, updated_at)
-		VALUES ('` + CheckpointEvaluate + `', $1, $2, now())
-		ON CONFLICT (strategy) DO UPDATE SET
-			block_number = EXCLUDED.block_number,
-			block_hash = EXCLUDED.block_hash,
-			updated_at = now()`,
+		UPDATE strategy_checkpoints
+		SET block_number = LEAST(block_number, $1),
+			block_hash = CASE WHEN block_number > $1 THEN $2 ELSE block_hash END,
+			updated_at = now()
+		WHERE strategy = '` + CheckpointEvaluate + `'`,
 		ancestor, nullableStr(hash)); err != nil {
 		return err
 	}
@@ -453,19 +461,35 @@ func (d *DB) CommitPools(ctx context.Context, pools []Pool, checkpointBlock uint
 	}
 	defer tx.Rollback(ctx)
 	for _, sp := range pools {
+		// 真实创建溯源（DiscoverPools 从 PoolCreated 日志读取）；
+		// 无真实信息时兜底 bootstrap 结束块，但 hash 保持未知（不造假）
+		createdBlock := sp.CreatedBlock
+		if createdBlock == 0 {
+			createdBlock = checkpointBlock
+		}
+		createdHash := sp.CreatedBlockHash
+		if isUnknownHash(createdHash) {
+			createdHash = ""
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
 				canonical, created_block, created_block_hash)
-			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, $8, NULL)
+			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, NULLIF($8, 0), NULLIF($9, ''))
 			ON CONFLICT (address) DO UPDATE SET
 				exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
 				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
 				fee = EXCLUDED.fee, tick_spacing = EXCLUDED.tick_spacing,
 				canonical = TRUE,
+				-- 真实 Bootstrap 信息覆盖未知/零占位（NULL 或 0 块或全零 hash）
 				created_block = CASE WHEN dex_pools.created_block IS NULL
-					THEN EXCLUDED.created_block ELSE dex_pools.created_block END`,
+					OR dex_pools.created_block = 0
+					THEN EXCLUDED.created_block ELSE dex_pools.created_block END,
+				created_block_hash = CASE WHEN dex_pools.created_block_hash IS NULL
+					OR dex_pools.created_block_hash = ''
+					OR dex_pools.created_block_hash = '0x0000000000000000000000000000000000000000000000000000000000000000'
+					THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END`,
 			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing,
-			checkpointBlock); err != nil {
+			createdBlock, nullableStr(createdHash)); err != nil {
 			return fmt.Errorf("pool %s: %w", sp.Address, err)
 		}
 	}
@@ -547,6 +571,14 @@ func (d *DB) LoadPools(ctx context.Context) ([]Pool, error) {
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// isUnknownHash 判断创建 hash 是否未知（空串或全零——动态池零值 .Hex() 不是空串）。
+func isUnknownHash(s string) bool {
+	if s == "" || s == "0x0000000000000000000000000000000000000000000000000000000000000000" {
+		return true
+	}
+	return false
 }
 
 func nullableUint64(v uint64) *uint64 {

@@ -195,6 +195,9 @@ func main() {
 				slog.Warn("new pool init", "addr", meta.Pool.Hex(), "err", err)
 				continue
 			}
+			// 创建溯源：直接使用 PoolCreated 日志的区块与 hash（PoolByAddress 不提供）
+			p.CreatedBlock = l.BlockNumber
+			p.CreatedBlockHash = l.BlockHash
 			reg.UpsertPool(v3.State(p))
 			graph.AddPool(p.Pool(), p.Address)
 			if db != nil {

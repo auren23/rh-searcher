@@ -148,7 +148,15 @@ func (e *Engine) finalizeCandidate(c *Candidate, ev SwapEvent, r Route, stateBlo
 
 // ProcessBlock 区块级评估：应用完整区块的日志后，收集所有受影响池的路由，
 // 按池序列全局去重，每条 route 只评估一次（避免两池同区块 Swap 时重复模拟）。
+// ProcessBlock 按评估区块高度固定状态评估（stateBlock = ev.BlockNumber）。
+// 不再存在"跨区块聚合到 latest 状态"的路径：每个队列区块独立固定评估。
 func (e *Engine) ProcessBlock(ctx context.Context, ev SwapEvent, affectedPools []common.Address) *BlockResult {
+	return e.ProcessBlockAt(ctx, ev, affectedPools, ev.BlockNumber)
+}
+
+// ProcessBlockAt 与 ProcessBlock 相同，但状态区块可显式指定
+// （恢复路径：评估终点可能低于事件区块）。
+func (e *Engine) ProcessBlockAt(ctx context.Context, ev SwapEvent, affectedPools []common.Address, stateBlock uint64) *BlockResult {
 	res := &BlockResult{Block: ev.BlockNumber, BlockHash: ev.BlockHash}
 	allRoutes := make([]Route, 0, len(affectedPools)*2)
 	seenRoutes := make(map[string]struct{})
@@ -163,7 +171,7 @@ func (e *Engine) ProcessBlock(ctx context.Context, ev SwapEvent, affectedPools [
 		}
 	}
 	for _, r := range allRoutes {
-		res.Candidates = append(res.Candidates, e.evaluateRoute(ctx, ev, r)...)
+		res.Candidates = append(res.Candidates, e.evaluateRoute(ctx, ev, r, stateBlock)...)
 	}
 	return res
 }
@@ -172,14 +180,15 @@ func (e *Engine) ProcessBlock(ctx context.Context, ev SwapEvent, affectedPools [
 func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 	routes := e.searcher.FindRoutes(ctx, ev.Pool, e.cfg.WETH, e.cfg.MaxHops)
 	for _, r := range routes {
-		e.evaluateRoute(ctx, ev, r)
+		e.evaluateRoute(ctx, ev, r, ev.BlockNumber)
 	}
 }
 
 // evaluateRoute 单条路由的 Top-K 模拟与统一落盘。返回本路由产生的候选（不写数据库）。
-func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route) []*Candidate {
-	// 执行 Shadow 模式：固定状态区块，路由所有池的状态读取都在该高度
-	stateHead, stateHash, err := e.searcher.RefreshRoute(ctx, r)
+func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, stateBlock uint64) []*Candidate {
+	// 执行 Shadow 模式：固定状态区块（逐块评估 = 队列区块本身），
+	// 路由所有池的状态读取都在该高度
+	stateHead, stateHash, err := e.searcher.RefreshRoute(ctx, r, stateBlock)
 	if err != nil {
 		// 状态不可用：打指标并记录 group 级拒绝（不静默从漏斗消失）
 		routeRefreshFailures.Inc()
@@ -325,9 +334,10 @@ type Searcher interface {
 	Optimize(ctx context.Context, r Route, block uint64, ts int64) *Candidate
 	// TopKOptimize 返回本地毛利最高的 k 个输入量候选（供逐个链上模拟后选优）。
 	TopKOptimize(ctx context.Context, r Route, k int, block uint64, ts int64) []*Candidate
-	// RefreshRoute 执行 Shadow 模式：固定一个状态区块，路由所有池的状态读取都在该高度。
-	// 返回 (stateBlock, stateHash, err)。
-	RefreshRoute(ctx context.Context, r Route) (uint64, common.Hash, error)
+	// RefreshRoute 执行 Shadow 模式：把路由所有池的状态固定读取到 block 高度。
+	// 返回 (stateBlock, stateHash, err)。逐块评估时 block 必须是该队列区块本身，
+	// 不能读取 latest——否则双游标恢复的只是"哪些池受影响"，不是"当时的机会"。
+	RefreshRoute(ctx context.Context, r Route, block uint64) (uint64, common.Hash, error)
 }
 
 // Evaluator 评估：模拟验证 + 成本核算。

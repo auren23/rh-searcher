@@ -242,3 +242,127 @@ func TestRestorePoolsExcludesOrphans(t *testing.T) {
 		t.Fatalf("LoadPools returned %d pools, want only the canonical one", len(pools))
 	}
 }
+
+// P0-1: 升级崩溃恢复——ingest 提交后 evaluate 游标落后，重启后队列仍被读取
+func TestEvaluationQueueSurvivesCrash(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	if _, err := db.pool.Exec(ctx, `
+		DELETE FROM opportunities;
+		DELETE FROM processed_blocks;
+		DELETE FROM strategy_checkpoints;
+		DELETE FROM block_affected_pools;`); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	// 模拟：ingest 100~102 已提交，evaluate 只到 100（崩溃点）
+	if err := db.InitializeBlockCheckpoint(ctx, CheckpointBlocks, 99, "0x999", "0x888"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	for i := uint64(100); i <= 102; i++ {
+		h := common.BigToHash(new(big.Int).SetUint64(i)).Hex()
+		if err := db.CommitBlockIngest(ctx, i, h, common.BigToHash(new(big.Int).SetUint64(i-1)).Hex(),
+			nil, []string{"0xaa01"}); err != nil {
+			t.Fatalf("ingest %d: %v", i, err)
+		}
+	}
+	// evaluate 游标落后（100），重启后队列必须包含 101、102
+	pending, err := db.LoadPendingAffected(ctx, 100)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(pending) != 2 || pending[0].Block != 101 || pending[1].Block != 102 {
+		t.Fatalf("pending=%+v want blocks 101,102", pending)
+	}
+	// 评估 101 后，剩余 102
+	if err := db.CommitEvaluation(ctx, 101, common.BigToHash(big.NewInt(101)).Hex(), nil); err != nil {
+		t.Fatalf("eval 101: %v", err)
+	}
+	pending, err = db.LoadPendingAffected(ctx, 101)
+	if err != nil {
+		t.Fatalf("load2: %v", err)
+	}
+	if len(pending) != 1 || pending[0].Block != 102 {
+		t.Fatalf("pending after 101=%+v", pending)
+	}
+}
+
+// P0-2: reorg 时 evaluate 只退不进（evaluate=100 < ancestor=105 保持 100）
+func TestReorgDoesNotAdvanceLaggingEvaluate(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	if _, err := db.pool.Exec(ctx, `
+		DELETE FROM opportunities;
+		DELETE FROM processed_blocks;
+		DELETE FROM strategy_checkpoints;
+		DELETE FROM block_affected_pools;`); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if err := db.InitializeBlockCheckpoint(ctx, CheckpointBlocks, 110, "0xaaa", "0x999"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	// 把 evaluate 手动拉到 100（落后）
+	if err := db.CommitEvaluation(ctx, 100, "0x100", nil); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if err := db.RollbackToAncestor(ctx, CheckpointBlocks, 105, "0x105", "0x104"); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	n, h, err := NewPGCheckpoint(db).LoadWithHash(ctx, CheckpointEvaluate)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if n != 100 || h != common.HexToHash("0x100") {
+		t.Fatalf("evaluate after reorg = %d %s, want 100 (no advance)", n, h.Hex())
+	}
+	// evaluate 超前时（120 > ancestor 105）才回退到 105
+	if err := db.CommitEvaluation(ctx, 120, "0x120", nil); err != nil {
+		t.Fatalf("eval2: %v", err)
+	}
+	if err := db.RollbackToAncestor(ctx, CheckpointBlocks, 105, "0x105", "0x104"); err != nil {
+		t.Fatalf("rollback2: %v", err)
+	}
+	n, _, err = NewPGCheckpoint(db).LoadWithHash(ctx, CheckpointEvaluate)
+	if err != nil {
+		t.Fatalf("load2: %v", err)
+	}
+	if n != 105 {
+		t.Fatalf("evaluate after reorg2 = %d, want 105", n)
+	}
+}
+
+// P0-4: CommitPools 保存真实创建高度与 hash（而非 bootstrap 结束块/NULL）
+func TestCommitPoolsExactProvenance(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	if _, err := db.pool.Exec(ctx, `DELETE FROM dex_pools; DELETE FROM strategy_checkpoints;`); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	p := Pool{Address: "0x0000000000000000000000000000000000000bb1",
+		Exchange: "uniswap-v3", Protocol: "v3", Token0: "0xaaa", Token1: "0xbbb",
+		Fee: 3000, TickSpacing: 60, CreatedBlock: 42, CreatedBlockHash: "0x2a"}
+	if err := db.CommitPools(ctx, []Pool{p}, 9999); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	var cb uint64
+	var ch *string
+	if err := db.pool.QueryRow(ctx,
+		`SELECT created_block, created_block_hash FROM dex_pools WHERE address=$1`, p.Address).
+		Scan(&cb, &ch); err != nil {
+		t.Fatal(err)
+	}
+	if cb != 42 || ch == nil || *ch != "0x2a" {
+		t.Fatalf("created = %d %v, want 42 0x2a", cb, ch)
+	}
+	// 真实信息覆盖零 hash 占位
+	if err := db.CommitPools(ctx, []Pool{p}, 9999); err != nil {
+		t.Fatalf("recommit: %v", err)
+	}
+	if err := db.pool.QueryRow(ctx,
+		`SELECT created_block, created_block_hash FROM dex_pools WHERE address=$1`, p.Address).
+		Scan(&cb, &ch); err != nil {
+		t.Fatal(err)
+	}
+	if cb != 42 || ch == nil || *ch != "0x2a" {
+		t.Fatalf("created after recommit = %d %v, want 42 0x2a", cb, ch)
+	}
+}

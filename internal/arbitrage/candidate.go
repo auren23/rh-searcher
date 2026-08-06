@@ -191,12 +191,11 @@ func (s *LocalSearcher) prepareRoute(ctx context.Context, r Route) error {
 // RefreshRoute 执行 Shadow 模式：先固定一个状态区块（blockNumber + blockHash），
 // 路由所有池的状态读取（slot0/liquidity/bitmap）全部固定在该高度。
 // 返回 (stateBlock, stateHash, err)。调用方需将 stateBlock 用于 eth_call 与 hash 校验。
-func (s *LocalSearcher) RefreshRoute(ctx context.Context, r Route) (uint64, common.Hash, error) {
-	header, err := s.v3.HeaderAt(ctx, nil)
+func (s *LocalSearcher) RefreshRoute(ctx context.Context, r Route, block uint64) (uint64, common.Hash, error) {
+	header, err := s.v3.HeaderAt(ctx, new(big.Int).SetUint64(block))
 	if err != nil {
-		return 0, common.Hash{}, fmt.Errorf("header: %w", err)
+		return 0, common.Hash{}, fmt.Errorf("header %d: %w", block, err)
 	}
-	block := new(big.Int).Set(header.Number)
 	for _, h := range r.Hops {
 		state := s.registry.Pool(h.Pool)
 		if state == nil {
@@ -206,7 +205,7 @@ func (s *LocalSearcher) RefreshRoute(ctx context.Context, r Route) (uint64, comm
 		if !ok {
 			return 0, common.Hash{}, fmt.Errorf("pool %s unsupported", h.Pool.Hex())
 		}
-		if err := s.v3.RefreshPoolStateAt(ctx, p, block); err != nil {
+		if err := s.v3.RefreshPoolStateAt(ctx, p, new(big.Int).SetUint64(block)); err != nil {
 			return 0, common.Hash{}, fmt.Errorf("pool %s refresh: %w", h.Pool.Hex(), err)
 		}
 	}
