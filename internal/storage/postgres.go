@@ -89,6 +89,17 @@ func (d *DB) checkSchema(ctx context.Context) error {
 	if !hasPb {
 		return fmt.Errorf("database schema out of date: migration 0006 not applied")
 	}
+	// 0007: dex_pools.canonical / created_block（孤池恢复依赖）
+	var hasPoolCanonical bool
+	if err := d.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_name='dex_pools' AND column_name='canonical')
+	`).Scan(&hasPoolCanonical); err != nil {
+		return fmt.Errorf("schema check: %w", err)
+	}
+	if !hasPoolCanonical {
+		return fmt.Errorf("database schema out of date: migration 0007 not applied")
+	}
 	return nil
 }
 
@@ -239,15 +250,28 @@ func (d *DB) RollbackToAncestor(ctx context.Context, strategy string, ancestor u
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE opportunities SET canonical = FALSE
-		WHERE strategy = $1 AND canonical = TRUE AND observed_block > $2`,
+		WHERE strategy = $1 AND canonical = TRUE
+		  AND GREATEST(
+				observed_block,
+				COALESCE(state_block, 0),
+				COALESCE(simulation_block, 0)
+			  ) > $2`,
 		StrategyArbitrage, ancestor); err != nil {
 		return err
 	}
-	// 孤块中创建并持久化的池标记非规范（Restore 时过滤，不进入 Graph）
+	// 孤块中创建并持久化的池标记非规范（Restore 时过滤，不进入 Graph）。
+	// 精确判定：池的 created_block_hash 必须落在本事务已标记的孤块列表里
+	// （PoolCreated/首次观察区块），而不是简单按高度比较——池可能创建于
+	// 祖先之前、只是第一次 Swap 在孤块高度。
 	if _, err := tx.Exec(ctx, `
 		UPDATE dex_pools SET canonical = FALSE
-		WHERE canonical = TRUE AND created_block > $1`,
-		ancestor); err != nil {
+		WHERE canonical = TRUE
+		  AND created_block_hash IS NOT NULL
+		  AND created_block_hash IN (
+			SELECT block_hash FROM processed_blocks
+			WHERE strategy = $1 AND canonical = FALSE
+		  )`,
+		strategy); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `
@@ -311,13 +335,18 @@ func (d *DB) CommitPools(ctx context.Context, pools []Pool, checkpointBlock uint
 	defer tx.Rollback(ctx)
 	for _, sp := range pools {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing)
-			VALUES ($1,$2,$3,$4,$5,$6,$7)
+			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
+				canonical, created_block, created_block_hash)
+			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, $8, NULL)
 			ON CONFLICT (address) DO UPDATE SET
 				exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
 				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
-				fee = EXCLUDED.fee, tick_spacing = EXCLUDED.tick_spacing`,
-			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing); err != nil {
+				fee = EXCLUDED.fee, tick_spacing = EXCLUDED.tick_spacing,
+				canonical = TRUE,
+				created_block = CASE WHEN dex_pools.created_block IS NULL
+					THEN EXCLUDED.created_block ELSE dex_pools.created_block END`,
+			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing,
+			checkpointBlock); err != nil {
 			return fmt.Errorf("pool %s: %w", sp.Address, err)
 		}
 	}
@@ -372,7 +401,8 @@ type Pool struct {
 
 // LoadPools 读取全部池元数据（启动恢复）。tick_spacing 缺失时（旧数据）返回 0，由调用方补查。
 func (d *DB) LoadPools(ctx context.Context) ([]Pool, error) {
-	rows, err := d.pool.Query(ctx, `SELECT address, exchange, protocol, token0, token1, fee, COALESCE(tick_spacing, 0) FROM dex_pools`)
+	rows, err := d.pool.Query(ctx, `SELECT address, exchange, protocol, token0, token1, fee, COALESCE(tick_spacing, 0)
+		FROM dex_pools WHERE canonical = TRUE`)
 	if err != nil {
 		return nil, err
 	}

@@ -95,7 +95,7 @@ func TestMarkOrphansTwoLevelReorg(t *testing.T) {
 		h := common.BigToHash(new(big.Int).SetUint64(i)).Hex()
 		parent := prev
 		prev = h
-		// 每个区块携带一个新池（孤块创建的池应被标记 canonical=false）
+		// 每个区块携带一个新池（创建 hash = 该区块 hash；孤块 4/5 的池应被标记）
 		poolAddr := common.BigToHash(new(big.Int).SetUint64(1000 + i)).Hex()[24:]
 		pools := []Pool{{Address: "0x" + poolAddr, Exchange: "uniswap-v3",
 			Protocol: "v3", Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}}
@@ -193,5 +193,41 @@ func TestCommitBlockResultRollsBackOnCandidateFailure(t *testing.T) {
 		`SELECT block_number FROM strategy_checkpoints WHERE strategy=$1`,
 		CheckpointBlocks).Scan(&n); err != nil || n != 200 {
 		t.Fatalf("checkpoint n=%d err=%v want 200", n, err)
+	}
+}
+
+// P0-1: RestorePools 必须排除孤块池（LoadPools WHERE canonical=TRUE），
+// 否则孤池会重新进入 Graph。
+func TestRestorePoolsExcludesOrphans(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	if _, err := db.pool.Exec(ctx, `
+		DELETE FROM opportunities;
+		DELETE FROM processed_blocks;
+		DELETE FROM strategy_checkpoints;
+		DELETE FROM dex_pools;`); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	// 两个池：孤儿（created_block_hash 属于孤块）与规范池
+	orphanHash := common.BigToHash(big.NewInt(9001)).Hex()
+	goodHash := common.BigToHash(big.NewInt(9002)).Hex()
+	orphan := Pool{Address: "0x0000000000000000000000000000000000000aa1",
+		Exchange: "uniswap-v3", Protocol: "v3", Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}
+	good := Pool{Address: "0x0000000000000000000000000000000000000aa2",
+		Exchange: "uniswap-v3", Protocol: "v3", Token0: "0xaaa", Token1: "0xccc", Fee: 3000, TickSpacing: 60}
+	if _, err := db.pool.Exec(ctx, `
+		INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
+			canonical, created_block, created_block_hash)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE,10,$8), ($9,$10,$11,$12,$13,$14,$15,TRUE,10,$16)`,
+		orphan.Address, orphan.Exchange, orphan.Protocol, orphan.Token0, orphan.Token1, orphan.Fee, orphan.TickSpacing, orphanHash,
+		good.Address, good.Exchange, good.Protocol, good.Token0, good.Token1, good.Fee, good.TickSpacing, goodHash); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	pools, err := db.LoadPools(ctx)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(pools) != 1 || pools[0].Address != good.Address {
+		t.Fatalf("LoadPools returned %d pools, want only the canonical one", len(pools))
 	}
 }

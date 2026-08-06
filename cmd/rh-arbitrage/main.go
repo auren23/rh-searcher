@@ -480,15 +480,6 @@ func main() {
 		return nil
 	}
 
-	// 单事务提交（pools + candidates + processed_blocks + checkpoint）；失败 → 游标不前进
-	processAndCommit := func(h chain.BlockEvent) error {
-		res, _, pending, err := processBlock(h, true)
-		if err != nil {
-			return err
-		}
-		return commitResult(h, res, pending)
-	}
-
 	// reorg 处理：新链与旧链在 lastApplied+1 断裂时，用 processed_blocks 历史
 	// 按高度对比新旧 hash 找共同祖先（≤64 层）；RollbackToAncestor 单事务
 	// （孤块标记 + checkpoint 回退）成功后，重建内存池状态，回退游标。
@@ -522,13 +513,12 @@ func main() {
 			}
 		}
 		if !found {
-			// 历史缺失或全被替换：保守回退 64 层重处理（checkpoint 回退到该层）
-			ancestor = 0
-			if rollback > 64 {
-				ancestor = rollback - 64
-			}
-			slog.Warn("reorg: no common ancestor found, conservative rollback", "to", ancestor)
-		} else if ancestor < rollback {
+			// 历史缺失或全被替换：无法确认共同祖先时禁止自动恢复
+			// （盲回退 64 层不是祖先，深孤链数据会保持 canonical=true）
+			return fmt.Errorf("reorg: no common ancestor found within %d blocks "+
+				"(rollback needed at %d); manual recovery required", 64, rollback)
+		}
+		if ancestor < rollback {
 			slog.Warn("reorg common ancestor", "rollback_to", ancestor)
 		}
 		var ancHdr *types.Header
@@ -562,42 +552,45 @@ func main() {
 		}
 	}()
 
-	// 启动窗口补扫：从 lastApplied+1 顺序处理；第一块校验父衔接（离线 reorg）。
-	// 任一区块失败即停止推进（不跳块）。回退后循环条件重新计算（不会跳过新区块）。
-	// 补扫只取日志 + 提交历史 + 应用内存状态，不逐块评估（避免对同一当前状态
-	// 重复评估）；结束时对聚合的 affected pools 统一评估一次（P1-3）。
-	backfillAffected := map[common.Address]struct{}{}
-	for lastApplied < startHead {
-		bn := lastApplied + 1
-		hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
-		if err != nil {
-			slog.Error("startup backfill header, stopping cursor", "block", bn, "err", err)
-			break
-		}
-		if lastAppliedHash != (common.Hash{}) && hdr.ParentHash != lastAppliedHash {
-			if err := handleReorg(); err != nil {
-				slog.Error("startup reorg rollback failed, exiting", "err", err)
-				os.Exit(1)
+	// backfill：从 lastApplied+1 顺序补扫到 to（含）。逐块校验 parent 衔接
+	// （离线/漏 head 的 reorg 在第一块即被发现），逐块提交历史并应用内存状态，
+	// 但不评估——返回聚合的 affected pools，由调用方统一评估一次
+	// （避免对同一当前 RPC 状态重复评估，污染机会频率统计）。
+	backfill := func(to uint64) (map[common.Address]struct{}, error) {
+		affected := map[common.Address]struct{}{}
+		for lastApplied < to {
+			bn := lastApplied + 1
+			hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
+			if err != nil {
+				return affected, fmt.Errorf("backfill header %d: %w", bn, err)
 			}
-			continue // 回退后重新计算 bn
+			if lastAppliedHash != (common.Hash{}) && hdr.ParentHash != lastAppliedHash {
+				if err := handleReorg(); err != nil {
+					return affected, err
+				}
+				continue // 回退后重新计算 bn
+			}
+			ev := chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash}
+			res, a, pending, err := processBlock(ev, false)
+			if err != nil {
+				return affected, fmt.Errorf("backfill block %d: %w", bn, err)
+			}
+			if err := commitResult(ev, res, pending); err != nil {
+				return affected, err
+			}
+			for p := range a {
+				affected[p] = struct{}{}
+			}
 		}
-		res, affected, pending, err := processBlock(chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash}, false)
-		if err != nil {
-			slog.Error("startup backfill failed, cursor stays at", "block", lastApplied, "err", err)
-			break
-		}
-		if err := commitResult(chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash}, res, pending); err != nil {
-			slog.Error("startup backfill commit failed, cursor stays at", "block", lastApplied, "err", err)
-			break
-		}
-		for p := range affected {
-			backfillAffected[p] = struct{}{}
-		}
+		return affected, nil
 	}
-	// 补扫聚合评估：一个当前状态只评估一次（候选以补扫最后一块为观察区块）
-	if len(backfillAffected) > 0 {
-		pools := make([]common.Address, 0, len(backfillAffected))
-		for p := range backfillAffected {
+	// 对聚合 affected pools 统一评估一次并落盘（候选观察区块 = 补扫终点）
+	evaluateBackfill := func(affected map[common.Address]struct{}) error {
+		if len(affected) == 0 || sink == nil {
+			return nil
+		}
+		pools := make([]common.Address, 0, len(affected))
+		for p := range affected {
 			pools = append(pools, p)
 		}
 		ev := chain.BlockEvent{Number: lastApplied, Hash: lastAppliedHash}
@@ -606,12 +599,21 @@ func main() {
 			BlockHash:   ev.Hash,
 			ReceivedAt:  time.Now().UnixMilli(),
 		}, pools)
-		if len(processed.Candidates) > 0 && sink != nil {
-			// 独立候选提交：不重写 checkpoint/processed_blocks（parent hash 已逐块保存）
-			if err := sink.CommitCandidatesForExistingBlock(ctx, ev.Number, ev.Hash.Hex(), processed.Candidates); err != nil {
-				slog.Error("backfill evaluation commit failed", "err", err)
-			}
+		if len(processed.Candidates) == 0 {
+			return nil
 		}
+		// 独立候选提交：不重写 checkpoint/processed_blocks（parent hash 已逐块保存）
+		return sink.CommitCandidatesForExistingBlock(ctx, ev.Number, ev.Hash.Hex(), processed.Candidates)
+	}
+
+	// 启动窗口补扫：失败即停止推进（不跳块）；结束后统一评估一次
+	backfillAffected, err := backfill(startHead)
+	if err != nil {
+		slog.Error("startup backfill failed, cursor stays at", "block", lastApplied, "err", err)
+		os.Exit(1)
+	}
+	if err := evaluateBackfill(backfillAffected); err != nil {
+		slog.Error("backfill evaluation commit failed", "err", err)
 	}
 
 	for {
@@ -626,40 +628,14 @@ func main() {
 			if h.Number <= lastApplied {
 				continue // 已处理（含轮询源补块重复）
 			}
-			if lastAppliedHash != (common.Hash{}) && h.Number == lastApplied+1 && h.Parent != lastAppliedHash {
-				if err := handleReorg(); err != nil {
-					slog.Error("reorg rollback failed, exiting", "err", err)
-					os.Exit(1) // 失败关闭：不允许双规范数据运行
-				}
+			// 顺序补扫到新 head（含 reorg 检测），随后统一评估一次（同启动补扫语义）
+			affected, err := backfill(h.Number)
+			if err != nil {
+				slog.Error("backfill failed, cursor stays at", "block", lastApplied, "err", err)
+				os.Exit(1) // 失败关闭：任一区块失败即停止，不跳块
 			}
-			// 顺序处理 lastApplied+1 → h.Number；任一失败即停止推进（失败区块不被跳过）
-			// 每个待处理区块都校验 parent 衔接（漏 head 时 gap 第一块同样能发现 reorg）
-			bn := lastApplied + 1
-			for bn <= h.Number {
-				var ev chain.BlockEvent
-				if bn == h.Number {
-					ev = h
-				} else {
-					hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
-					if err != nil {
-						slog.Error("gap header, cursor stays at", "block", lastApplied, "err", err)
-						break
-					}
-					ev = chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash}
-				}
-				if lastAppliedHash != (common.Hash{}) && ev.Parent != lastAppliedHash {
-					if err := handleReorg(); err != nil {
-						slog.Error("reorg rollback failed, exiting", "err", err)
-						os.Exit(1)
-					}
-					bn = lastApplied + 1 // 回退后从新游标重来（continue 前重置）
-					continue
-				}
-				if err := processAndCommit(ev); err != nil {
-					slog.Error("block processing failed, cursor stays at", "block", lastApplied, "err", err)
-					break
-				}
-				bn = lastApplied + 1
+			if err := evaluateBackfill(affected); err != nil {
+				slog.Error("evaluation commit failed", "err", err)
 			}
 		}
 	}
