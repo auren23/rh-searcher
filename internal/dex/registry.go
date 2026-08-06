@@ -48,9 +48,36 @@ func (r *Registry) UpsertPool(state PoolState) {
 	defer r.mu.Unlock()
 	p := state.Pool()
 	addr := common.HexToAddress(p.ID)
+	if _, exists := r.pools[addr]; exists {
+		r.pools[addr] = state // 仅更新；byToken 不重复追加
+		return
+	}
 	r.pools[addr] = state
 	r.byToken[p.Token0] = append(r.byToken[p.Token0], addr)
 	r.byToken[p.Token1] = append(r.byToken[p.Token1], addr)
+}
+
+// Remove 删除池状态（reorg / 事务失败回滚临时注册用）。
+func (r *Registry) Remove(addr common.Address) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state, ok := r.pools[addr]
+	if !ok {
+		return
+	}
+	delete(r.pools, addr)
+	p := state.Pool()
+	r.byToken[p.Token0] = removeAddr(r.byToken[p.Token0], addr)
+	r.byToken[p.Token1] = removeAddr(r.byToken[p.Token1], addr)
+}
+
+func removeAddr(list []common.Address, addr common.Address) []common.Address {
+	for i, a := range list {
+		if a == addr {
+			return append(list[:i], list[i+1:]...)
+		}
+	}
+	return list
 }
 
 func (r *Registry) Pool(addr common.Address) PoolState {

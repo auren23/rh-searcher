@@ -94,6 +94,23 @@ func (d *DB) checkSchema(ctx context.Context) error {
 
 func (d *DB) Close() { d.pool.Close() }
 
+// CommitCandidatesForExistingBlock 只落盘候选（补扫聚合评估用）：
+// 不更新 checkpoint / processed_blocks / pools——这些已被逐块提交过，
+// 避免把已正确的 parent hash 覆盖为空。
+func (d *DB) CommitCandidatesForExistingBlock(ctx context.Context, block uint64, hash string, candidates []*arbitrage.Candidate) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for _, c := range candidates {
+		if err := insertCandidateTx(ctx, tx, c); err != nil {
+			return fmt.Errorf("candidate %s: %w", c.ID, err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
 // SaveCandidate 落盘套利候选（含拒绝的；完整可重放字段）。
 func (d *DB) SaveCandidate(ctx context.Context, c *arbitrage.Candidate) error {
 	return insertCandidateTx(ctx, d.pool, c)
@@ -147,6 +164,7 @@ func (d *DB) SaveLiquidationCandidate(ctx context.Context, c *liquidation.Candid
 // 新池 + 候选 + checkpoint（含 hash）。任一步失败整体回滚 ——
 // 游标只有在事务提交成功后才允许前进（exactly-once 的落盘侧）。
 func (d *DB) CommitBlockResult(ctx context.Context, block uint64, blockHash, parentHash string, pools []Pool, cands []*arbitrage.Candidate) error {
+	hash := blockHash
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -155,13 +173,17 @@ func (d *DB) CommitBlockResult(ctx context.Context, block uint64, blockHash, par
 
 	for _, sp := range pools {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing)
-			VALUES ($1,$2,$3,$4,$5,$6,$7)
+			INSERT INTO dex_pools (address, exchange, protocol, token0, token1, fee, tick_spacing,
+				canonical, created_block, created_block_hash)
+			VALUES ($1,$2,$3,$4,$5,$6,$7, TRUE, $8, $9)
 			ON CONFLICT (address) DO UPDATE SET
 				exchange = EXCLUDED.exchange, protocol = EXCLUDED.protocol,
 				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
-				fee = EXCLUDED.fee, tick_spacing = EXCLUDED.tick_spacing`,
-			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing); err != nil {
+				fee = EXCLUDED.fee, tick_spacing = EXCLUDED.tick_spacing,
+				canonical = TRUE, created_block = EXCLUDED.created_block,
+				created_block_hash = EXCLUDED.created_block_hash`,
+			sp.Address, sp.Exchange, sp.Protocol, sp.Token0, sp.Token1, sp.Fee, sp.TickSpacing,
+			block, nullableStr(hash)); err != nil {
 			return fmt.Errorf("pool %s: %w", sp.Address, err)
 		}
 	}
@@ -219,6 +241,13 @@ func (d *DB) RollbackToAncestor(ctx context.Context, strategy string, ancestor u
 		UPDATE opportunities SET canonical = FALSE
 		WHERE strategy = $1 AND canonical = TRUE AND observed_block > $2`,
 		StrategyArbitrage, ancestor); err != nil {
+		return err
+	}
+	// 孤块中创建并持久化的池标记非规范（Restore 时过滤，不进入 Graph）
+	if _, err := tx.Exec(ctx, `
+		UPDATE dex_pools SET canonical = FALSE
+		WHERE canonical = TRUE AND created_block > $1`,
+		ancestor); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `

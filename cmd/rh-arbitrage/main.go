@@ -328,6 +328,15 @@ func main() {
 		applies []func()          // 成功后按序执行
 		tickBounds [][2]int       // 成功后 ResyncMintBurn
 	}
+	// 回滚本区块临时注册的新池（事务失败/处理错误后调用；正式注册在 commit 成功后）
+	rollbackTempPools := func(pending map[common.Address]*pendingPool) {
+		for _, pp := range pending {
+			if pp.isNew {
+				reg.Remove(pp.pool.Address)
+				graph.Remove(pp.pool.Address)
+			}
+		}
+	}
 	// evaluate=false 时只取日志不评估（补扫路径用，避免重复评估同一当前状态）
 	processBlock := func(h chain.BlockEvent, evaluate bool) (*arbitrage.BlockResult, map[common.Address]struct{}, map[common.Address]*pendingPool, error) {
 		logs, err := readCli.FilterLogs(ctx, ethereum.FilterQuery{
@@ -338,12 +347,12 @@ func main() {
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("block %d getLogs: %w", h.Number, err)
 		}
+		res := &arbitrage.BlockResult{Block: h.Number, BlockHash: h.Hash}
 		for _, l := range logs {
 			if l.BlockHash != h.Hash {
 				return nil, nil, nil, fmt.Errorf("block %d hash mismatch: log=%s header=%s", h.Number, l.BlockHash.Hex(), h.Hash.Hex())
 			}
 		}
-		res := &arbitrage.BlockResult{Block: h.Number, BlockHash: h.Hash}
 		sort.Slice(logs, func(i, j int) bool {
 			if logs[i].TxIndex != logs[j].TxIndex {
 				return logs[i].TxIndex < logs[j].TxIndex
@@ -366,6 +375,7 @@ func main() {
 							slog.Debug("not a factory pool, skipped", "addr", l.Address.Hex())
 							continue
 						}
+						rollbackTempPools(pending)
 						return nil, nil, nil, fmt.Errorf("block %d pool %s verify: %w", h.Number, l.Address.Hex(), derr)
 					}
 					if pool.TickSpacing > 0 {
@@ -390,6 +400,7 @@ func main() {
 			apply, derr := adapter.DecodeLog(pp.pool, l)
 			if derr != nil {
 				// 已知事件解码失败 → 禁止推进（不允许永久跳过）
+				rollbackTempPools(pending)
 				return nil, nil, nil, fmt.Errorf("block %d decode %s tx=%d log=%d: %w",
 					h.Number, l.Address.Hex(), l.TxIndex, l.Index, derr)
 			}
@@ -441,6 +452,8 @@ func main() {
 	}
 
 	// DB 提交 + 成功后应用内存 + 推进游标（processAndCommit 与补扫共用）
+	// 提交失败 → 回滚本区块临时注册的新池（幽灵池不能留下：重试同一区块时
+	// 会被误判为旧池而不再写入 dex_pools）
 	commitResult := func(h chain.BlockEvent, res *arbitrage.BlockResult, pending map[common.Address]*pendingPool) error {
 		if sink != nil {
 			newPools := make([]storage.Pool, 0, len(res.NewPools))
@@ -452,10 +465,12 @@ func main() {
 				})
 			}
 			if err := sink.CommitBlockResult(ctx, h.Number, h.Hash.Hex(), h.Parent.Hex(), newPools, res.Candidates); err != nil {
+				rollbackTempPools(pending)
 				return fmt.Errorf("commit block %d: %w", h.Number, err)
 			}
 		} else {
 			if err := saveCheckpoint(storage.CheckpointBlocks, h.Number); err != nil {
+				rollbackTempPools(pending)
 				return err
 			}
 		}
@@ -592,7 +607,8 @@ func main() {
 			ReceivedAt:  time.Now().UnixMilli(),
 		}, pools)
 		if len(processed.Candidates) > 0 && sink != nil {
-			if err := sink.CommitBlockResult(ctx, ev.Number, ev.Hash.Hex(), "", nil, processed.Candidates); err != nil {
+			// 独立候选提交：不重写 checkpoint/processed_blocks（parent hash 已逐块保存）
+			if err := sink.CommitCandidatesForExistingBlock(ctx, ev.Number, ev.Hash.Hex(), processed.Candidates); err != nil {
 				slog.Error("backfill evaluation commit failed", "err", err)
 			}
 		}
@@ -617,7 +633,9 @@ func main() {
 				}
 			}
 			// 顺序处理 lastApplied+1 → h.Number；任一失败即停止推进（失败区块不被跳过）
-			for bn := lastApplied + 1; bn <= h.Number; bn++ {
+			// 每个待处理区块都校验 parent 衔接（漏 head 时 gap 第一块同样能发现 reorg）
+			bn := lastApplied + 1
+			for bn <= h.Number {
 				var ev chain.BlockEvent
 				if bn == h.Number {
 					ev = h
@@ -629,10 +647,19 @@ func main() {
 					}
 					ev = chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash}
 				}
+				if lastAppliedHash != (common.Hash{}) && ev.Parent != lastAppliedHash {
+					if err := handleReorg(); err != nil {
+						slog.Error("reorg rollback failed, exiting", "err", err)
+						os.Exit(1)
+					}
+					bn = lastApplied + 1 // 回退后从新游标重来（continue 前重置）
+					continue
+				}
 				if err := processAndCommit(ev); err != nil {
 					slog.Error("block processing failed, cursor stays at", "block", lastApplied, "err", err)
 					break
 				}
+				bn = lastApplied + 1
 			}
 		}
 	}

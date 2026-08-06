@@ -95,7 +95,11 @@ func TestMarkOrphansTwoLevelReorg(t *testing.T) {
 		h := common.BigToHash(new(big.Int).SetUint64(i)).Hex()
 		parent := prev
 		prev = h
-		if err := db.CommitBlockResult(ctx, i, h, parent, nil,
+		// 每个区块携带一个新池（孤块创建的池应被标记 canonical=false）
+		poolAddr := common.BigToHash(new(big.Int).SetUint64(1000 + i)).Hex()[24:]
+		pools := []Pool{{Address: "0x" + poolAddr, Exchange: "uniswap-v3",
+			Protocol: "v3", Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}}
+		if err := db.CommitBlockResult(ctx, i, h, parent, pools,
 			[]*arbitrage.Candidate{testCandidate(
 				"reorg-cand-"+h, i, h)}); err != nil {
 			t.Fatalf("commit %d: %v", i, err)
@@ -134,6 +138,25 @@ func TestMarkOrphansTwoLevelReorg(t *testing.T) {
 	}
 	if pbOrphan != 2 {
 		t.Fatalf("processed_blocks orphan=%d want 2", pbOrphan)
+	}
+	// 孤块中创建的池也被标记（dex_pools canonical）
+	var poolOrphan int
+	if err := db.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM dex_pools WHERE canonical = FALSE`).Scan(&poolOrphan); err != nil {
+		t.Fatal(err)
+	}
+	if poolOrphan != 2 {
+		t.Fatalf("dex_pools orphan=%d want 2", poolOrphan)
+	}
+	// 同高度 canonical 行不允许重复（历史表主键策略）
+	var dup int
+	if err := db.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT block_number FROM processed_blocks
+			WHERE strategy=$1 AND canonical = TRUE
+			GROUP BY block_number HAVING COUNT(*) > 1) t`,
+		CheckpointBlocks).Scan(&dup); err != nil || dup != 0 {
+		t.Fatalf("dup canonical rows=%d err=%v", dup, err)
 	}
 }
 

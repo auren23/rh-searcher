@@ -14,6 +14,27 @@ func NewGraph() *Graph {
 	return &Graph{adj: make(map[common.Address][]PoolRef), seenEdges: make(map[string]struct{})}
 }
 
+// Remove 删除池边（回滚临时注册用）。
+func (g *Graph) Remove(addr common.Address) {
+	if _, dup := g.seenEdges[addr.Hex()]; !dup {
+		return
+	}
+	delete(g.seenEdges, addr.Hex())
+	for tok, refs := range g.adj {
+		out := refs[:0]
+		for _, r := range refs {
+			if r.Address != addr {
+				out = append(out, r)
+			}
+		}
+		if len(out) == 0 {
+			delete(g.adj, tok)
+		} else {
+			g.adj[tok] = out
+		}
+	}
+}
+
 // Reset 清空图（reorg 重建用）。
 func (g *Graph) Reset() {
 	g.adj = make(map[common.Address][]PoolRef)
