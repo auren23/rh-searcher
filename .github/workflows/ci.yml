@@ -78,7 +78,7 @@ jobs:
         env:
           RH_TEST_PG_URL: postgres://rh:rh@localhost:5432/rh_sql_legacy
         run: |
-          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/testdata/legacy_schema.sql
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/testdata/schema_at_0001_legacy.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0002_shadow_schema_fix.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0003_opportunity_grouping.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0004_group_selected_unique.sql

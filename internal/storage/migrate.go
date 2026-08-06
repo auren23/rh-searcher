@@ -42,54 +42,32 @@ func discoverMigrations() ([]migrationFile, error) {
 	return out, nil
 }
 
-// verifyLegacyBaselineFingerprint 验证旧库确实完整应用了 0001..0011
-// （表、索引、列、默认值全部匹配才算 baseline 安全——不允许"有任意业务表
-// 就猜测迁移已完成"）。返回 (是否旧库, error)。
-func verifyLegacyBaselineFingerprint(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
-	var checks int
-	expect := 7 // 5 张业务表 + 0004 唯一索引 + 0011 默认值
-	// 1) 全部业务表存在
-	for _, tbl := range []string{"opportunities", "dex_pools", "strategy_checkpoints",
-		"processed_blocks", "block_affected_pools"} {
-		var ok bool
-		if err := conn.QueryRow(ctx, `
-			SELECT EXISTS (SELECT 1 FROM information_schema.tables
-				WHERE table_schema='public' AND table_name=$1)`, tbl).Scan(&ok); err != nil {
-			return false, err
-		}
-		if ok {
-			checks++
-		}
-	}
-	// 2) 0004 唯一索引
-	var idx bool
-	if err := conn.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='uq_opportunities_group_selected')
-	`).Scan(&idx); err != nil {
+// isLegacyDatabase 用共享的 verifySchemaAt0011 判断旧库是否完整到达 0011：
+// 与启动 checkSchema 完全同一套结构检查（不存在两套不一致的 Schema 认知）。
+func isLegacyDatabase(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
+	var recorded int
+	if err := conn.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&recorded); err != nil {
 		return false, err
 	}
-	if idx {
-		checks++
+	if recorded > 0 {
+		return false, nil // 正常续跑库
 	}
-	// 3) 0010/0011 gas_estimate_mode 默认 not_estimated（MAX 聚合保证恒有一行）
-	var def string
-	if err := conn.QueryRow(ctx, `
-		SELECT COALESCE(MAX(column_default), '') FROM information_schema.columns
-		WHERE table_name='opportunities' AND column_name='gas_estimate_mode'
-	`).Scan(&def); err != nil {
-		return false, err
+	err := verifySchemaAt0011(ctx, conn)
+	if err == nil {
+		return true, nil // 完整 0011 旧库
 	}
-	if strings.Contains(def, "not_estimated") {
-		checks++
+	// 结构不匹配：区分"全新库"（无任何表）与"残缺库"（失败关闭，不猜测）
+	var n int
+	if qerr := conn.QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema='public' AND table_name <> 'schema_migrations'
+	`).Scan(&n); qerr != nil {
+		return false, qerr
 	}
-	if checks == 0 {
-		return false, nil // 全新库
+	if n == 0 {
+		return false, nil // 全新库：从 0001 开始
 	}
-	if checks != expect {
-		return false, fmt.Errorf("legacy baseline fingerprint incomplete: %d/%d checks passed "+
-			"(refusing to guess migration state)", checks, expect)
-	}
-	return true, nil
+	return false, fmt.Errorf("legacy baseline refused: schema does not match 0011 fingerprint (%v)", err)
 }
 
 // Migrate 内置迁移 runner：Fresh-safe、幂等、并发安全。
@@ -125,7 +103,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	if recorded == 0 {
-		legacy, err := verifyLegacyBaselineFingerprint(ctx, conn)
+		legacy, err := isLegacyDatabase(ctx, conn)
 		if err != nil {
 			return err
 		}

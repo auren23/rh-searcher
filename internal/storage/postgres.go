@@ -39,115 +39,99 @@ func New(ctx context.Context, url string) (*DB, error) {
 	return db, nil
 }
 
-// checkSchema 版本检查：确认 opportunities 已含 shadow 运行所需列。
-// 旧库需手动执行 migrations/0001..0004（代码不会自动迁移）。
-func (d *DB) checkSchema(ctx context.Context) error {
-	var has bool
-	err := d.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM information_schema.columns
-			WHERE table_name = 'opportunities' AND column_name = 'opportunity_group_id'
-		)`).Scan(&has)
-	if err != nil {
-		return fmt.Errorf("schema check: %w", err)
+// Querier 查询接口（checkSchema / verifySchemaAt0011 共用，便于 migrate.go 复用）。
+type Querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// verifySchemaAt0011 校验数据库结构完整到达 0011（表/索引/列/默认值）。
+// Legacy baseline 与启动检查共用同一套判断——不允许两套不一致的结构认知。
+func verifySchemaAt0011(ctx context.Context, q Querier) error {
+	var checks int
+	expect := 12
+	// 5 张核心业务表
+	for _, tbl := range []string{"opportunities", "dex_pools", "strategy_checkpoints",
+		"processed_blocks", "block_affected_pools"} {
+		var ok bool
+		if err := q.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM information_schema.tables
+				WHERE table_schema='public' AND table_name=$1)`, tbl).Scan(&ok); err != nil {
+			return err
+		}
+		if ok {
+			checks++
+		}
 	}
-	if !has {
-		return fmt.Errorf("database schema out of date: run migrations 0001-0004 " +
-			"(internal/storage/migrations/) against this database before starting")
-	}
-	// 0004 的唯一索引必须存在（只查列无法证明 0004 已应用）
+	// 0004 唯一索引
 	var idx bool
-	err = d.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM pg_indexes WHERE indexname = 'uq_opportunities_group_selected'
-		)`).Scan(&idx)
-	if err != nil {
-		return fmt.Errorf("schema check: %w", err)
+	if err := q.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='uq_opportunities_group_selected')
+	`).Scan(&idx); err != nil {
+		return err
 	}
-	if !idx {
-		return fmt.Errorf("database schema out of date: migration 0004 " +
-			"(uq_opportunities_group_selected) not applied")
+	if idx {
+		checks++
 	}
-	// 0005 字段（block_hash / canonical）必须存在
-	var hasHash, hasCanonical bool
-	if err := d.pool.QueryRow(ctx, `
+	// 0005: strategy_checkpoints.hash 列 + opportunities.canonical
+	var h, p, canon bool
+	if err := q.QueryRow(ctx, `
 		SELECT
 			EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='strategy_checkpoints' AND column_name='block_hash'),
+			EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='strategy_checkpoints' AND column_name='parent_hash'),
 			EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='opportunities' AND column_name='canonical')
-	`).Scan(&hasHash, &hasCanonical); err != nil {
-		return fmt.Errorf("schema check: %w", err)
+	`).Scan(&h, &p, &canon); err != nil {
+		return err
 	}
-	if !hasHash || !hasCanonical {
-		return fmt.Errorf("database schema out of date: migration 0005 not applied")
+	if h && p && canon {
+		checks += 3
 	}
-	// 0006: processed_blocks（reorg 祖先查找）
-	var hasPb bool
-	if err := d.pool.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='processed_blocks')
-	`).Scan(&hasPb); err != nil {
-		return fmt.Errorf("schema check: %w", err)
-	}
-	if !hasPb {
-		return fmt.Errorf("database schema out of date: migration 0006 not applied")
-	}
-	// 0007: dex_pools 三列完整（部分执行的迁移不能通过）
+	// 0007: dex_pools 三列
 	var nPoolCols int
-	if err := d.pool.QueryRow(ctx, `
+	if err := q.QueryRow(ctx, `
 		SELECT COUNT(*) FROM information_schema.columns
 		WHERE table_name='dex_pools'
 		  AND column_name IN ('canonical', 'created_block', 'created_block_hash')
 	`).Scan(&nPoolCols); err != nil {
-		return fmt.Errorf("schema check: %w", err)
+		return err
 	}
-	if nPoolCols != 3 {
-		return fmt.Errorf("database schema out of date: migration 0007 not applied "+
-			"(dex_pools has %d/3 canonical columns)", nPoolCols)
+	if nPoolCols == 3 {
+		checks++
 	}
-	// 0008: block_affected_pools（评估队列）
-	var hasBap bool
-	if err := d.pool.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='block_affected_pools')
-	`).Scan(&hasBap); err != nil {
-		return fmt.Errorf("schema check: %w", err)
-	}
-	if !hasBap {
-		return fmt.Errorf("database schema out of date: migration 0008 not applied")
-	}
-	// 0009: provenance_source（溯源覆盖规则依赖）
-	var hasProv bool
-	if err := d.pool.QueryRow(ctx, `
+	// 0009: provenance_source
+	var prov bool
+	if err := q.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM information_schema.columns
 			WHERE table_name='dex_pools' AND column_name='provenance_source')
-	`).Scan(&hasProv); err != nil {
-		return fmt.Errorf("schema check: %w", err)
+	`).Scan(&prov); err != nil {
+		return err
 	}
-	if !hasProv {
-		return fmt.Errorf("database schema out of date: migration 0009 not applied")
+	if prov {
+		checks++
 	}
-	// 0010: gas_estimate_mode 列 + 0011 默认值（漏跑 0011 的库列存在但默认
-	// 仍是 historical——必须显式检查默认值）
-	var hasGasMode bool
-	if err := d.pool.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM information_schema.columns
-			WHERE table_name='opportunities' AND column_name='gas_estimate_mode')
-	`).Scan(&hasGasMode); err != nil {
-		return fmt.Errorf("schema check: %w", err)
-	}
-	if !hasGasMode {
-		return fmt.Errorf("database schema out of date: migration 0010 not applied")
-	}
+	// 0011: gas_estimate_mode 默认 not_estimated
 	var def string
-	if err := d.pool.QueryRow(ctx, `
-		SELECT COALESCE(column_default, '') FROM information_schema.columns
+	if err := q.QueryRow(ctx, `
+		SELECT COALESCE(MAX(column_default), '') FROM information_schema.columns
 		WHERE table_name='opportunities' AND column_name='gas_estimate_mode'
 	`).Scan(&def); err != nil {
-		return fmt.Errorf("schema check: %w", err)
+		return err
 	}
-	if !strings.Contains(def, "not_estimated") {
-		return fmt.Errorf("database schema out of date: migration 0011 not applied "+
-			"(gas_estimate_mode default %q, want not_estimated)", def)
+	if strings.Contains(def, "not_estimated") {
+		checks++
 	}
-	// 版本门控：全部必须版本都必须在场（MAX 门槛无法发现中间缺失）。
+	if checks != expect {
+		return fmt.Errorf("schema not at 0011: %d/%d structure checks passed", checks, expect)
+	}
+	return nil
+}
+
+// 旧库需手动执行 migrations/0001..0004（代码不会自动迁移）。
+func (d *DB) checkSchema(ctx context.Context) error {
+	// 结构部分（0001..0011）与 legacy baseline 共用同一套判断
+	if err := verifySchemaAt0011(ctx, d.pool); err != nil {
+		return fmt.Errorf("database schema out of date: %w", err)
+	}
+	// 版本门控：全部必须版本都在场（MAX 门槛无法发现中间缺失）。
 	// 另检查不存在高于程序支持的未知版本（降级风险）。
 	var present, unknown int
 	if err := d.pool.QueryRow(ctx, `
