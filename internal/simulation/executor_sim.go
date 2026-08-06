@@ -23,6 +23,9 @@ const (
 	DecisionLocalCandidate  = "local_candidate"  // 仅本地数学模型，未过链上模拟
 	DecisionSimulationOK    = "simulation_accepted"
 	DecisionSimulationRejected = "simulation_rejected"
+	// DecisionSimulationCostApprox 模拟成功但 gas 非 historical：
+	// 记录利润，不得进入正式 Selected / 净 EV 统计
+	DecisionSimulationCostApprox = "simulation_valid_cost_approx"
 )
 
 // ExecutorSimulator 用真实 executeV3Cycle calldata 做 eth_call 模拟。
@@ -172,6 +175,10 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	}
 	gas, err = s.cli.EstimateGas(ctx, estMsg)
 	if err != nil {
+		if isInfraError(err) {
+			// 估算 RPC 基础设施故障：区块保持未评估，由上层重试
+			return nil, fmt.Errorf("estimateGas (infra): %w", err)
+		}
 		gas = s.maxGas // 估算失败用上限（保守）；不得参与正式 EV 统计
 		gasMode = GasEstimateMax
 	}

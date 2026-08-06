@@ -188,7 +188,7 @@ func insertCandidateTx(ctx context.Context, q interface {
 		nullableStr(c.CalldataHash), nullableUint64(c.StateBlock), nullableUint64(c.SimulationBlock),
 		nullableStr(c.OpportunityGroupID), nullableInt(c.Rank), c.Selected,
 		nullableUint64(c.L1GasUnits), nullableBigInt(c.L2BaseFeeWei), nullableBigInt(c.L1BaseFeeEstimateWei),
-		strOr(c.GasEstimateMode, "historical"),
+		strOr(c.GasEstimateMode, "not_estimated"),
 	)
 	return err
 }
@@ -243,10 +243,20 @@ func (d *DB) CommitBlockIngest(ctx context.Context, block uint64, blockHash, par
 				token0 = EXCLUDED.token0, token1 = EXCLUDED.token1,
 				fee = EXCLUDED.fee, tick_spacing = EXCLUDED.tick_spacing,
 				canonical = TRUE,
-				created_block = CASE WHEN dex_pools.created_block IS NULL
-					THEN EXCLUDED.created_block ELSE dex_pools.created_block END,
-				created_block_hash = CASE WHEN dex_pools.created_block_hash IS NULL
-					THEN EXCLUDED.created_block_hash ELSE dex_pools.created_block_hash END,
+				-- 溯源升级必须原子：incoming=pool_created_log 且现有非权威时，
+				-- block/hash/source 一起替换（否则观察块会被"认证"成权威来源）
+				created_block = CASE
+					WHEN COALESCE(EXCLUDED.provenance_source, '') = 'pool_created_log'
+						AND COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'
+					THEN EXCLUDED.created_block
+					WHEN dex_pools.created_block IS NULL THEN EXCLUDED.created_block
+					ELSE dex_pools.created_block END,
+				created_block_hash = CASE
+					WHEN COALESCE(EXCLUDED.provenance_source, '') = 'pool_created_log'
+						AND COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'
+					THEN EXCLUDED.created_block_hash
+					WHEN dex_pools.created_block_hash IS NULL THEN EXCLUDED.created_block_hash
+					ELSE dex_pools.created_block_hash END,
 				provenance_source = CASE
 					WHEN COALESCE(EXCLUDED.provenance_source, '') = 'pool_created_log'
 						AND COALESCE(dex_pools.provenance_source, '') <> 'pool_created_log'

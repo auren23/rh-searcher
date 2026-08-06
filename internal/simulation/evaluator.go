@@ -79,6 +79,11 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 	net := new(big.Int).Sub(res.Profit, gasCostWei)
 	net.Sub(net, e.safetyMarginWei)
 	c.ExpectedNetProfit = net
+	// gas 成本非 historical（latest 近似或 maxGas 兜底）：
+	// 利润数据保留，但不得判定为正式 accepted/selected
+	if res.GasEstimateMode != GasEstimateHistory {
+		return DecisionSimulationCostApprox, "gas cost approximate (" + string(res.GasEstimateMode) + ")", net, nil
+	}
 	slog.Debug("simulation result",
 		"profit_wei", res.Profit.String(), "gas_used", res.GasUsed,
 		"gas_price_wei", res.GasPriceWei.String(), "net_wei", net.String(),

@@ -251,6 +251,14 @@ func TestSnapshotQuotesHistoricalState(t *testing.T) {
 	live.Tick = 0
 	reg.UpsertPool(v3.State(live))
 	graph.AddPool(live.Pool(), live.Address)
+	// 第二个同对池：WETH→X→WETH 两跳环需要两个池
+	live2 := v3.NewPoolFromMeta(common.Address{4}, "uniswap-v3",
+		common.Address{2}, common.Address{3}, 3000, 60)
+	live2.SqrtPriceX96 = new(big.Int).SetUint64(200e6)
+	live2.Liquidity = big.NewInt(1e18)
+	live2.Tick = 0
+	reg.UpsertPool(v3.State(live2))
+	graph.AddPool(live2.Pool(), live2.Address)
 
 	fv := &fakeV3{}
 	searcher := NewLocalSearcher(graph, reg, fv, common.Address{2})
@@ -292,28 +300,32 @@ func TestSnapshotQuotesHistoricalState(t *testing.T) {
 	if !allZeroProfit {
 		t.Fatalf("gross profit must come from the historical snapshot (price 100 => 0 profit)")
 	}
-	// 重放：同一区块两次评估 → 候选 ID/RouteJSON 完全一致（确定性）
-	snapB, err := searcher.SnapshotRoute(ctx, r, 100)
+	// 完整引擎重放：ProcessBlockAt 两次（finalizeCandidate 生成真实 ID）。
+	// 断言 ID/RouteJSON 非空且两次完全一致，InputAmount/GrossProfit 一致。
+	ev := SwapEvent{BlockNumber: 100, BlockHash: common.Hash{0x64}, ReceivedAt: 0}
+	engine := NewEngine(Config{ChainID: 4663, WETH: common.Address{2}, MinProfitWei: big.NewInt(1),
+		TopK: 3, Mode: "shadow"}, nil, searcher, &fakeEvaluator{}, &fakeExecutor{})
+	res1, err := engine.ProcessBlock(ctx, ev, []common.Address{{1}})
 	if err != nil {
-		t.Fatalf("snapshotB: %v", err)
+		t.Fatalf("process1: %v", err)
 	}
-	candsB := searcher.TopKOptimizeAt(ctx, r, snapB, 3, 100, 0)
-	if len(cands) != len(candsB) {
-		t.Fatalf("replay candidate count %d != %d", len(cands), len(candsB))
+	res2, err := engine.ProcessBlock(ctx, ev, []common.Address{{1}})
+	if err != nil {
+		t.Fatalf("process2: %v", err)
 	}
-	for i := range cands {
-		if cands[i].ID != candsB[i].ID || cands[i].RouteJSON != candsB[i].RouteJSON {
-			t.Fatalf("replay candidate %d differs: %s vs %s", i, cands[i].ID, candsB[i].ID)
+	if len(res1.Candidates) != len(res2.Candidates) || len(res1.Candidates) == 0 {
+		t.Fatalf("candidate counts %d vs %d (want equal, non-zero)", len(res1.Candidates), len(res2.Candidates))
+	}
+	for i := range res1.Candidates {
+		c1, c2 := res1.Candidates[i], res2.Candidates[i]
+		if c1.ID == "" {
+			t.Fatalf("candidate %d ID is empty", i)
 		}
-	}
-	// 再次重放：相同快照（确定性）
-	snap2, err := searcher.SnapshotRoute(ctx, Route{
-		Hops: []Hop{{Pool: common.Address{1}, TokenIn: common.Address{2}, TokenOut: common.Address{3}}},
-	}, 100)
-	if err != nil {
-		t.Fatalf("snapshot2: %v", err)
-	}
-	if snap2.Hops[0].Pool.SqrtPriceX96.Cmp(snap.Hops[0].Pool.SqrtPriceX96) != 0 {
-		t.Fatalf("replay not deterministic")
+		if c1.ID != c2.ID || c1.RouteJSON != c2.RouteJSON {
+			t.Fatalf("replay candidate %d differs (id %q vs %q)", i, c1.ID, c2.ID)
+		}
+		if c1.InputAmount.Cmp(c2.InputAmount) != 0 || c1.GrossProfit.Cmp(c2.GrossProfit) != 0 {
+			t.Fatalf("replay candidate %d amounts differ", i)
+		}
 	}
 }

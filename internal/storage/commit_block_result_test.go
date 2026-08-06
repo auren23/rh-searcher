@@ -424,3 +424,69 @@ func TestCommitPoolsOverridesFallbackProvenance(t *testing.T) {
 		t.Fatalf("provenance overwritten: %d %v", cb, ch)
 	}
 }
+
+// P0-1: CommitBlockIngest 的权威溯源升级必须原子——block/hash/source
+// 一起替换（观察块不能被"认证"成权威来源）。
+func TestCommitBlockIngestAtomicProvenanceUpgrade(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	if _, err := db.pool.Exec(ctx, `DELETE FROM dex_pools; DELETE FROM strategy_checkpoints;`); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	addr := "0x0000000000000000000000000000000000000dd1"
+	base := Pool{Address: addr, Exchange: "uniswap-v3", Protocol: "v3",
+		Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}
+	// 1) 观察块兜底：110 / hash110 / observed_swap_fallback
+	if err := db.CommitBlockIngest(ctx, 110, "0x6e", "0x6d", []Pool{base}, nil); err != nil {
+		t.Fatalf("ingest fallback: %v", err)
+	}
+	// 2) 真实日志：42 / 0x2a / pool_created_log → 三字段必须一起变
+	authoritative := base
+	authoritative.CreatedBlock = 42
+	authoritative.CreatedBlockHash = "0x2a"
+	authoritative.ProvenanceSource = "pool_created_log"
+	if err := db.CommitBlockIngest(ctx, 130, "0x82", "0x81", []Pool{authoritative}, nil); err != nil {
+		t.Fatalf("ingest authoritative: %v", err)
+	}
+	var cb uint64
+	var ch, prov *string
+	if err := db.pool.QueryRow(ctx,
+		`SELECT created_block, created_block_hash, provenance_source FROM dex_pools WHERE address=$1`, addr).
+		Scan(&cb, &ch, &prov); err != nil {
+		t.Fatal(err)
+	}
+	if cb != 42 || ch == nil || *ch != "0x2a" || prov == nil || *prov != "pool_created_log" {
+		t.Fatalf("after upgrade = %d %q %q, want 42 0x2a pool_created_log", cb, deref(ch), deref(prov))
+	}
+	// 3) 后续观察块（observed_swap_fallback）不能降级权威
+	if err := db.CommitBlockIngest(ctx, 150, "0x96", "0x95", []Pool{base}, nil); err != nil {
+		t.Fatalf("ingest fallback2: %v", err)
+	}
+	if err := db.pool.QueryRow(ctx,
+		`SELECT created_block, created_block_hash, provenance_source FROM dex_pools WHERE address=$1`, addr).
+		Scan(&cb, &ch, &prov); err != nil {
+		t.Fatal(err)
+	}
+	if cb != 42 || ch == nil || *ch != "0x2a" || prov == nil || *prov != "pool_created_log" {
+		t.Fatalf("after fallback2 = %d %q %q, want unchanged 42 0x2a pool_created_log", cb, deref(ch), deref(prov))
+	}
+}
+
+// P0-2: 0011 语义——空 gas 模式落库为 not_estimated（不是 historical）
+func TestGasModeDefaultNotEstimated(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	c := testCandidate("gas-mode-1", 1, "0x1")
+	c.GasEstimateMode = "" // 未进入模拟的拒绝候选
+	if err := db.SaveCandidate(ctx, c); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	var mode string
+	if err := db.pool.QueryRow(ctx,
+		`SELECT gas_estimate_mode FROM opportunities WHERE id=$1`, c.ID).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "not_estimated" {
+		t.Fatalf("gas_estimate_mode=%q want not_estimated", mode)
+	}
+}

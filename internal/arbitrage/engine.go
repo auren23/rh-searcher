@@ -338,6 +338,9 @@ func MarshalRoute(hops []Hop) string {
 }
 
 // SimulationAccepted 通过链上模拟的决策值（live 发送门槛）。
+// SimulationCostApprox 模拟成功但 gas 成本非 historical（估算近似/兜底）：
+// 记录利润数据，但不得进入正式 Selected / 净 EV 统计。
+const SimulationCostApprox = "simulation_valid_cost_approx"
 const SimulationAccepted = "simulation_accepted"
 
 // routeRefreshFailures 状态刷新失败计数（轻量指标，无 Prometheus 依赖）。
