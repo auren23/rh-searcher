@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jackc/pgx/v5"
@@ -123,7 +124,8 @@ func (d *DB) checkSchema(ctx context.Context) error {
 	if !hasProv {
 		return fmt.Errorf("database schema out of date: migration 0009 not applied")
 	}
-	// 0010: gas_estimate_mode（成本质量标记）
+	// 0010: gas_estimate_mode 列 + 0011 默认值（漏跑 0011 的库列存在但默认
+	// 仍是 historical——必须显式检查默认值）
 	var hasGasMode bool
 	if err := d.pool.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM information_schema.columns
@@ -133,6 +135,28 @@ func (d *DB) checkSchema(ctx context.Context) error {
 	}
 	if !hasGasMode {
 		return fmt.Errorf("database schema out of date: migration 0010 not applied")
+	}
+	var def string
+	if err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(column_default, '') FROM information_schema.columns
+		WHERE table_name='opportunities' AND column_name='gas_estimate_mode'
+	`).Scan(&def); err != nil {
+		return fmt.Errorf("schema check: %w", err)
+	}
+	if !strings.Contains(def, "not_estimated") {
+		return fmt.Errorf("database schema out of date: migration 0011 not applied "+
+			"(gas_estimate_mode default %q, want not_estimated)", def)
+	}
+	// 0012: schema_migrations 版本表（版本门控，不再猜列存在）
+	var latest string
+	if err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(MAX(version), '') FROM schema_migrations
+	`).Scan(&latest); err != nil {
+		return fmt.Errorf("schema check: %w", err)
+	}
+	if latest < "0011" {
+		return fmt.Errorf("database schema out of date: migration 0012 not applied "+
+			"(schema_migrations latest %q)", latest)
 	}
 	return nil
 }

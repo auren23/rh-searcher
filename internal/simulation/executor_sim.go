@@ -9,9 +9,11 @@ import (
 	"math/big"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core/types"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -35,7 +37,9 @@ const (
 // ExecutorSimulator 用真实 executeV3Cycle calldata 做 eth_call 模拟。
 // 模拟交易与最终发送交易逐字节相同（不允许"模拟专用简化路径"）。
 type ExecutorSimulator struct {
-	cli       *ethclient.Client
+	cli *ethclient.Client
+	// histUnsupported: 节点明确不支持历史估算后缓存（整个运行期不再尝试）
+	histUnsupported atomic.Bool
 	contract  common.Address // ArbitrageExecutor 地址
 	from      common.Address // 执行钱包（hot wallet）
 	maxGas    uint64
@@ -55,7 +59,8 @@ type GasEstimateMode string
 const (
 	GasEstimateLatest  GasEstimateMode = "latest_approximation"
 	GasEstimateMax     GasEstimateMode = "max_gas_fallback"
-	GasEstimateHistory GasEstimateMode = "historical"
+	// GasEstimateComplete = gas used + gas price 均来自历史区块（正式 EV 唯一准入）
+	GasEstimateComplete GasEstimateMode = "historical_complete"
 )
 
 type SimResult struct {
@@ -83,6 +88,26 @@ func (s *ExecutorSimulator) VerifyBlockHash(ctx context.Context, block uint64, w
 		return fmt.Errorf("block hash mismatch at %d: sim=%s read=%s", block, hdr.Hash().Hex(), want.Hex())
 	}
 	return nil
+}
+
+// isUnsupportedHistoricalEstimate 判断节点是否明确不支持历史估算
+// （-32601 method not found / -32602 invalid params / not supported）。
+// 只有这类错误允许 fallback latest；其余按基础设施或一致性错误处理。
+func isUnsupportedHistoricalEstimate(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"method not found", "-32601", "invalid params", "-32602",
+		"too many arguments", "wrong number of arguments",
+		"not supported", "unsupported",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // isInfraError 判断是否为可重试的基础设施错误（RPC 超时/限流/断连/节点落后），
@@ -131,13 +156,16 @@ func isRevertError(err error) bool {
 // 返回 error = 基础设施错误（可重试，调用方不得推进游标）；
 // RevertMsg 非空 = 真实 revert（确定性拒绝，可落盘）。
 func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate, chainID uint64, block *big.Int) (*SimResult, error) {
-	// deadline 固定到历史区块时间（重放确定性）
+	// 历史 header 只读一次：deadline 时间 + base fee 共用（P0-3：
+	// 正式 historical 成本禁止用硬编码默认 gas price）
+	var historicalHeader *types.Header
 	var blockTime int64
 	if block != nil {
 		hdr, herr := s.cli.HeaderByNumber(ctx, block)
 		if herr != nil {
 			return nil, fmt.Errorf("header at %d: %w", block.Uint64(), herr)
 		}
+		historicalHeader = hdr
 		blockTime = int64(hdr.Time)
 	}
 	calldata, err := BuildExecuteV3CycleCalldataAt(c, chainID, blockTime)
@@ -166,37 +194,68 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 		return &SimResult{RevertMsg: fmt.Sprintf("short return %d bytes", len(out)), CalldataHash: hashHex(calldata)}, nil
 	}
 	profit := new(big.Int).SetBytes(out[:32])
-	// Gas 估算在 latest 状态执行：模拟 calldata 的 deadline 是历史时间（+120s），
-	// 在 latest 状态必然过期 revert（DeadlinePassed）→ 用独立 calldata 估算
-	// （仅 deadline 不同，gas 影响可忽略）。估算仍标记 latest_approximation。
+	// gasPrice：latest/近似路径用 SuggestGasPrice 或默认；
+	// historical_complete 路径在后面用历史 header base fee 覆盖
+	gasPrice := big.NewInt(1e8) // 0.1 gwei 保守默认（仅近似路径，不进入正式 EV）
+	if block == nil {
+		if g, gerr := s.cli.SuggestGasPrice(ctx); gerr == nil && g.Sign() > 0 {
+			gasPrice = g
+		}
+	}
+	// Gas 估算：historical 尝试必须用原始 msg（历史 deadline 的历史 calldata）——
+	// 与保存的 calldata_hash 严格对应、重放确定。只有 latest fallback 才用
+	// fresh-deadline estMsg（latest 状态下历史 deadline 必然 DeadlinePassed）。
 	gasMode := GasEstimateLatest
 	gas := uint64(0)
-	estMsg := msg
+	var estMsg ethereum.CallMsg
 	if block != nil {
 		if estCalldata, cerr := BuildExecuteV3CycleCalldata(c, chainID); cerr == nil {
 			estMsg = ethereum.CallMsg{From: s.from, To: &s.contract, Gas: s.maxGas, Data: estCalldata}
 		}
-	}
-	if block != nil {
-		// 先尝试固定历史区块估算（eth_estimateGas(msg, block)，Geth/archive 支持）：
-		// 成功 → 真正的 historical 成本，可参与正式 EV 统计
-		if gas, err = estimateGasAt(ctx, s.cli, estMsg, block); err == nil {
-			gasMode = GasEstimateHistory
+		// 节点明确不支持后整个运行期不再尝试 historical（避免每次猜测/轰炸）
+		if !s.histUnsupported.Load() {
+			gas, err = estimateGasAt(ctx, s.cli, msg, block)
+			switch {
+			case err == nil:
+				// 历史估算成功：gas price 必须来自同一历史 header 的 base fee，
+				// 否则不算完整 historical（禁止默认价进入正式数据）
+				if historicalHeader == nil || historicalHeader.BaseFee == nil || historicalHeader.BaseFee.Sign() <= 0 {
+					return nil, fmt.Errorf("historical block %d missing base fee", block.Uint64())
+				}
+				gasPrice = new(big.Int).Set(historicalHeader.BaseFee)
+				gasMode = GasEstimateComplete
+			case isUnsupportedHistoricalEstimate(err):
+				// 明确不支持（-32601/-32602/not supported）→ latest 近似，
+				// 并缓存：后续区块直接走 latest
+				slog.Debug("historical estimateGas unsupported, using latest approximation", "err", err)
+				s.histUnsupported.Store(true)
+				gas, err = s.cli.EstimateGas(ctx, estMsg)
+				if err != nil {
+					if isInfraError(err) {
+						return nil, fmt.Errorf("estimateGas (infra): %w", err)
+					}
+					gas = s.maxGas
+					gasMode = GasEstimateMax
+				}
+			case isInfraError(err):
+				// 基础设施故障：区块保持未评估，由上层重试
+				return nil, fmt.Errorf("historical estimateGas (infra): %w", err)
+			default:
+				// 未知/矛盾错误：宁可重试，不可误认证
+				return nil, fmt.Errorf("historical estimateGas (inconsistent): %w", err)
+			}
 		} else {
-			// 节点不支持历史估算（常见公共 RPC）→ 回到 latest 近似
-			slog.Debug("historical estimateGas unavailable", "err", err)
 			gas, err = s.cli.EstimateGas(ctx, estMsg)
 			if err != nil {
 				if isInfraError(err) {
-					// 估算 RPC 基础设施故障：区块保持未评估，由上层重试
 					return nil, fmt.Errorf("estimateGas (infra): %w", err)
 				}
-				gas = s.maxGas // 估算失败用上限（保守）；不得参与正式 EV 统计
+				gas = s.maxGas
 				gasMode = GasEstimateMax
 			}
 		}
 	} else {
-		gas, err = s.cli.EstimateGas(ctx, estMsg)
+		gas, err = s.cli.EstimateGas(ctx, msg)
 		if err != nil {
 			if isInfraError(err) {
 				return nil, fmt.Errorf("estimateGas (infra): %w", err)
@@ -208,14 +267,7 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 	// Gas 价格固定到历史块（Arbitrum L2 base fee，读 header.BaseFee at block）：
 	// 成本必须与池状态/eth_call 同一区块，不能用调用时的 latest 污染历史利润。
 	// 读取失败视为基础设施错误（可重试），不静默 fallback。
-	gasPrice := big.NewInt(1e8) // 0.1 gwei 保守默认
-	if block != nil {
-		if hdr, herr := s.cli.HeaderByNumber(ctx, block); herr == nil && hdr.BaseFee != nil && hdr.BaseFee.Sign() > 0 {
-			gasPrice = hdr.BaseFee
-		}
-	} else if g, gerr := s.cli.SuggestGasPrice(ctx); gerr == nil && g.Sign() > 0 {
-		gasPrice = g
-	}
+
 	// Arbitrum L1 data 费用：NodeInterface 虚拟合约 (0x...C8) 的 gasEstimateL1Component(to, contractCreation, data)
 	// 返回 (gasEstimateForL1, baseFee, l1BaseFeeEstimate)；eth_gasEstimateL1Component RPC 方法不存在。
 	var l1GasUnits uint64
@@ -302,11 +354,14 @@ func buildExecuteV3CycleCalldata(c *arbitrage.Candidate, chainID uint64, deadlin
 		Pool     common.Address
 		TokenIn  common.Address
 		TokenOut common.Address
-		Fee      uint32
+		// ABI uint24 的 Go 类型是 *big.Int（非 8/16/32/64 的 uint 都映射到 big.Int）——
+		// 用 uint32 打包会报 "cannot use uint32 as type ptr"
+		Fee *big.Int
 	}
 	hops := make([]hop, 0, len(c.Route))
 	for _, h := range c.Route {
-		hops = append(hops, hop{Pool: h.Pool, TokenIn: h.TokenIn, TokenOut: h.TokenOut, Fee: h.Fee})
+		hops = append(hops, hop{Pool: h.Pool, TokenIn: h.TokenIn, TokenOut: h.TokenOut,
+			Fee: new(big.Int).SetUint64(uint64(h.Fee))})
 	}
 	minProfit := big.NewInt(1) // 模拟时最小利润门槛：只要能盈利即可；真实门槛在 Evaluate 决策
 	if c.ExpectedNetProfit != nil && c.ExpectedNetProfit.Sign() > 0 {

@@ -81,7 +81,7 @@ func (e *SimulationEvaluator) Evaluate(ctx context.Context, c *arbitrage.Candida
 	c.ExpectedNetProfit = net
 	// gas 成本非 historical（latest 近似或 maxGas 兜底）：
 	// 利润数据保留，但不得判定为正式 accepted/selected
-	if res.GasEstimateMode != GasEstimateHistory {
+	if res.GasEstimateMode != GasEstimateComplete {
 		return DecisionSimulationCostApprox, "gas cost approximate (" + string(res.GasEstimateMode) + ")", net, nil
 	}
 	slog.Debug("simulation result",
