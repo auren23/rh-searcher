@@ -30,7 +30,13 @@ jobs:
       - name: Build
         run: go build ./...
       - name: Vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          # 禁止旧的 checkpoint 策略名（命名空间化后旧名会破坏重启恢复）
+          ! grep -R 'heights\["pools"\]' cmd/
+          ! grep -R 'saveCheckpoint("blocks"' cmd/
+          ! grep -R 'ckpt.Save("pools"' cmd/
+          ! grep -R 'heights\["blocks"\]' cmd/
       - name: Test (unit)
         run: go test ./...
       - name: Test (race)
@@ -44,6 +50,7 @@ jobs:
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0003_opportunity_grouping.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0004_group_selected_unique.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0005_reorg_checkpoint.sql
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0006_reorg_history.sql
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q route_json
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q opportunity_group_id
           psql "$RH_TEST_PG_URL" -c "\d dex_pools" | grep -q tick_spacing
@@ -57,6 +64,7 @@ jobs:
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0003_opportunity_grouping.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0004_group_selected_unique.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0005_reorg_checkpoint.sql
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0006_reorg_history.sql
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q route_json
           psql "$RH_TEST_PG_URL" -c "SELECT 1 FROM information_schema.table_constraints WHERE constraint_name='execution_attempts_opportunity_id_fkey'" | grep -q 1
           go test ./internal/storage/ -run TestSaveLocalRejectedCandidate -v

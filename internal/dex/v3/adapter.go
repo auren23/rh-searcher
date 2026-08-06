@@ -4,6 +4,7 @@ package v3
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -446,6 +447,10 @@ func (a *Adapter) QuoteExactIn(p *Pool, tokenIn common.Address, amountIn *big.In
 
 
 
+// ErrNotFactoryPool 表示地址不属于本 Factory（确认非本池，可安全跳过；
+// 区别于 RPC 类错误——那些必须阻止区块游标推进）。
+var ErrNotFactoryPool = errors.New("not a factory pool")
+
 // PoolByAddress 按地址构造池并读取 token0/token1/fee/tickSpacing（含返回长度校验 + Factory 归属验证）。
 func (a *Adapter) PoolByAddress(ctx context.Context, addr common.Address) (*Pool, error) {
 	read := func(data []byte) ([]byte, error) {
@@ -479,8 +484,11 @@ func (a *Adapter) PoolByAddress(ctx context.Context, addr common.Address) (*Pool
 	args := append(append(append(sel,
 		leftPad(t0raw[12:32])...), leftPad(t1raw[12:32])...), leftPad(feeraw[29:32])...)
 	got, err := a.cli.CallContract(ctx, ethereum.CallMsg{To: &a.factory, Data: args}, nil)
-	if err != nil || len(got) < 32 || common.BytesToAddress(got[12:32]) != addr {
-		return nil, fmt.Errorf("pool %s not verified by factory %s", addr.Hex(), a.factory.Hex())
+	if err != nil {
+		return nil, fmt.Errorf("pool %s factory check: %w", addr.Hex(), err)
+	}
+	if len(got) < 32 || common.BytesToAddress(got[12:32]) != addr {
+		return nil, fmt.Errorf("%w: pool %s", ErrNotFactoryPool, addr.Hex())
 	}
 	ts := int(new(big.Int).SetBytes(tsraw[29:32]).Int64())
 	if ts <= 0 {

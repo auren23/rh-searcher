@@ -9,6 +9,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -77,6 +78,16 @@ func (d *DB) checkSchema(ctx context.Context) error {
 	}
 	if !hasHash || !hasCanonical {
 		return fmt.Errorf("database schema out of date: migration 0005 not applied")
+	}
+	// 0006: processed_blocks（reorg 祖先查找）
+	var hasPb bool
+	if err := d.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='processed_blocks')
+	`).Scan(&hasPb); err != nil {
+		return fmt.Errorf("schema check: %w", err)
+	}
+	if !hasPb {
+		return fmt.Errorf("database schema out of date: migration 0006 not applied")
 	}
 	return nil
 }
@@ -169,6 +180,44 @@ func (d *DB) CommitBlockResult(ctx context.Context, block uint64, blockHash, par
 			updated_at = now()`,
 		block, nullableStr(blockHash), nullableStr(parentHash)); err != nil {
 		return fmt.Errorf("checkpoint: %w", err)
+	}
+	// 规范区块历史（reorg 共同祖先查找）；同 hash 重处理 → 恢复 canonical
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO processed_blocks (strategy, block_number, block_hash, parent_hash, canonical)
+		VALUES ('` + CheckpointBlocks + `', $1, $2, COALESCE($3, ''), TRUE)
+		ON CONFLICT (strategy, block_hash) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			parent_hash = EXCLUDED.parent_hash,
+			canonical = TRUE`,
+		block, nullableStr(blockHash), nullableStr(parentHash)); err != nil {
+		return fmt.Errorf("processed_blocks: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// QueryRow 执行单行查询（reorg 祖先查找用）。
+func (d *DB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return d.pool.QueryRow(ctx, sql, args...)
+}
+
+// MarkOrphans 在同一事务内标记孤块（processed_blocks + opportunities）：
+// 重处理新链时 CommitBlockResult 会写入新 canonical 行/候选，旧数据保留。
+func (d *DB) MarkOrphans(ctx context.Context, strategy string, aboveBlock uint64) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		UPDATE processed_blocks SET canonical = FALSE
+		WHERE strategy = $1 AND canonical = TRUE AND block_number > $2`,
+		strategy, aboveBlock); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE opportunities SET canonical = FALSE
+		WHERE observed_block > $1`, aboveBlock); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }

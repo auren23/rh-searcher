@@ -62,20 +62,32 @@ func (p *Pool) Pool() dex.Pool {
 }
 
 // Clone 深拷贝（事件应用前使用；commit 成功前不污染 Registry 状态）。
+// cloneBig nil 安全拷贝（惰性 Pool 的 slot0/liquidity 在首次事件前可能为 nil）。
+func cloneBig(v *big.Int) *big.Int {
+	if v == nil {
+		return nil
+	}
+	return new(big.Int).Set(v)
+}
+
 func (p *Pool) Clone() *Pool {
 	np := *p
-	np.Liquidity = new(big.Int).Set(p.Liquidity)
-	np.SqrtPriceX96 = new(big.Int).Set(p.SqrtPriceX96)
+	np.Liquidity = cloneBig(p.Liquidity)
+	np.SqrtPriceX96 = cloneBig(p.SqrtPriceX96)
 	np.ticks = make(map[int]*Tick, len(p.ticks))
 	for k, v := range p.ticks {
+		if v == nil {
+			np.ticks[k] = nil
+			continue
+		}
 		np.ticks[k] = &Tick{
-			LiquidityGross: new(big.Int).Set(v.LiquidityGross),
-			LiquidityNet:   new(big.Int).Set(v.LiquidityNet),
+			LiquidityGross: cloneBig(v.LiquidityGross),
+			LiquidityNet:   cloneBig(v.LiquidityNet),
 		}
 	}
 	np.bitmap = make(map[int64]*big.Int, len(p.bitmap))
 	for k, v := range p.bitmap {
-		np.bitmap[k] = new(big.Int).Set(v)
+		np.bitmap[k] = cloneBig(v)
 	}
 	np.bitmapLoaded = make(map[int64]bool, len(p.bitmapLoaded))
 	for k, v := range p.bitmapLoaded {

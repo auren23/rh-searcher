@@ -3,6 +3,8 @@ package v3
 import (
 	"math/big"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 func bitmapPool(tick, spacing int) *Pool {
@@ -88,5 +90,28 @@ func TestNextInitializedTickUnloaded(t *testing.T) {
 	next, found = p.nextInitializedTick(100*60, true)
 	if found || next != lo {
 		t.Errorf("downward unloaded: got %d want spacing-lower %d", next, lo)
+	}
+}
+
+// Clone 对惰性池（Liquidity/SqrtPriceX96 为 nil）必须安全（发现阶段只读静态字段）。
+func TestCloneLazyPool(t *testing.T) {
+	p := &Pool{
+		Address: common.Address{1},
+		ticks:   map[int]*Tick{0: nil, 1: {LiquidityGross: big.NewInt(5), LiquidityNet: big.NewInt(-3)}},
+		bitmap:  map[int64]*big.Int{0: big.NewInt(7)},
+	}
+	np := p.Clone()
+	if np.Liquidity != nil || np.SqrtPriceX96 != nil {
+		t.Fatalf("lazy clone must keep nil big.Ints")
+	}
+	if np.ticks[1].LiquidityGross.Cmp(big.NewInt(5)) != 0 {
+		t.Fatalf("tick gross not copied")
+	}
+	np.ticks[1].LiquidityGross.SetInt64(99)
+	if p.ticks[1].LiquidityGross.Int64() != 5 {
+		t.Fatalf("clone must be deep")
+	}
+	if np.bitmap[0].Int64() != 7 {
+		t.Fatalf("bitmap not copied")
 	}
 }

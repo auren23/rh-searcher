@@ -125,7 +125,7 @@ func main() {
 
 	// 池引导（断点续扫到链头；bootstrap 错误不忽略）
 	if adapter != nil {
-		startBlock := heights["pools"]
+		startBlock := heights[storage.CheckpointPools]
 		if startBlock < cfg.Dexes.V3[0].FactoryBlock {
 			startBlock = cfg.Dexes.V3[0].FactoryBlock
 		}
@@ -135,7 +135,7 @@ func main() {
 			slog.Error("bootstrap failed (pools may be missing)", "err", err)
 			os.Exit(1)
 		}
-		_ = ckpt.Save("pools", lastPoolBlock)
+		_ = ckpt.Save(storage.CheckpointPools, lastPoolBlock)
 	}
 	slog.Info("total pools", "count", len(reg.AllPools()))
 
