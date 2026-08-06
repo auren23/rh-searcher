@@ -19,6 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/jackc/pgx/v5"
 
@@ -285,9 +286,9 @@ func main() {
 				slog.Error("first header", "err", err)
 				os.Exit(1)
 			}
-			if err := pgCkpt.SaveWithHash(ctx, storage.CheckpointBlocks,
+			if err := sink.InitializeBlockCheckpoint(ctx, storage.CheckpointBlocks,
 				hdr.Number.Uint64(), hdr.Hash().Hex(), hdr.ParentHash.Hex()); err != nil {
-				slog.Error("first checkpoint save failed", "err", err)
+				slog.Error("first checkpoint init failed", "err", err)
 				os.Exit(1) // 失败关闭
 			}
 			lastApplied = hdr.Number.Uint64()
@@ -327,18 +328,19 @@ func main() {
 		applies []func()          // 成功后按序执行
 		tickBounds [][2]int       // 成功后 ResyncMintBurn
 	}
-	processBlock := func(h chain.BlockEvent) (*arbitrage.BlockResult, map[common.Address]*pendingPool, error) {
+	// evaluate=false 时只取日志不评估（补扫路径用，避免重复评估同一当前状态）
+	processBlock := func(h chain.BlockEvent, evaluate bool) (*arbitrage.BlockResult, map[common.Address]struct{}, map[common.Address]*pendingPool, error) {
 		logs, err := readCli.FilterLogs(ctx, ethereum.FilterQuery{
 			FromBlock: new(big.Int).SetUint64(h.Number),
 			ToBlock:   new(big.Int).SetUint64(h.Number),
 			Topics:    eventTopics,
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("block %d getLogs: %w", h.Number, err)
+			return nil, nil, nil, fmt.Errorf("block %d getLogs: %w", h.Number, err)
 		}
 		for _, l := range logs {
 			if l.BlockHash != h.Hash {
-				return nil, nil, fmt.Errorf("block %d hash mismatch: log=%s header=%s", h.Number, l.BlockHash.Hex(), h.Hash.Hex())
+				return nil, nil, nil, fmt.Errorf("block %d hash mismatch: log=%s header=%s", h.Number, l.BlockHash.Hex(), h.Hash.Hex())
 			}
 		}
 		res := &arbitrage.BlockResult{Block: h.Number, BlockHash: h.Hash}
@@ -364,7 +366,7 @@ func main() {
 							slog.Debug("not a factory pool, skipped", "addr", l.Address.Hex())
 							continue
 						}
-						return nil, nil, fmt.Errorf("block %d pool %s verify: %w", h.Number, l.Address.Hex(), derr)
+						return nil, nil, nil, fmt.Errorf("block %d pool %s verify: %w", h.Number, l.Address.Hex(), derr)
 					}
 					if pool.TickSpacing > 0 {
 						newPoolMetas = append(newPoolMetas, arbitrage.PoolMeta{
@@ -374,6 +376,12 @@ func main() {
 						})
 					}
 					pp = &pendingPool{pool: pool, isNew: true}
+					// P1: 新池先临时进 Registry/Graph——Engine 评估（RefreshRoute 查
+					// registry + FindRoutes 查 graph）必须在事务前能看到它，否则
+					// 新池的第一次 Swap 找不到任何路由。事务失败时池保持临时状态
+					// （幽灵池，重启后从 PG 恢复即消失），DB 无写入，无数据污染。
+					reg.UpsertPool(v3.State(pool))
+					graph.AddPool(pool.Pool(), l.Address)
 				} else {
 					pp = &pendingPool{pool: state.(*v3.Pool)}
 				}
@@ -382,7 +390,7 @@ func main() {
 			apply, derr := adapter.DecodeLog(pp.pool, l)
 			if derr != nil {
 				// 已知事件解码失败 → 禁止推进（不允许永久跳过）
-				return nil, nil, fmt.Errorf("block %d decode %s tx=%d log=%d: %w",
+				return nil, nil, nil, fmt.Errorf("block %d decode %s tx=%d log=%d: %w",
 					h.Number, l.Address.Hex(), l.TxIndex, l.Index, derr)
 			}
 			if apply == nil {
@@ -402,7 +410,7 @@ func main() {
 		for p := range affected {
 			pools = append(pools, p)
 		}
-		if len(pools) > 0 {
+		if evaluate && len(pools) > 0 {
 			processed := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
 				BlockNumber: h.Number,
 				BlockHash:   h.Hash,
@@ -410,7 +418,7 @@ func main() {
 			}, pools)
 			res.Candidates = processed.Candidates
 		}
-		return res, pending, nil
+		return res, affected, pending, nil
 	}
 
 	// 事务成功后应用日志到内存（exactly-once）。Resync 失败仅该池滞后，
@@ -432,12 +440,8 @@ func main() {
 		}
 	}
 
-	// 单事务提交（pools + candidates + processed_blocks + checkpoint）；失败 → 游标不前进
-	processAndCommit := func(h chain.BlockEvent) error {
-		res, pending, err := processBlock(h)
-		if err != nil {
-			return err
-		}
+	// DB 提交 + 成功后应用内存 + 推进游标（processAndCommit 与补扫共用）
+	commitResult := func(h chain.BlockEvent, res *arbitrage.BlockResult, pending map[common.Address]*pendingPool) error {
 		if sink != nil {
 			newPools := make([]storage.Pool, 0, len(res.NewPools))
 			for _, np := range res.NewPools {
@@ -461,13 +465,25 @@ func main() {
 		return nil
 	}
 
+	// 单事务提交（pools + candidates + processed_blocks + checkpoint）；失败 → 游标不前进
+	processAndCommit := func(h chain.BlockEvent) error {
+		res, _, pending, err := processBlock(h, true)
+		if err != nil {
+			return err
+		}
+		return commitResult(h, res, pending)
+	}
+
 	// reorg 处理：新链与旧链在 lastApplied+1 断裂时，用 processed_blocks 历史
-	// 按高度对比新旧 hash 找共同祖先（≤64 层），标记孤块（同事务），回退游标。
-	handleReorg := func() {
+	// 按高度对比新旧 hash 找共同祖先（≤64 层）；RollbackToAncestor 单事务
+	// （孤块标记 + checkpoint 回退）成功后，重建内存池状态，回退游标。
+	// 任何一步失败 → 返回 error，由调用方失败关闭（不允许双规范数据运行）。
+	handleReorg := func() error {
 		rollback := lastApplied
 		slog.Warn("reorg detected", "at", lastApplied,
 			"expected", lastAppliedHash.Hex())
 		ancestor := uint64(0)
+		ancestorHash := ""
 		found := false
 		for d := uint64(0); d <= 64; d++ {
 			bh := rollback - d
@@ -476,24 +492,22 @@ func main() {
 				SELECT block_hash FROM processed_blocks
 				WHERE strategy = $1 AND block_number = $2 AND canonical = TRUE`,
 				storage.CheckpointBlocks, bh).Scan(&oldHash)
-			if qerr != nil {
+			if qerr != nil || oldHash == nil {
 				break // 无更早历史：保守回退到最远已知层
-			}
-			if oldHash == nil {
-				break
 			}
 			hdr, herr := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bh))
 			if herr != nil {
-				break
+				return fmt.Errorf("reorg ancestor header %d: %w", bh, herr)
 			}
 			if hdr.Hash().Hex() == *oldHash {
 				ancestor = bh
+				ancestorHash = *oldHash
 				found = true
 				break
 			}
 		}
 		if !found {
-			// 历史缺失或全被替换：保守回退 64 层重处理
+			// 历史缺失或全被替换：保守回退 64 层重处理（checkpoint 回退到该层）
 			ancestor = 0
 			if rollback > 64 {
 				ancestor = rollback - 64
@@ -502,12 +516,28 @@ func main() {
 		} else if ancestor < rollback {
 			slog.Warn("reorg common ancestor", "rollback_to", ancestor)
 		}
-		// 孤块标记（processed_blocks + opportunities 同一事务）
-		if err := sink.MarkOrphans(ctx, storage.CheckpointBlocks, ancestor); err != nil {
-			slog.Error("reorg mark failed", "err", err)
+		var ancHdr *types.Header
+		if found {
+			var herr error
+			ancHdr, herr = readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(ancestor))
+			if herr != nil {
+				return fmt.Errorf("reorg ancestor header: %w", herr)
+			}
+		}
+		if err := sink.RollbackToAncestor(ctx, storage.CheckpointBlocks, ancestor,
+			ancestorHash, ancParent(ancHdr)); err != nil {
+			return fmt.Errorf("reorg rollback: %w", err)
+		}
+		// 数据库已回退：重建内存池状态（孤块 tick/swap 状态不能残留），
+		// 失败关闭（内存与数据库不一致比崩溃更危险）
+		reg.Reset()
+		graph.Reset()
+		if _, err := storage.RestorePools(ctx, sink, reg, graph); err != nil {
+			return fmt.Errorf("reorg rebuild registry: %w", err)
 		}
 		lastApplied = ancestor
-		lastAppliedHash = common.Hash{} // 未知：重处理期间不做衔接校验，成功后恢复
+		lastAppliedHash = common.HexToHash(ancestorHash) // 重处理期间继续衔接校验
+		return nil
 	}
 
 	heads, headErrs := src.SubscribeBlocks(ctx)
@@ -517,24 +547,54 @@ func main() {
 		}
 	}()
 
-	// 启动窗口补扫：从 lastApplied+1 顺序处理；第一块校验父衔接（离线 reorg）；
-	// 任一区块失败即停止推进（不跳块）
-	first := true
-	for bn := lastApplied + 1; bn <= startHead; bn++ {
+	// 启动窗口补扫：从 lastApplied+1 顺序处理；第一块校验父衔接（离线 reorg）。
+	// 任一区块失败即停止推进（不跳块）。回退后循环条件重新计算（不会跳过新区块）。
+	// 补扫只取日志 + 提交历史 + 应用内存状态，不逐块评估（避免对同一当前状态
+	// 重复评估）；结束时对聚合的 affected pools 统一评估一次（P1-3）。
+	backfillAffected := map[common.Address]struct{}{}
+	for lastApplied < startHead {
+		bn := lastApplied + 1
 		hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
 		if err != nil {
 			slog.Error("startup backfill header, stopping cursor", "block", bn, "err", err)
 			break
 		}
-		if first && lastAppliedHash != (common.Hash{}) && hdr.ParentHash != lastAppliedHash {
-			handleReorg()
-			first = false
-			continue // 回退后从新起点重新补扫
+		if lastAppliedHash != (common.Hash{}) && hdr.ParentHash != lastAppliedHash {
+			if err := handleReorg(); err != nil {
+				slog.Error("startup reorg rollback failed, exiting", "err", err)
+				os.Exit(1)
+			}
+			continue // 回退后重新计算 bn
 		}
-		first = false
-		if err := processAndCommit(chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash}); err != nil {
+		res, affected, pending, err := processBlock(chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash}, false)
+		if err != nil {
 			slog.Error("startup backfill failed, cursor stays at", "block", lastApplied, "err", err)
 			break
+		}
+		if err := commitResult(chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash}, res, pending); err != nil {
+			slog.Error("startup backfill commit failed, cursor stays at", "block", lastApplied, "err", err)
+			break
+		}
+		for p := range affected {
+			backfillAffected[p] = struct{}{}
+		}
+	}
+	// 补扫聚合评估：一个当前状态只评估一次（候选以补扫最后一块为观察区块）
+	if len(backfillAffected) > 0 {
+		pools := make([]common.Address, 0, len(backfillAffected))
+		for p := range backfillAffected {
+			pools = append(pools, p)
+		}
+		ev := chain.BlockEvent{Number: lastApplied, Hash: lastAppliedHash}
+		processed := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
+			BlockNumber: ev.Number,
+			BlockHash:   ev.Hash,
+			ReceivedAt:  time.Now().UnixMilli(),
+		}, pools)
+		if len(processed.Candidates) > 0 && sink != nil {
+			if err := sink.CommitBlockResult(ctx, ev.Number, ev.Hash.Hex(), "", nil, processed.Candidates); err != nil {
+				slog.Error("backfill evaluation commit failed", "err", err)
+			}
 		}
 	}
 
@@ -551,7 +611,10 @@ func main() {
 				continue // 已处理（含轮询源补块重复）
 			}
 			if lastAppliedHash != (common.Hash{}) && h.Number == lastApplied+1 && h.Parent != lastAppliedHash {
-				handleReorg()
+				if err := handleReorg(); err != nil {
+					slog.Error("reorg rollback failed, exiting", "err", err)
+					os.Exit(1) // 失败关闭：不允许双规范数据运行
+				}
 			}
 			// 顺序处理 lastApplied+1 → h.Number；任一失败即停止推进（失败区块不被跳过）
 			for bn := lastApplied + 1; bn <= h.Number; bn++ {
@@ -634,3 +697,11 @@ func preflightExecutor(ctx context.Context, cli *ethclient.Client, contract comm
 }
 
 func wethAddr(cfg *config.Config) common.Address { return common.HexToAddress(cfg.Chain.WETH) }
+
+// ancParent 返回祖先 header 的 parent hash（nil 时为空串；JSON fallback 模式无历史）。
+func ancParent(h *types.Header) string {
+	if h == nil {
+		return ""
+	}
+	return h.ParentHash.Hex()
+}

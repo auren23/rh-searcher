@@ -101,8 +101,19 @@ func TestMarkOrphansTwoLevelReorg(t *testing.T) {
 			t.Fatalf("commit %d: %v", i, err)
 		}
 	}
-	if err := db.MarkOrphans(ctx, CheckpointBlocks, 3); err != nil {
+	if err := db.RollbackToAncestor(ctx, CheckpointBlocks, 3, "0x3", "0x2"); err != nil {
 		t.Fatalf("mark: %v", err)
+	}
+	// checkpoint 必须回退到祖先（P0-2）
+	var ckptN uint64
+	var ckptH *string
+	if err := db.pool.QueryRow(ctx,
+		`SELECT block_number, block_hash FROM strategy_checkpoints WHERE strategy=$1`,
+		CheckpointBlocks).Scan(&ckptN, &ckptH); err != nil {
+		t.Fatal(err)
+	}
+	if ckptN != 3 || ckptH == nil || *ckptH != "0x3" {
+		t.Fatalf("checkpoint not rolled back: n=%d h=%v", ckptN, ckptH)
 	}
 	var orphan, kept int
 	if err := db.pool.QueryRow(ctx, `

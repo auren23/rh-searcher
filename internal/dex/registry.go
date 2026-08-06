@@ -34,6 +34,14 @@ func (r *Registry) Adapter(protocol string) PoolAdapter {
 	return r.adapters[protocol]
 }
 
+// Reset 清空全部池状态（reorg 重建用；适配器保留）。
+func (r *Registry) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pools = make(map[common.Address]PoolState)
+	r.byToken = make(map[common.Address][]common.Address)
+}
+
 // UpsertPool 新增或更新池状态。
 func (r *Registry) UpsertPool(state PoolState) {
 	r.mu.Lock()

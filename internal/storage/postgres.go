@@ -115,7 +115,7 @@ func insertCandidateTx(ctx context.Context, q interface {
 			l1_gas_units, l2_base_fee_wei, l1_base_fee_estimate_wei
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
 		ON CONFLICT (id) DO NOTHING`,
-		c.ID, "weth-2hop", c.ObservedBlock, c.ObservedAt, c.SourceEvent,
+		c.ID, StrategyArbitrage, c.ObservedBlock, c.ObservedAt, c.SourceEvent,
 		c.BlockHash.Hex(), c.TxHash.Hex(), c.LogIndex, c.RouteJSON,
 		c.InputAsset.Hex(), c.InputAmount.String(), c.GrossProfit.String(),
 		c.GasEstimate.String(), c.SwapCost.String(), c.SlippageCost.String(),
@@ -200,9 +200,10 @@ func (d *DB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	return d.pool.QueryRow(ctx, sql, args...)
 }
 
-// MarkOrphans 在同一事务内标记孤块（processed_blocks + opportunities）：
-// 重处理新链时 CommitBlockResult 会写入新 canonical 行/候选，旧数据保留。
-func (d *DB) MarkOrphans(ctx context.Context, strategy string, aboveBlock uint64) error {
+// RollbackToAncestor：reorg 单事务回滚——
+// 1) processed_blocks 标孤块；2) 本策略候选标孤块（不碰其他策略）；
+// 3) checkpoint 回退到共同祖先（含 hash）。全部成功才返回，失败由调用方失败关闭。
+func (d *DB) RollbackToAncestor(ctx context.Context, strategy string, ancestor uint64, hash, parent string) error {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -211,12 +212,56 @@ func (d *DB) MarkOrphans(ctx context.Context, strategy string, aboveBlock uint64
 	if _, err := tx.Exec(ctx, `
 		UPDATE processed_blocks SET canonical = FALSE
 		WHERE strategy = $1 AND canonical = TRUE AND block_number > $2`,
-		strategy, aboveBlock); err != nil {
+		strategy, ancestor); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE opportunities SET canonical = FALSE
-		WHERE observed_block > $1`, aboveBlock); err != nil {
+		WHERE strategy = $1 AND canonical = TRUE AND observed_block > $2`,
+		StrategyArbitrage, ancestor); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, parent_hash, updated_at)
+		VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (strategy) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			parent_hash = EXCLUDED.parent_hash,
+			updated_at = now()`,
+		strategy, ancestor, nullableStr(hash), nullableStr(parent)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// InitializeBlockCheckpoint：空库首次启动原子写入（checkpoint + 规范区块历史），
+// 保证首次 reorg 的祖先查找能找到初始链头。
+func (d *DB) InitializeBlockCheckpoint(ctx context.Context, strategy string, block uint64, hash, parent string) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, parent_hash, updated_at)
+		VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (strategy) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			parent_hash = EXCLUDED.parent_hash,
+			updated_at = now()`,
+		strategy, block, nullableStr(hash), nullableStr(parent)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO processed_blocks (strategy, block_number, block_hash, parent_hash, canonical)
+		VALUES ($1, $2, $3, COALESCE($4, ''), TRUE)
+		ON CONFLICT (strategy, block_hash) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			parent_hash = EXCLUDED.parent_hash,
+			canonical = TRUE`,
+		strategy, block, hash, nullableStr(parent)); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

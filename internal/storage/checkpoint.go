@@ -17,6 +17,9 @@ const (
 	CheckpointPools  = "arbitrage:pools"
 )
 
+// StrategyArbitrage 是 opportunities.strategy 值（与 checkpoint 策略名不同命名空间）。
+const StrategyArbitrage = "weth-2hop"
+
 // Checkpoint 断点：记录各索引器已处理到哪个区块，重启后恢复。
 // 生产用 PostgreSQL（strategy_checkpoints 表），本地开发用 JSON 文件。
 type Checkpoint struct {

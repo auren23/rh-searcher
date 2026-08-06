@@ -14,6 +14,12 @@ func NewGraph() *Graph {
 	return &Graph{adj: make(map[common.Address][]PoolRef), seenEdges: make(map[string]struct{})}
 }
 
+// Reset 清空图（reorg 重建用）。
+func (g *Graph) Reset() {
+	g.adj = make(map[common.Address][]PoolRef)
+	g.seenEdges = make(map[string]struct{})
+}
+
 // AddPool 把池作为两个方向的边加入图（同一池只加一次）。
 func (g *Graph) AddPool(p Pool, addr common.Address) {
 	if _, dup := g.seenEdges[addr.Hex()]; dup {
