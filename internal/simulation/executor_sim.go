@@ -2,12 +2,16 @@ package simulation
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net"
 	"strings"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common/hexutil"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -173,14 +177,33 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 			estMsg = ethereum.CallMsg{From: s.from, To: &s.contract, Gas: s.maxGas, Data: estCalldata}
 		}
 	}
-	gas, err = s.cli.EstimateGas(ctx, estMsg)
-	if err != nil {
-		if isInfraError(err) {
-			// 估算 RPC 基础设施故障：区块保持未评估，由上层重试
-			return nil, fmt.Errorf("estimateGas (infra): %w", err)
+	if block != nil {
+		// 先尝试固定历史区块估算（eth_estimateGas(msg, block)，Geth/archive 支持）：
+		// 成功 → 真正的 historical 成本，可参与正式 EV 统计
+		if gas, err = estimateGasAt(ctx, s.cli, estMsg, block); err == nil {
+			gasMode = GasEstimateHistory
+		} else {
+			// 节点不支持历史估算（常见公共 RPC）→ 回到 latest 近似
+			slog.Debug("historical estimateGas unavailable", "err", err)
+			gas, err = s.cli.EstimateGas(ctx, estMsg)
+			if err != nil {
+				if isInfraError(err) {
+					// 估算 RPC 基础设施故障：区块保持未评估，由上层重试
+					return nil, fmt.Errorf("estimateGas (infra): %w", err)
+				}
+				gas = s.maxGas // 估算失败用上限（保守）；不得参与正式 EV 统计
+				gasMode = GasEstimateMax
+			}
 		}
-		gas = s.maxGas // 估算失败用上限（保守）；不得参与正式 EV 统计
-		gasMode = GasEstimateMax
+	} else {
+		gas, err = s.cli.EstimateGas(ctx, estMsg)
+		if err != nil {
+			if isInfraError(err) {
+				return nil, fmt.Errorf("estimateGas (infra): %w", err)
+			}
+			gas = s.maxGas
+			gasMode = GasEstimateMax
+		}
 	}
 	// Gas 价格固定到历史块（Arbitrum L2 base fee，读 header.BaseFee at block）：
 	// 成本必须与池状态/eth_call 同一区块，不能用调用时的 latest 污染历史利润。
@@ -223,6 +246,28 @@ func (s *ExecutorSimulator) Simulate(ctx context.Context, c *arbitrage.Candidate
 		CalldataHash: hashHex(calldata), SimulationBlock: simBlock,
 		L1GasUnits: l1GasUnits, L2BaseFeeWei: l2BaseFee, L1BaseFeeEstimateWei: l1BaseFeeEstimate,
 		GasEstimateMode: gasMode}, nil
+}
+
+// estimateGasAt 用原始 JSON-RPC 调用 eth_estimateGas(callObj, block)——
+// Geth/archive 节点支持固定历史区块估算。节点不支持时返回 error，
+// 调用方回退 latest 近似。
+func estimateGasAt(ctx context.Context, cli *ethclient.Client, msg ethereum.CallMsg, block *big.Int) (uint64, error) {
+	raw, err := json.Marshal(map[string]any{
+		"from":     msg.From.Hex(),
+		"to":       msg.To.Hex(),
+		"gas":      hexutil.EncodeUint64(msg.Gas),
+		"data":     hexutil.Bytes(msg.Data),
+		"value":    hexutil.EncodeBig(big.NewInt(0)),
+	})
+	if err != nil {
+		return 0, err
+	}
+	var res hexutil.Uint64
+	callErr := cli.Client().CallContext(ctx, &res, "eth_estimateGas", json.RawMessage(raw), hexutil.EncodeBig(block))
+	if callErr != nil {
+		return 0, callErr
+	}
+	return uint64(res), nil
 }
 
 // hashHex keccak256 十六进制（calldata 指纹）。
