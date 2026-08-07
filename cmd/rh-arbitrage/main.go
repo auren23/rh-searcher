@@ -887,6 +887,20 @@ func main() {
 				break
 			}
 			done++
+			// freshness-first：过期机会直接跳过（公共 RPC 无 archive，
+			// 旧块无法还原——继续评估只是制造统计噪音）。
+			// 显式审计 stale_skipped + 推进观察游标
+			if simMode != "historical_strict" && head > pb.Block {
+				lag := head - pb.Block
+				if lag > maxObsLag {
+					if err := sink.SkipStaleBlock(ctx, pb.Block, pb.Hash, lag, "stale_no_archive"); err != nil {
+						return fmt.Errorf("skip stale block %d: %w", pb.Block, err)
+					}
+					lastEvaluated = pb.Block
+					m.evaluateBlocks++
+					continue
+				}
+			}
 			addrs := make([]common.Address, 0, len(pb.Pools))
 			for _, p := range pb.Pools {
 				addrs = append(addrs, common.HexToAddress(p))
