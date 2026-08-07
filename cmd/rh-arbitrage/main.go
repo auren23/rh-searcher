@@ -700,8 +700,10 @@ func main() {
 	// 自适应批量拉日志：跨块一次 FilterLogs（合并 RPC 请求），按块分组；
 	// 429/超大响应 → 范围二分（下限单块）；成功 → 扩大（上限 256）。
 	// 数据库提交与 reorg 校验仍逐块 exactly-once（坏块只回滚自身，不拖累区间）。
-	batchLogs := func(from, to uint64) ([]types.Log, error) {
-		size := uint64(32)
+	// 返回 (logs, 实际覆盖到的末块, err)。成功但未覆盖 to → 扩大重试；
+	// 失败 → 二分缩小返回部分范围（调用方从 hi+1 继续）。绝不允许静默丢日志。
+	batchLogs := func(from, to uint64) ([]types.Log, uint64, error) {
+		size := uint64(256)
 		for {
 			hi := from + size - 1
 			if hi > to {
@@ -714,14 +716,18 @@ func main() {
 				Topics:    eventTopics,
 			})
 			if err == nil {
-				if hi < to && size < 256 {
-					size *= 2 // 成功扩大
+				if hi < to {
+					size *= 2 // 成功但未覆盖目标 → 扩大再拉
+					if size > 256 {
+						size = 256
+					}
+					continue
 				}
-				return logs, nil
+				return logs, hi, nil
 			}
 			metrics.rpc429++
 			if size <= 1 {
-				return nil, fmt.Errorf("batch logs %d..%d: %w", from, hi, err)
+				return nil, hi, fmt.Errorf("batch logs %d..%d: %w", from, hi, err)
 			}
 			size /= 2 // 429/超大 → 二分缩小重试
 		}
@@ -771,10 +777,11 @@ func main() {
 			if chunkTo > to {
 				chunkTo = to
 			}
-			logs, err := batchLogs(from, chunkTo)
+			logs, hi, err := batchLogs(from, chunkTo)
 			if err != nil {
 				return err
 			}
+			chunkTo = hi // 实际覆盖范围（可能因限速缩小；绝不小块丢日志）
 			// 按块分组（块内按 txIndex/logIndex 排序由 processBlock 处理）
 			byBlock := map[uint64][]types.Log{}
 			for _, l := range logs {
