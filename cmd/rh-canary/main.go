@@ -38,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 
@@ -64,6 +65,7 @@ type metricsView struct {
 	eventsFresh     uint64   // lag <= maxObsLag 的评估（fresh 样本）
 	eventsStaleSkip uint64   // lag > staleSkipLag 未评估（不制造噪音）
 	evalErrors      uint64   // 基础设施错误（快照/head 失败）
+	evalThrottled   uint64   // 评估节流跳过（min-eval-gap 内的 WETH 事件）
 	disconnects     uint64   // WSS 断线重连次数
 	recoveries      uint64   // 缺口恢复次数
 	recoveredBlocks uint64   // 恢复覆盖的区块数
@@ -145,9 +147,18 @@ type eventRecord struct {
 	Head                uint64 `json:"head"`
 	StateLagBlocks      uint64 `json:"state_lag_blocks"`
 	EventToEvaluationMs int64  `json:"event_to_evaluation_ms"`
-	Discovered          bool   `json:"discovered"`
-	Skipped             string `json:"skipped,omitempty"` // "" | "stale" | "discovery_failed" | "eval_error"
+	Skipped             string `json:"skipped,omitempty"` // "" | "stale" | "non_weth" | "discovery_pending" | "head_error" | "eval_error" | "eval_throttled"
 	BestDecision        string `json:"best_decision,omitempty"`
+}
+
+// poolRecord 运行时发现的 WETH 池（研究侧建池集用）。
+type poolRecord struct {
+	TS     int64  `json:"ts"`
+	Kind   string `json:"kind"` // "pool"
+	Pool   string `json:"pool"`
+	Token0 string `json:"token0"`
+	Token1 string `json:"token1"`
+	Fee    uint32 `json:"fee"`
 }
 
 type canary struct {
@@ -161,11 +172,18 @@ type canary struct {
 	graph      *dex.Graph
 	searcher   *arbitrage.LocalSearcher
 	engine     *arbitrage.Engine
-	wethPools  map[common.Address]struct{}
-	nonWeth    map[common.Address]struct{} // 已确认非 WETH 池（过滤缓存）
-	notV3      map[common.Address]struct{} // 已确认非本 Factory 池（过滤缓存）
-	cursor     chain.LogCursor
-	query      ethereum.FilterQuery
+	pmu            sync.Mutex                 // 保护 pool 集合（wethPools/nonWeth/notV3/discoverPending）
+	wethPools      map[common.Address]struct{}
+	nonWeth        map[common.Address]struct{} // 已确认非 WETH 池（过滤缓存）
+	notV3          map[common.Address]struct{} // 已确认非本 Factory 池（过滤缓存）
+	discoverPending map[common.Address]struct{} // 发现队列去重
+	discoverCh     chan common.Address          // 异步发现队列（事件循环不阻塞 RPC）
+	engineMu       sync.Mutex                   // 序列化 engine 评估与 reg/graph 写入
+	outMu          sync.Mutex                   // JSONL 写入互斥（bufio.Writer 非线程安全）
+	lastEvalAt     time.Time                    // 评估节流：minEvalGap 内最多一次
+	minEvalGap     time.Duration
+	cursor         chain.LogCursor
+	logFilter      map[string]interface{} // eth_subscribe logs 参数（必须小写 key）
 	metrics    *metrics
 	out        *bufio.Writer
 	outFile    *os.File
@@ -339,11 +357,18 @@ func main() {
 		graph:     graph,
 		searcher:  searcher,
 		engine:    engine,
-		wethPools: wethPools,
-		nonWeth:   make(map[common.Address]struct{}),
-		notV3:     make(map[common.Address]struct{}),
-		query: ethereum.FilterQuery{
-			Topics: [][]common.Hash{{v3.SwapTopic()}},
+		wethPools:       wethPools,
+		nonWeth:         make(map[common.Address]struct{}),
+		notV3:           make(map[common.Address]struct{}),
+		discoverPending: make(map[common.Address]struct{}),
+		discoverCh:      make(chan common.Address, 4096),
+		minEvalGap:      250 * time.Millisecond,
+		// 订阅参数必须用小写 key map：go-ethereum 的 ethereum.FilterQuery 没有
+		// json tag，直接传 rpc.EthSubscribe 会把字段序列化成大写（"Topics"），
+		// Nitro 节点忽略未知 key → 订阅退化为全量日志。已验证格式：
+		// {"topics":[[swapTopic]]}（与 ethclient.toFilterArg 的 key 一致）。
+		logFilter: map[string]interface{}{
+			"topics": [][]common.Hash{{v3.SwapTopic()}},
 		},
 		metrics:   &metrics{v: metricsView{startedAt: startedAt}},
 		out:       out,
@@ -372,6 +397,9 @@ func main() {
 		"duration", c.duration, "max_fresh_evals", c.maxEvals,
 		"recovery_chunk_blocks", c.chunk, "stale_skip_lag", c.staleSkip,
 		"out", outPath)
+
+	// 异步发现 worker：池发现不阻塞事件流（同步 RPC 会让消费者在 8 events/s 下落后）
+	go c.discoveryWorker(ctx)
 
 	// 监控：60s 统计 + 30s 公共 RPC 交叉校验
 	go statsLoop(ctx, c)
@@ -413,7 +441,7 @@ func (c *canary) run(ctx context.Context) error {
 		}
 		c.wss = rc
 		ch := make(chan types.Log, 4096)
-		sub, err := rc.EthSubscribe(ctx, ch, "logs", c.query)
+		sub, err := rc.EthSubscribe(ctx, ch, "logs", c.logFilter)
 		if err != nil {
 			rc.Close()
 			c.metrics.inc(func(m *metricsView) { m.disconnects++ })
@@ -538,7 +566,10 @@ func (c *canary) recoverAndProcess(ctx context.Context, from uint64) error {
 
 // getLogsRetry getLogs 带 429 退避重试（Alchemy 免费版 10-block 上限由调用方保证）。
 func (c *canary) getLogsRetry(ctx context.Context, from, to uint64) ([]types.Log, error) {
-	q := c.query
+	// HTTP getLogs 走 ethclient.FilterLogs（toFilterArg 小写 key，过滤正确）
+	q := ethereum.FilterQuery{
+		Topics: [][]common.Hash{{v3.SwapTopic()}},
+	}
 	q.FromBlock = new(big.Int).SetUint64(from)
 	q.ToBlock = new(big.Int).SetUint64(to)
 	var lastErr error
@@ -562,36 +593,154 @@ func (c *canary) getLogsRetry(ctx context.Context, from, to uint64) ([]types.Log
 	return nil, lastErr
 }
 
-// discoverPool 首次见到的池：校验 Factory 归属与 token 对；WETH 池注册进图。
-// 返回 true = 该池属于 WETH 池集（可评估）。失败（RPC 错误）不缓存，下次事件重试。
-func (c *canary) discoverPool(ctx context.Context, addr common.Address) bool {
+// poolState 查询池的集合状态（0=未知 1=WETH 2=非WETH 3=非Factory）。
+func (c *canary) poolState(addr common.Address) int {
+	c.pmu.Lock()
+	defer c.pmu.Unlock()
+	if _, ok := c.wethPools[addr]; ok {
+		return 1
+	}
 	if _, ok := c.nonWeth[addr]; ok {
-		return false
+		return 2
 	}
 	if _, ok := c.notV3[addr]; ok {
-		return false
+		return 3
+	}
+	return 0
+}
+
+// enqueueDiscovery 未知池入发现队列（去重；队列满丢弃，下个事件重试）。
+func (c *canary) enqueueDiscovery(addr common.Address) {
+	c.pmu.Lock()
+	defer c.pmu.Unlock()
+	if _, ok := c.discoverPending[addr]; ok {
+		return
+	}
+	c.discoverPending[addr] = struct{}{}
+	select {
+	case c.discoverCh <- addr:
+	default:
+		// 队列满：丢弃本次入队，事件下次出现时重试
+	}
+}
+
+// discoveryWorker 异步池发现：事件循环不因 RPC 阻塞（8 events/s 下同步发现必落后）。
+func (c *canary) discoveryWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case addr := <-c.discoverCh:
+			c.resolvePool(ctx, addr)
+		}
+	}
+}
+
+// resolvePool 执行一次完整发现：廉价 token 预检（2 calls）→ WETH 池全量校验 → 注册进图。
+// 基础设施错误不缓存（下次事件重试）；确定性失败（非 Factory / revert）缓存。
+func (c *canary) resolvePool(ctx context.Context, addr common.Address) {
+	if c.poolState(addr) != 0 {
+		c.pmu.Lock()
+		delete(c.discoverPending, addr)
+		c.pmu.Unlock()
+		return // 已被并发解决
+	}
+	t0, t1, err := c.tokenPair(ctx, addr)
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "revert") || strings.Contains(msg, "invalid opcode") {
+			// 确定性失败：地址不是 V3 池（无 token0()）→ 缓存，不再重试
+			c.pmu.Lock()
+			c.notV3[addr] = struct{}{}
+			delete(c.discoverPending, addr)
+			c.pmu.Unlock()
+			return
+		}
+		c.metrics.inc(func(m *metricsView) { m.evalErrors++ })
+		slog.Debug("pool token check failed", "pool", addr.Hex(), "err", err)
+		c.pmu.Lock()
+		delete(c.discoverPending, addr)
+		c.pmu.Unlock()
+		return
+	}
+	if t0 != c.weth && t1 != c.weth {
+		c.pmu.Lock()
+		c.nonWeth[addr] = struct{}{}
+		delete(c.discoverPending, addr)
+		c.pmu.Unlock()
+		return
 	}
 	pool, err := c.adapter.PoolByAddress(ctx, addr)
 	if err != nil {
 		if errors.Is(err, v3.ErrNotFactoryPool) {
+			c.pmu.Lock()
 			c.notV3[addr] = struct{}{}
-			return false
+			delete(c.discoverPending, addr)
+			c.pmu.Unlock()
+			return
 		}
 		c.metrics.inc(func(m *metricsView) { m.evalErrors++ })
 		slog.Debug("pool discovery failed", "pool", addr.Hex(), "err", err)
-		return false // 基础设施错误：不缓存，下个事件重试
+		c.pmu.Lock()
+		delete(c.discoverPending, addr)
+		c.pmu.Unlock()
+		return
 	}
-	if pool.Token0 != c.weth && pool.Token1 != c.weth {
-		c.nonWeth[addr] = struct{}{}
-		return false
-	}
+	// 先注册图（engine 评估前必须可见），再标记 WETH（事件循环只在 WETH 后评估）
+	c.engineMu.Lock()
 	c.reg.UpsertPool(v3.State(pool))
 	c.graph.AddPool(pool.Pool(), addr)
+	c.engineMu.Unlock()
+	c.pmu.Lock()
 	c.wethPools[addr] = struct{}{}
+	delete(c.discoverPending, addr)
+	c.pmu.Unlock()
 	c.metrics.inc(func(m *metricsView) { m.poolsDiscovered++ })
 	slog.Info("WETH pool discovered", "pool", addr.Hex(),
 		"token0", pool.Token0.Hex(), "token1", pool.Token1.Hex(), "fee", pool.Fee)
-	return true
+	c.writePool(pool)
+}
+
+// writePool WETH 池发现行落 JSONL。
+func (c *canary) writePool(pool *v3.Pool) {
+	raw, err := json.Marshal(poolRecord{
+		TS:     time.Now().UnixMilli(),
+		Kind:   "pool",
+		Pool:   pool.Address.Hex(),
+		Token0: pool.Token0.Hex(),
+		Token1: pool.Token1.Hex(),
+		Fee:    pool.Fee,
+	})
+	if err != nil {
+		return
+	}
+	c.outMu.Lock()
+	c.out.Write(raw)
+	c.out.WriteByte('\n')
+	c.out.Flush()
+	c.outMu.Unlock()
+}
+
+// tokenPair 读取池的 token0/token1（2 次 eth_call；自发现廉价预检）。
+func (c *canary) tokenPair(ctx context.Context, addr common.Address) (common.Address, common.Address, error) {
+	t0raw, err := c.httpCli.CallContract(ctx, ethereum.CallMsg{
+		To:   &addr,
+		Data: crypto.Keccak256([]byte("token0()"))[:4],
+	}, nil)
+	if err != nil {
+		return common.Address{}, common.Address{}, err
+	}
+	t1raw, err := c.httpCli.CallContract(ctx, ethereum.CallMsg{
+		To:   &addr,
+		Data: crypto.Keccak256([]byte("token1()"))[:4],
+	}, nil)
+	if err != nil {
+		return common.Address{}, common.Address{}, err
+	}
+	if len(t0raw) < 32 || len(t1raw) < 32 {
+		return common.Address{}, common.Address{}, fmt.Errorf("short token response")
+	}
+	return common.BytesToAddress(t0raw[12:32]), common.BytesToAddress(t1raw[12:32]), nil
 }
 
 // head 读取当前链头（≤300ms 缓存；评估批内共享同一 head 快照）。
@@ -609,24 +758,23 @@ func (c *canary) head(ctx context.Context) (uint64, error) {
 	return h, nil
 }
 
-// handleLog 单个 Swap 事件：WETH 池过滤 → head 快照 → local_only 评估 → JSONL。
+// handleLog 单个 Swap 事件：记录全流量延迟 → WETH 池过滤（异步自发现）→ local_only 评估 → JSONL。
+// state_lag 对全部事件采样（含非 WETH）：Alchemy WSS 的交付新鲜度是全流量问题，
+// 策略评估只对已知 WETH 池执行。事件循环不做任何同步 RPC（head 缓存除外）——
+// 8 events/s 下同步发现/评估会让消费者落后，lag 失真。
 func (c *canary) handleLog(ctx context.Context, l types.Log) {
 	c.metrics.inc(func(m *metricsView) { m.eventsTotal++ })
-	discovered := false
-	if _, known := c.wethPools[l.Address]; !known {
-		if !c.discoverPool(ctx, l.Address) {
-			c.metrics.inc(func(m *metricsView) { m.eventsNonWeth++ })
-			c.writeEvent(l, 0, 0, false, "discovery_failed", "")
-			return
-		}
-		discovered = true
+	// 防御：订阅过滤可能被节点忽略（曾发生：大写 key 导致全量日志）。
+	// 非 Swap topic 直接丢弃，不污染延迟样本。
+	if len(l.Topics) == 0 || l.Topics[0] != v3.SwapTopic() {
+		c.metrics.inc(func(m *metricsView) { m.eventsNonWeth++ })
+		return
 	}
-	t0 := time.Now()
 	head, err := c.head(ctx)
 	if err != nil {
 		c.metrics.inc(func(m *metricsView) { m.evalErrors++ })
 		slog.Warn("head read failed", "block", l.BlockNumber, "err", err)
-		c.writeEvent(l, 0, 0, discovered, "eval_error", "")
+		c.writeEvent(l, 0, 0, "head_error", "")
 		return
 	}
 	if head < l.BlockNumber {
@@ -634,11 +782,29 @@ func (c *canary) handleLog(ctx context.Context, l types.Log) {
 	}
 	lag := head - l.BlockNumber
 	c.metrics.recordLag(lag)
+	switch c.poolState(l.Address) {
+	case 2, 3: // 已确认非 WETH / 非 Factory：纯延迟样本
+		c.metrics.inc(func(m *metricsView) { m.eventsNonWeth++ })
+		c.writeEvent(l, head, lag, "non_weth", "")
+		return
+	case 0: // 未知池：异步发现，本事件跳过（下次同池事件可能已就绪）
+		c.enqueueDiscovery(l.Address)
+		c.writeEvent(l, head, lag, "discovery_pending", "")
+		return
+	}
+	// 已知 WETH 池
 	if lag > c.staleSkip {
 		c.metrics.inc(func(m *metricsView) { m.eventsStaleSkip++ })
-		c.writeEvent(l, head, lag, discovered, "stale", "")
+		c.writeEvent(l, head, lag, "stale", "")
 		return // 陈旧事件无即时套利信号，评估只是噪音
 	}
+	if time.Since(c.lastEvalAt) < c.minEvalGap {
+		c.metrics.inc(func(m *metricsView) { m.evalThrottled++ })
+		c.writeEvent(l, head, lag, "eval_throttled", "")
+		return // 评估节流：保护免费档 CU 预算，延迟样本已记录
+	}
+	t0 := time.Now() // 评估起点（event_to_evaluation_ms 基准）
+	c.lastEvalAt = t0
 	ev := arbitrage.SwapEvent{
 		Pool:        l.Address,
 		BlockNumber: l.BlockNumber,
@@ -647,12 +813,14 @@ func (c *canary) handleLog(ctx context.Context, l types.Log) {
 		LogIndex:    l.Index,
 		ReceivedAt:  t0.UnixMilli(),
 	}
+	c.engineMu.Lock()
 	res, err := c.engine.ProcessBlockAt(ctx, ev, []common.Address{l.Address}, head)
+	c.engineMu.Unlock()
 	evalMs := time.Since(t0).Milliseconds()
 	if err != nil {
 		c.metrics.inc(func(m *metricsView) { m.evalErrors++ })
 		slog.Warn("evaluation failed", "block", l.BlockNumber, "pool", l.Address.Hex(), "err", err)
-		c.writeEvent(l, head, lag, discovered, "eval_error", "")
+		c.writeEvent(l, head, lag, "eval_error", "")
 		return
 	}
 	c.metrics.recordEvalMs(evalMs)
@@ -670,12 +838,12 @@ func (c *canary) handleLog(ctx context.Context, l types.Log) {
 			break
 		}
 	}
-	c.writeEvent(l, head, lag, discovered, "", best)
+	c.writeEvent(l, head, lag, "", best)
 	c.writeCandidates(l, head, lag, evalMs, res)
 }
 
 // writeEvent 事件行落 JSONL（跳过原因 + 延迟；评估结果在 candidate 行）。
-func (c *canary) writeEvent(l types.Log, head, lag uint64, discovered bool, skipped, best string) {
+func (c *canary) writeEvent(l types.Log, head, lag uint64, skipped, best string) {
 	rec := eventRecord{
 		TS:             time.Now().UnixMilli(),
 		Kind:           "event",
@@ -686,7 +854,6 @@ func (c *canary) writeEvent(l types.Log, head, lag uint64, discovered bool, skip
 		Pool:           l.Address.Hex(),
 		Head:           head,
 		StateLagBlocks: lag,
-		Discovered:     discovered,
 		Skipped:        skipped,
 		BestDecision:   best,
 	}
@@ -694,9 +861,11 @@ func (c *canary) writeEvent(l types.Log, head, lag uint64, discovered bool, skip
 	if err != nil {
 		return
 	}
+	c.outMu.Lock()
 	c.out.Write(raw)
 	c.out.WriteByte('\n')
 	c.out.Flush()
+	c.outMu.Unlock()
 }
 
 // writeCandidates 候选落 JSONL + 统计 gross/net 正数。
@@ -769,9 +938,11 @@ func (c *canary) writeCandidates(l types.Log, head, lag uint64, evalMs int64, re
 			slog.Warn("marshal record", "err", err)
 			continue
 		}
+		c.outMu.Lock()
 		c.out.Write(raw)
 		c.out.WriteByte('\n')
 		c.out.Flush()
+		c.outMu.Unlock()
 	}
 }
 
@@ -799,6 +970,7 @@ func statsLoop(ctx context.Context, c *canary) {
 				"events", m.eventsTotal, "non_weth", m.eventsNonWeth,
 				"evaluated", m.eventsEvaluated, "fresh", m.eventsFresh,
 				"stale_skipped", m.eventsStaleSkip, "eval_errors", m.evalErrors,
+				"eval_throttled", m.evalThrottled,
 				"lag_p50", lagP50, "eval_ms_p50", evalP50,
 				"gross_positive", m.grossPositive,
 				"pools_discovered", m.poolsDiscovered,
@@ -865,6 +1037,7 @@ func summary(ctx context.Context, c *canary, m metricsView, runErr error) {
 	w("events_fresh (lag<=%d): %d", c.maxObsLag, m.eventsFresh)
 	w("events_stale_skipped (lag>%d): %d", c.staleSkip, m.eventsStaleSkip)
 	w("eval_errors: %d", m.evalErrors)
+	w("eval_throttled: %d", m.evalThrottled)
 	w("wss_disconnects: %d", m.disconnects)
 	w("gap_recoveries: %d", m.recoveries)
 	w("gap_recovered_blocks: %d", m.recoveredBlocks)
