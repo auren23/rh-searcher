@@ -776,10 +776,27 @@ func main() {
 					return fmt.Errorf("backfill header %d: %w", bn, err)
 				}
 				if lastAppliedHash != (common.Hash{}) && hdr.ParentHash != lastAppliedHash {
-					if err := handleReorg(); err != nil {
-						return err
+					// 伪 reorg 防护：公共 RPC 多节点负载均衡下 hash 可能短暂
+					// 漂移——重拉同一块 2 次，hash 稳定不匹配才视为真 reorg
+					mismatch := true
+					for retry := 0; retry < 2; retry++ {
+						time.Sleep(time.Second)
+						h2, herr := headerAt(bn)
+						if herr != nil {
+							break
+						}
+						if h2.ParentHash == lastAppliedHash {
+							hdr = h2
+							mismatch = false
+							break
+						}
 					}
-					break // 回退后外层循环重新计算
+					if mismatch {
+						if err := handleReorg(); err != nil {
+							return err
+						}
+						break // 回退后外层循环重新计算
+					}
 				}
 				if err := ingestOne(bn, hdr, logs); err != nil {
 					return err
@@ -823,6 +840,21 @@ func main() {
 			return fmt.Errorf("load pending affected: %w", err)
 		}
 		done := 0
+		evalStart := time.Now().UnixMilli()
+		// 一批评估共享同一 head H：快照缓存（headHash 键）全命中，
+		// RPC 从每块 1 head + N 池降到 1 head + 池集一次
+		var head uint64
+		if simMode != "historical_strict" {
+			hd, herr := readCli.HeaderByNumber(ctx, nil)
+			if herr != nil {
+				return fmt.Errorf("head for %s: %w", simMode, herr)
+			}
+			head = hd.Number.Uint64()
+			cfgCopy := engineCfg
+			cfgCopy.HeadAtSnapshot = head
+			cfgCopy.HeadAtSnapshotMs = evalStart
+			engine.SetConfig(cfgCopy)
+		}
 		for _, pb := range pending {
 			if done >= evalBudget {
 				break
@@ -832,7 +864,6 @@ func main() {
 			for _, p := range pb.Pools {
 				addrs = append(addrs, common.HexToAddress(p))
 			}
-			evalStart := time.Now().UnixMilli()
 			// 状态年龄基于 ingest 时持久化的原始接收时间（不允许恢复时重填 now）
 			ageMs := int64(0)
 			if pb.ReceivedAtMs > 0 {
@@ -843,17 +874,7 @@ func main() {
 			}
 			if simMode != "historical_strict" {
 				// local_only / latest_observe：快照与（latest_observe 的）
-				// eth_call 都固定在当前 head H——公共 RPC 非 archive 时历史块
-				// 状态不可读，只有 head 快照可行；local_only 不查 executor 余额
-				hd, herr := readCli.HeaderByNumber(ctx, nil)
-				if herr != nil {
-					return fmt.Errorf("head for %s: %w", simMode, herr)
-				}
-				head := hd.Number.Uint64()
-				cfgCopy := engineCfg
-				cfgCopy.HeadAtSnapshot = head
-				cfgCopy.HeadAtSnapshotMs = evalStart
-				engine.SetConfig(cfgCopy)
+				// eth_call 都固定在本批 head H；local_only 不查 executor 余额
 				ev := arbitrage.SwapEvent{
 					BlockNumber: pb.Block,
 					BlockHash:   common.HexToHash(pb.Hash),

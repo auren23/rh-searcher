@@ -140,6 +140,15 @@ func LoadMerged(paths ...string) (*Config, error) {
 		if cfg.Arbitrage.SimulationTopK > 0 {
 			merged.Arbitrage.SimulationTopK = cfg.Arbitrage.SimulationTopK
 		}
+		if cfg.Arbitrage.SimulationMode != "" {
+			merged.Arbitrage.SimulationMode = cfg.Arbitrage.SimulationMode
+		}
+		if cfg.Arbitrage.LocalGasUnits > 0 {
+			merged.Arbitrage.LocalGasUnits = cfg.Arbitrage.LocalGasUnits
+		}
+		if cfg.Arbitrage.LocalGasStressMultiplier > 0 {
+			merged.Arbitrage.LocalGasStressMultiplier = cfg.Arbitrage.LocalGasStressMultiplier
+		}
 	}
 	return merged, nil
 }
