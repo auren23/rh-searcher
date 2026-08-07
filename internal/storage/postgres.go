@@ -441,18 +441,29 @@ func (d *DB) LoadPendingAffected(ctx context.Context, fromBlock uint64) ([]Pendi
 	return out, rows.Err()
 }
 
+// SaveThroughputSample 落库吞吐指标采样（60s 周期；Canary 判断用）。
+func (d *DB) SaveThroughputSample(ctx context.Context, ingestBps, evaluateBps float64,
+	ingestLag, evaluateLag uint64, getlogsReqs, rpc429 uint64, cacheHitRatio float64) error {
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO throughput_samples
+			(ingest_bps, evaluate_bps, ingest_lag, evaluate_lag, getlogs_reqs, rpc_429, cache_hit_ratio)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		ingestBps, evaluateBps, ingestLag, evaluateLag, getlogsReqs, rpc429, cacheHitRatio)
+	return err
+}
+
 // QueryRow 执行单行查询（reorg 祖先查找用）。
 func (d *DB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	return d.pool.QueryRow(ctx, sql, args...)
 }
 
 // requiredSchemaVersion 启动要求的最高迁移版本（0014 统一旧 historical 命名）。
-const requiredSchemaVersion = "0016"
+const requiredSchemaVersion = "0017"
 
 // requiredVersions 启动要求的完整迁移版本集合（任何中间缺失都拒绝启动）。
 var requiredVersions = []string{
 	"0001", "0002", "0003", "0004", "0005", "0006", "0007",
-	"0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016",
+	"0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017",
 }
 
 // RollbackToAncestor：reorg 单事务回滚——

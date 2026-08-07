@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/ethereum/go-ethereum/common"
+
 	"github.com/auren23/rh-searcher/internal/dex"
 )
 
@@ -11,6 +13,9 @@ import (
 type BootstrapOptions struct {
 	BatchSize  uint64
 	MaxBatches int // 0 = 不限
+	// WETHOnly 非零时：只把包含该 token 的池加入 Registry/Graph
+	// （MVP 两跳路线 WETH→TOKEN→WETH 的池必然含 WETH；39 万池里 99% 无用）
+	WETHOnly common.Address
 }
 
 // Bootstrap 从 fromBlock 一直扫描到链头（head），空批次不停。
@@ -48,6 +53,10 @@ func Bootstrap(ctx context.Context, a *Adapter, reg *dex.Registry, graph *dex.Gr
 			batchSize = opt.BatchSize // 成功后恢复
 		}
 		for _, p := range pools {
+			if opt.WETHOnly != (common.Address{}) &&
+				p.Token0 != opt.WETHOnly && p.Token1 != opt.WETHOnly {
+				continue // 非 WETH 池：当前策略用不到，不进入运行集
+			}
 			reg.UpsertPool(State(p))
 			graph.AddPool(p.Pool(), p.Address)
 		}

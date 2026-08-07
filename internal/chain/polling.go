@@ -42,14 +42,15 @@ func (p *PollingSource) SubscribeBlocks(ctx context.Context) (<-chan BlockEvent,
 				}
 				n := head.Number.Uint64()
 				if gap := gaps.Observe(n); gap != nil {
-					// 补缺口（从旧到新）
+					// 补缺口（从旧到新）。只用 header：Arbitrum Nitro 区块含
+					// go-ethereum 不认识的 tx 类型，full block 解码必失败
 					for bn := gap.From; bn <= gap.To; bn++ {
-						b, err := p.BlockByNumber(ctx, bn)
+						h, err := p.cli.HeaderByNumber(ctx, big.NewInt(int64(bn)))
 						if err != nil {
 							errCh <- err
 							continue
 						}
-						out <- BlockEvent{Number: bn, Hash: b.Hash(), Parent: b.ParentHash(), Time: b.Time()}
+						out <- BlockEvent{Number: bn, Hash: h.Hash(), Parent: h.ParentHash, Time: h.Time}
 					}
 				}
 				select {

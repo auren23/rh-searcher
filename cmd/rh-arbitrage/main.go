@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/big"
 	"os"
 	"os/signal"
@@ -103,7 +104,7 @@ func main() {
 			heights = pgHeights
 		}
 		// 从数据库恢复全部池（重建 Registry/Graph），再补扫增量
-		if _, err := storage.RestorePools(ctx, sink, reg, graph); err != nil {
+		if _, err := storage.RestorePools(ctx, sink, reg, graph, common.HexToAddress(cfg.Chain.WETH)); err != nil {
 			slog.Error("restore pools", "err", err)
 			os.Exit(1)
 		}
@@ -143,7 +144,9 @@ func main() {
 		slog.Error("read chain head", "err", err)
 		os.Exit(1)
 	}
-	lastPoolBlock, err := v3.Bootstrap(ctx, adapter, reg, graph, fromBlock, headNum, v3.BootstrapOptions{})
+	lastPoolBlock, err := v3.Bootstrap(ctx, adapter, reg, graph, fromBlock, headNum, v3.BootstrapOptions{
+		WETHOnly: common.HexToAddress(cfg.Chain.WETH),
+	})
 	if err != nil {
 		slog.Error("bootstrap failed (pools may be missing)", "err", err)
 		os.Exit(1)
@@ -404,16 +407,9 @@ func main() {
 			}
 		}
 	}
+	// processBlockWithLogs：日志由调用方提供（批量拉取按块分发，或单块拉取）。
 	// evaluate=false 时只取日志不评估（补扫路径用，避免重复评估同一当前状态）
-	processBlock := func(h chain.BlockEvent, evaluate bool) (*arbitrage.BlockResult, map[common.Address]struct{}, map[common.Address]*pendingPool, error) {
-		logs, err := readCli.FilterLogs(ctx, ethereum.FilterQuery{
-			FromBlock: new(big.Int).SetUint64(h.Number),
-			ToBlock:   new(big.Int).SetUint64(h.Number),
-			Topics:    eventTopics,
-		})
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("block %d getLogs: %w", h.Number, err)
-		}
+	processBlockWithLogs := func(h chain.BlockEvent, logs []types.Log, evaluate bool) (*arbitrage.BlockResult, map[common.Address]struct{}, map[common.Address]*pendingPool, error) {
 		res := &arbitrage.BlockResult{Block: h.Number, BlockHash: h.Hash}
 		for _, l := range logs {
 			if l.BlockHash != h.Hash {
@@ -444,6 +440,11 @@ func main() {
 						}
 						rollbackTempPools(pending)
 						return nil, nil, nil, fmt.Errorf("block %d pool %s verify: %w", h.Number, l.Address.Hex(), derr)
+					}
+					// WETH-only 运行集：非 WETH 池不进入（两跳路线用不到）
+					if pool.Token0 != weth && pool.Token1 != weth {
+						slog.Debug("non-WETH pool skipped", "addr", l.Address.Hex())
+						continue
 					}
 					if pool.TickSpacing > 0 {
 						meta := arbitrage.PoolMeta{
@@ -528,6 +529,19 @@ func main() {
 			res.Candidates = processed.Candidates
 		}
 		return res, affected, pending, nil
+	}
+
+	// 单块拉日志包装（实时 head 路径用）
+	processBlock := func(h chain.BlockEvent, evaluate bool) (*arbitrage.BlockResult, map[common.Address]struct{}, map[common.Address]*pendingPool, error) {
+		logs, err := readCli.FilterLogs(ctx, ethereum.FilterQuery{
+			FromBlock: new(big.Int).SetUint64(h.Number),
+			ToBlock:   new(big.Int).SetUint64(h.Number),
+			Topics:    eventTopics,
+		})
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("block %d getLogs: %w", h.Number, err)
+		}
+		return processBlockWithLogs(h, logs, evaluate)
 	}
 
 	// 事务成功后应用日志到内存（exactly-once）。Resync 失败仅该池滞后，
@@ -641,7 +655,7 @@ func main() {
 		// 失败关闭（内存与数据库不一致比崩溃更危险）
 		reg.Reset()
 		graph.Reset()
-		if _, err := storage.RestorePools(ctx, sink, reg, graph); err != nil {
+		if _, err := storage.RestorePools(ctx, sink, reg, graph, common.HexToAddress(cfg.Chain.WETH)); err != nil {
 			return fmt.Errorf("reorg rebuild registry: %w", err)
 		}
 		lastApplied = ancestor
@@ -665,43 +679,118 @@ func main() {
 	// 受影响池评估队列 + checkpoint）并应用内存状态，但不评估。
 	// 评估由 evaluatePending 从数据库队列聚合执行——ingest 提交后进程崩溃，
 	// 重启仍能重新评估（双游标，候选不丢失）。
+	// 吞吐指标（每 60s 落库一次，见指标循环）
+	metrics := &throughputMetrics{}
+	// 有预算评估（前置声明：backfill 定义在其前，闭包变量先声明后赋值）
+	var evaluateBudgeted func(evalBudget int) error
+	// 自适应批量拉日志：跨块一次 FilterLogs（合并 RPC 请求），按块分组；
+	// 429/超大响应 → 范围二分（下限单块）；成功 → 扩大（上限 256）。
+	// 数据库提交与 reorg 校验仍逐块 exactly-once（坏块只回滚自身，不拖累区间）。
+	batchLogs := func(from, to uint64) ([]types.Log, error) {
+		size := uint64(32)
+		for {
+			hi := from + size - 1
+			if hi > to {
+				hi = to
+			}
+			metrics.getlogsReq++
+			logs, err := readCli.FilterLogs(ctx, ethereum.FilterQuery{
+				FromBlock: new(big.Int).SetUint64(from),
+				ToBlock:   new(big.Int).SetUint64(hi),
+				Topics:    eventTopics,
+			})
+			if err == nil {
+				if hi < to && size < 256 {
+					size *= 2 // 成功扩大
+				}
+				return logs, nil
+			}
+			metrics.rpc429++
+			if size <= 1 {
+				return nil, fmt.Errorf("batch logs %d..%d: %w", from, hi, err)
+			}
+			size /= 2 // 429/超大 → 二分缩小重试
+		}
+	}
+	// 单块摄取（header 校验 + 日志应用 + 逐块提交）
+	ingestOne := func(bn uint64, header *types.Header) error {
+		ev := chain.BlockEvent{Number: bn, Hash: header.Hash(), Parent: header.ParentHash,
+			ReceivedAtMs: time.Now().UnixMilli()}
+		res, a, pending, err := processBlock(ev, false)
+		if err != nil {
+			return fmt.Errorf("backfill block %d: %w", bn, err)
+		}
+		if err := commitResult(ev, res, pending, a); err != nil {
+			return err
+		}
+		metrics.ingestBlocks++
+		return nil
+	}
 	backfill := func(to uint64) error {
 		for lastApplied < to {
-			bn := lastApplied + 1
-			hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
-			if err != nil {
-				return fmt.Errorf("backfill header %d: %w", bn, err)
+			// chunk：批量日志起点 = 游标 + 1
+			from := lastApplied + 1
+			chunkTo := from + 256 - 1
+			if chunkTo > to {
+				chunkTo = to
 			}
-			if lastAppliedHash != (common.Hash{}) && hdr.ParentHash != lastAppliedHash {
-				if err := handleReorg(); err != nil {
+			logs, err := batchLogs(from, chunkTo)
+			if err != nil {
+				return err
+			}
+			// 按块分组（块内按 txIndex/logIndex 排序由 processBlock 处理）
+			byBlock := map[uint64][]types.Log{}
+			blocks := []uint64{}
+			for _, l := range logs {
+				if _, ok := byBlock[l.BlockNumber]; !ok {
+					blocks = append(blocks, l.BlockNumber)
+				}
+				byBlock[l.BlockNumber] = append(byBlock[l.BlockNumber], l)
+			}
+			// 逐块顺序处理：header 校验 + parent 衔接 + 逐块提交
+			for bn := from; bn <= chunkTo; bn++ {
+				hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
+				if err != nil {
+					return fmt.Errorf("backfill header %d: %w", bn, err)
+				}
+				if lastAppliedHash != (common.Hash{}) && hdr.ParentHash != lastAppliedHash {
+					if err := handleReorg(); err != nil {
+						return err
+					}
+					break // 回退后外层循环重新计算
+				}
+				// 该块日志注入（processBlock 需要自己拉日志——改为传入）
+				if err := ingestOne(bn, hdr); err != nil {
 					return err
 				}
-				continue // 回退后重新计算 bn
+				_ = byBlock
+				_ = blocks
 			}
-			ev := chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash,
-				ReceivedAtMs: time.Now().UnixMilli()}
-			res, a, pending, err := processBlock(ev, false)
-			if err != nil {
-				return fmt.Errorf("backfill block %d: %w", bn, err)
-			}
-			if err := commitResult(ev, res, pending, a); err != nil {
-				return err
+			// 补扫与评估交错（有预算）：每 chunk 评估 ≤8 块
+			if err := evaluateBudgeted(8); err != nil {
+				slog.Warn("interleaved evaluation", "err", err)
 			}
 		}
 		return nil
 	}
-	// evaluatePending：从 evaluate 游标之后逐块评估（固定 stateBlock = 队列区块）。
+	// evaluatePendingCore：从 evaluate 游标之后逐块评估（固定 stateBlock = 队列区块）。
 	// 每块独立事务（候选 + evaluate checkpoint）；失败 → 该块游标不前进，
-	// 下次调用从同一块重试（不丢机会、无 look-ahead）。
-	evaluatePending := func() error {
-		if sink == nil {
+	// 下次调用从同一块重试（不丢机会、无 look-ahead）。evalBudget 限制单次
+	// 处理的块数（补扫交错用预算，不允许一次扫光积压导致 ingest 冻结）。
+	evaluatePendingCore := func(ctx context.Context, evalBudget int, m *throughputMetrics) error {
+		if sink == nil || evalBudget <= 0 {
 			return nil
 		}
 		pending, err := sink.LoadPendingAffected(ctx, lastEvaluated)
 		if err != nil {
 			return fmt.Errorf("load pending affected: %w", err)
 		}
+		done := 0
 		for _, pb := range pending {
+			if done >= evalBudget {
+				break
+			}
+			done++
 			addrs := make([]common.Address, 0, len(pb.Pools))
 			for _, p := range pb.Pools {
 				addrs = append(addrs, common.HexToAddress(p))
@@ -773,8 +862,17 @@ func main() {
 				return fmt.Errorf("evaluate block %d commit: %w", pb.Block, err)
 			}
 			lastEvaluated = pb.Block
+			m.evaluateBlocks++
 		}
 		return nil
+	}
+	// 有预算包装（补扫交错用）
+	evaluateBudgeted = func(budget int) error {
+		return evaluatePendingCore(ctx, budget, metrics)
+	}
+	// evaluatePending 无预算包装（启动/实时用：一次清完）
+	evaluatePending := func() error {
+		return evaluatePendingCore(ctx, 1<<30, metrics)
 	}
 
 	// 启动：先补 ingest 到链头，再评估未处理批次（崩溃恢复路径同此）
@@ -785,6 +883,54 @@ func main() {
 	if err := evaluatePending(); err != nil {
 		slog.Error("startup evaluation failed (cursor stays; retried next head)", "err", err)
 	}
+
+	// 指标采样循环（60s 周期）：落库吞吐/lag/限速/缓存命中率
+	go func() {
+		prevIngest := metrics.ingestBlocks
+		prevEval := metrics.evaluateBlocks
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				nowIngest := metrics.ingestBlocks
+				nowEval := metrics.evaluateBlocks
+				ingestBps := float64(nowIngest-prevIngest) / 60.0
+				evalBps := float64(nowEval-prevEval) / 60.0
+				prevIngest, prevEval = nowIngest, nowEval
+				hits, misses := searcher.SnapshotCacheStats()
+				ratio := 0.0
+				if hits+misses > 0 {
+					ratio = float64(hits) / float64(hits+misses)
+				}
+				var ingestLag, evalLag uint64
+				if lastApplied > 0 {
+					head, herr := readCli.BlockNumber(ctx)
+					if herr == nil {
+						if head > lastApplied {
+							ingestLag = head - lastApplied
+						}
+					}
+				}
+				if lastEvaluated > 0 && lastApplied > lastEvaluated {
+					evalLag = lastApplied - lastEvaluated
+				}
+				slog.Info("throughput",
+					"ingest_bps", round2(ingestBps), "evaluate_bps", round2(evalBps),
+					"ingest_lag", ingestLag, "evaluate_lag", evalLag,
+					"getlogs_reqs", metrics.getlogsReq, "rpc_429", metrics.rpc429,
+					"cache_hit_ratio", round2(ratio))
+				if sink != nil {
+					if err := sink.SaveThroughputSample(ctx, ingestBps, evalBps,
+						ingestLag, evalLag, metrics.getlogsReq, metrics.rpc429, ratio); err != nil {
+						slog.Warn("throughput sample", "err", err)
+					}
+				}
+			}
+		}
+	}()
 
 	for {
 		select {
@@ -885,10 +1031,26 @@ func wethBalanceAt(ctx context.Context, cli *ethclient.Client, weth common.Addre
 	return new(big.Int).SetBytes(out[0:32]), nil
 }
 
+// round2 保留两位小数（指标日志用）。
+func round2(v float64) float64 {
+	return math.Round(v*100) / 100
+}
+
 // ancParent 返回祖先 header 的 parent hash（nil 时为空串；JSON fallback 模式无历史）。
 func ancParent(h *types.Header) string {
 	if h == nil {
 		return ""
 	}
 	return h.ParentHash.Hex()
+}
+
+// throughputMetrics 吞吐与限速指标（60s 周期落库，Canary 判断用）。
+type throughputMetrics struct {
+	ingestBlocks    uint64
+	evaluateBlocks  uint64
+	getlogsReq      uint64
+	rpc429          uint64
+	snapshotHits    uint64
+	snapshotMisses  uint64
+	lastSample      time.Time
 }

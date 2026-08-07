@@ -16,10 +16,16 @@ import (
 // LocalSearcher 基于本地池状态的候选搜索器。
 // 候选搜索必须用本地状态，禁止把 Quoter 塞进搜索热路径。
 type LocalSearcher struct {
-	graph        *dex.Graph
-	registry     *dex.Registry
-	v3           V3Client
-	weth         common.Address
+	graph    *dex.Graph
+	registry *dex.Registry
+	v3       V3Client
+	weth     common.Address
+	// 池状态缓存：(headHash + pool) → 已刷新到该 head 的不可变克隆。
+	// 同一 head 内多个 pending 块反复访问相同池时复用；新 head 整体失效。
+	snapshotCache     map[string]*v3.Pool
+	snapshotCacheHead common.Hash
+	snapshotHits      uint64
+	snapshotMisses    uint64
 	maxInputWei  *big.Int // 单笔资金上限（nil = 不限）
 	minInputWei  *big.Int // 单笔下限（nil = 默认 1e-5 WETH）
 	contractBal  *big.Int // 执行合约 WETH 余额（nil = 未知）
@@ -33,7 +39,13 @@ type V3Client interface {
 }
 
 func NewLocalSearcher(g *dex.Graph, reg *dex.Registry, a V3Client, weth common.Address) *LocalSearcher {
-	return &LocalSearcher{graph: g, registry: reg, v3: a, weth: weth}
+	return &LocalSearcher{graph: g, registry: reg, v3: a, weth: weth,
+		snapshotCache: make(map[string]*v3.Pool)}
+}
+
+// SnapshotCacheStats 缓存命中率（吞吐指标用）。
+func (s *LocalSearcher) SnapshotCacheStats() (hits, misses uint64) {
+	return s.snapshotHits, s.snapshotMisses
 }
 
 // SetFunding 注入资金限制（搜索上限 = min(池深度, maxInputWei, 合约余额)）。
@@ -208,6 +220,11 @@ func (s *LocalSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64
 	snap := &RouteSnapshot{Block: header.Number.Uint64(), BlockHash: header.Hash(),
 		BaseFee: header.BaseFee,
 		Pools:   make(map[common.Address]*v3.Pool, len(r.Hops))}
+	// 新 head：整体清空缓存（用 blockHash 防 reorg 复用错误状态）
+	if s.snapshotCacheHead != header.Hash() {
+		s.snapshotCache = make(map[string]*v3.Pool)
+		s.snapshotCacheHead = header.Hash()
+	}
 	for _, h := range r.Hops {
 		state := s.registry.Pool(h.Pool)
 		if state == nil {
@@ -222,12 +239,21 @@ func (s *LocalSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64
 			return nil, fmt.Errorf("pool %s created at %d (after evaluation block %d)",
 				h.Pool.Hex(), p.CreatedBlock, block)
 		}
-		// 评估 overlay：在克隆上刷新，绝不修改实时 Registry 的内存状态
-		// （历史回放不能污染 ingest 游标之后的事件应用）
-		cp := p.Clone()
-		if err := s.v3.RefreshPoolStateAt(ctx, cp, new(big.Int).SetUint64(block)); err != nil {
-			return nil, fmt.Errorf("%w: pool %s refresh at %d: %v",
-				ErrInfra, h.Pool.Hex(), block, err)
+		// 池级缓存：(headHash, pool)。命中 → 克隆缓存（不可变，调用方随便用）；
+		// 未命中 → 克隆原池 + 刷新 + 缓存。绝不修改实时 Registry。
+		key := h.Pool.Hex()
+		var cp *v3.Pool
+		if cached, ok := s.snapshotCache[key]; ok {
+			s.snapshotHits++
+			cp = cached.Clone()
+		} else {
+			s.snapshotMisses++
+			cp = p.Clone()
+			if err := s.v3.RefreshPoolStateAt(ctx, cp, new(big.Int).SetUint64(block)); err != nil {
+				return nil, fmt.Errorf("%w: pool %s refresh at %d: %v",
+					ErrInfra, h.Pool.Hex(), block, err)
+			}
+			s.snapshotCache[key] = cp
 		}
 		snap.Pools[h.Pool] = cp
 		snap.Hops = append(snap.Hops, SnapshotHop{Pool: cp, TokenIn: h.TokenIn})

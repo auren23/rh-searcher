@@ -93,7 +93,7 @@ func main() {
 			slog.Warn("postgres unavailable, pool persistence disabled", "err", err)
 		} else {
 			defer db.Close()
-			restored, err := storage.RestorePools(ctx, db, reg, graph)
+			restored, err := storage.RestorePools(ctx, db, reg, graph, common.HexToAddress(cfg.Chain.WETH))
 			if err != nil {
 				slog.Error("restore pools", "err", err)
 				os.Exit(1)
