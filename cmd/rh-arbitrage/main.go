@@ -799,10 +799,13 @@ func main() {
 			for _, l := range logs {
 				byBlock[l.BlockNumber] = append(byBlock[l.BlockNumber], l)
 			}
-			// 逐块处理：只对有日志的块拉 header + 校验 + 逐块提交；
+			// 逐块处理：只对有日志的块拉 header + 逐块提交；
 			// 无日志块无状态副作用 → 只推进内存游标（不逐块提交，省 header RPC）。
-			// chunk 末尾统一拉末块 header 作为游标 hash（reorg 检测在 chunk 边界）。
 			// 崩溃后重扫无日志块 = 无操作（幂等）；有日志块仍逐块 exactly-once。
+			// parent 校验只在 chunk 首日志块做一次（公共 RPC 多节点 recent-block
+			// hash 漂移是常态——逐块校验会伪 reorg 死循环 + 386k 池重建风暴）；
+			// 真 reorg 检测延迟到 chunk 边界，补扫为追赶模式可接受
+			checked := false
 			for bn := from; bn <= chunkTo; bn++ {
 				logs := byBlock[bn]
 				if len(logs) == 0 {
@@ -812,9 +815,9 @@ func main() {
 				if err != nil {
 					return fmt.Errorf("backfill header %d: %w", bn, err)
 				}
-				if lastAppliedHash != (common.Hash{}) && hdr.ParentHash != lastAppliedHash {
-					// 伪 reorg 防护：公共 RPC 多节点负载均衡下 hash 可能短暂
-					// 漂移——重拉同一块 2 次，hash 稳定不匹配才视为真 reorg
+				if !checked && lastAppliedHash != (common.Hash{}) && hdr.ParentHash != lastAppliedHash {
+					// 伪 reorg 防护：重拉同一块 3 次（100ms 间隔），
+					// hash 稳定不匹配才视为真 reorg
 					mismatch := true
 					for retry := 0; retry < 3; retry++ {
 						time.Sleep(100 * time.Millisecond)
@@ -835,6 +838,7 @@ func main() {
 						break // 回退后外层循环重新计算
 					}
 				}
+				checked = true
 				if err := ingestOne(bn, hdr, logs); err != nil {
 					return err
 				}
