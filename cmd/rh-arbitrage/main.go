@@ -728,10 +728,20 @@ func main() {
 				return logs, hi, nil
 			}
 			metrics.rpc429++
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "429") || strings.Contains(msg, "rate limit") {
+				// 限速：退避重试（不缩小、不放弃）；单块也持续重试
+				select {
+				case <-ctx.Done():
+					return nil, hi, ctx.Err()
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
 			if size <= 1 {
 				return nil, hi, fmt.Errorf("batch logs %d..%d: %w", from, hi, err)
 			}
-			size /= 2 // 429/超大 → 二分缩小重试
+			size /= 2 // 超大响应等 → 二分缩小重试
 		}
 	}
 	// headerAt 拉取 header（429/限速 → 2s 退避重试 ≤6 次；其余错误直接返回）
