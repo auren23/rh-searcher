@@ -317,9 +317,24 @@ func main() {
 	if maxObsLag == 0 {
 		maxObsLag = 2
 	}
+	// local_only 分支硬依赖 SafetyMarginWei（engine.go:326 net.Sub），缺失会 nil panic
+	minProfit := big.NewInt(1e13)
+	safetyMargin := big.NewInt(5e12)
+	if cfg.Arbitrage.MinProfitWei != "" {
+		if v, ok := new(big.Int).SetString(cfg.Arbitrage.MinProfitWei, 10); ok {
+			minProfit = v
+		}
+	}
+	if cfg.Arbitrage.SafetyMarginWei != "" {
+		if v, ok := new(big.Int).SetString(cfg.Arbitrage.SafetyMarginWei, 10); ok {
+			safetyMargin = v
+		}
+	}
 	engineCfg := arbitrage.Config{
 		ChainID:                  cfg.Chain.ID,
 		WETH:                     weth,
+		MinProfitWei:             minProfit,
+		SafetyMarginWei:          safetyMargin,
 		MaxHops:                  2,
 		TopK:                     cfg.Arbitrage.SimulationTopK,
 		Mode:                     "shadow",
