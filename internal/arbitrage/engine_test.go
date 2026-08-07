@@ -539,3 +539,48 @@ func TestEngineProcessTokenGroupAt(t *testing.T) {
 		t.Fatalf("eval ms stats invalid: %+v", res)
 	}
 }
+
+// InvalidatePool 后下一次 SnapshotTokenGroup 必须重新 RPC 刷新该池
+// （Mint/Burn 改变 initialized ticks 后旧快照不得复用）。
+func TestInvalidatePoolForcesRefresh(t *testing.T) {
+	ctx := context.Background()
+	reg := dex.NewRegistry()
+	graph := dex.NewGraph()
+	weth := common.Address{2}
+	token := common.Address{3}
+	for _, addr := range []byte{1, 4} {
+		p := v3.NewPoolFromMeta(common.Address{addr}, "uniswap-v3", weth, token, 3000, 60)
+		p.SqrtPriceX96 = new(big.Int).SetUint64(100e6)
+		p.Liquidity = big.NewInt(1e18)
+		p.Tick = 0
+		reg.UpsertPool(v3.State(p))
+		graph.AddPool(p.Pool(), p.Address)
+	}
+	fv := &fakeV3{}
+	searcher := NewLocalSearcher(graph, reg, fv, weth)
+	if _, err := searcher.SnapshotTokenGroup(ctx, token, 100); err != nil {
+		t.Fatalf("first snapshot: %v", err)
+	}
+	n1 := len(fv.refreshed)
+	if n1 != 2 {
+		t.Fatalf("first snapshot refreshed %d pools, want 2", n1)
+	}
+	// 同 head 第二次：全缓存命中，零刷新
+	if _, err := searcher.SnapshotTokenGroup(ctx, token, 100); err != nil {
+		t.Fatalf("second snapshot: %v", err)
+	}
+	if len(fv.refreshed) != n1 {
+		t.Fatalf("repeat snapshot refreshed again: %d -> %d (cache broken)", n1, len(fv.refreshed))
+	}
+	// InvalidatePool 只失效该池：下一次只刷新它
+	searcher.InvalidatePool(common.Address{1})
+	if _, err := searcher.SnapshotTokenGroup(ctx, token, 100); err != nil {
+		t.Fatalf("third snapshot: %v", err)
+	}
+	if len(fv.refreshed) != n1+1 {
+		t.Fatalf("invalidate did not force refresh: %d -> %d", n1, len(fv.refreshed))
+	}
+	if fv.refreshed[n1] != "0x0100000000000000000000000000000000000000:100" {
+		t.Fatalf("invalidated pool not refreshed: %v", fv.refreshed[n1])
+	}
+}

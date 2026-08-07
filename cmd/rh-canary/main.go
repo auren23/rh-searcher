@@ -57,25 +57,29 @@ const (
 
 // metricsView 无锁指标视图（snapshot 输出，禁止复制带锁结构）。
 type metricsView struct {
-	startedAt       time.Time
-	eventsTotal     uint64     // 收到的全部 Swap 日志（订阅 + 恢复）
-	eventsNonWeth   uint64     // 本地 WETH 池集过滤掉的事件
-	eventsEvaluated uint64     // 进入评估的事件
-	eventsFresh     uint64     // lag <= maxObsLag 的评估（fresh 样本）
-	eventsStaleSkip uint64     // lag > staleSkipLag 未评估（不制造噪音）
-	evalErrors      uint64     // 基础设施错误（快照/head 失败）
-	disconnects     uint64     // WSS 断线重连次数
-	recoveries      uint64     // 缺口恢复次数
-	recoveredBlocks uint64     // 恢复覆盖的区块数
-	recoveredLogs   uint64     // 恢复拉到的日志数
-	grossPositive   uint64     // gross > 0 候选数
-	netPos          [3]uint64  // net1x/2x/3x > 0 候选数
-	poolsDiscovered uint64     // 运行时新发现的 WETH 池数（自发现模式）
-	crossChecks     uint64     // 公共 RPC head 对照次数
-	crossMismatches uint64     // 公共 RPC 与 Alchemy head 不一致次数
-	lagSamples      []uint64   // state_lag_blocks（全部 WETH 事件）
-	evalMsSamples   []int64    // event_to_evaluation_ms（评估完成 - 事件接收）
-	evalStats       []evalStat // 每次 token 组评估的吞吐明细
+	startedAt        time.Time
+	eventsTotal      uint64     // 收到的全部 Swap 日志（订阅 + 恢复）
+	eventsNonWeth    uint64     // 本地 WETH 池集过滤掉的事件
+	eventsEvaluated  uint64     // 进入评估的事件
+	eventsFresh      uint64     // lag <= maxObsLag 的评估（fresh 样本）
+	eventsFreshRoute uint64     // fresh 且 route_count>0 的评估（真实路线样本；停止条件）
+	eventsStaleSkip  uint64     // lag > staleSkipLag 未评估（不制造噪音）
+	evalErrors       uint64     // 基础设施错误（快照/head 失败）
+	lpEvents         uint64     // Mint/Burn 事件（bitmap/快照 invalidate）
+	bursts           uint64     // 触发的正利润 burst 复测
+	burstSamples     uint64     // burst 采样点数
+	disconnects      uint64     // WSS 断线重连次数
+	recoveries       uint64     // 缺口恢复次数
+	recoveredBlocks  uint64     // 恢复覆盖的区块数
+	recoveredLogs    uint64     // 恢复拉到的日志数
+	grossPositive    uint64     // gross > 0 候选数
+	netPos           [3]uint64  // net1x/2x/3x > 0 候选数
+	poolsDiscovered  uint64     // 运行时新发现的 WETH 池数（自发现模式）
+	crossChecks      uint64     // 公共 RPC head 对照次数
+	crossMismatches  uint64     // 公共 RPC 与 Alchemy head 不一致次数
+	lagSamples       []uint64   // state_lag_blocks（全部 WETH 事件）
+	evalMsSamples    []int64    // event_to_evaluation_ms（评估完成 - 事件接收）
+	evalStats        []evalStat // 每次 token 组评估的吞吐明细
 }
 
 // evalStat 单次 token-group 评估的吞吐指标（性能验收：p50/p95）。
@@ -143,13 +147,18 @@ type candidateRecord struct {
 	Route               string `json:"route"`
 	Rank                int    `json:"rank"`
 	Token               string `json:"token,omitempty"`
-	InputAmountWei      string `json:"input_amount_wei"`
-	GrossProfitWei      string `json:"gross_profit_wei,omitempty"`
-	NetProfitWei        string `json:"net_profit_wei,omitempty"`
-	GasCostWei          string `json:"gas_cost_wei,omitempty"`
-	Net1xWei            string `json:"net1x_wei,omitempty"`
-	Net2xWei            string `json:"net2x_wei,omitempty"`
-	Net3xWei            string `json:"net3x_wei,omitempty"`
+	// alpha 分类（不再用 event lag 一刀切）：
+	// causal_fresh: event lag<=2（Swap 刚发生后是否形成套利）
+	// actionable_latest: 当前 head 状态净利>0（收到信号后是否还有交易可做）
+	CausalFresh      bool   `json:"causal_fresh,omitempty"`
+	ActionableLatest bool   `json:"actionable_latest,omitempty"`
+	InputAmountWei   string `json:"input_amount_wei"`
+	GrossProfitWei   string `json:"gross_profit_wei,omitempty"`
+	NetProfitWei     string `json:"net_profit_wei,omitempty"`
+	GasCostWei       string `json:"gas_cost_wei,omitempty"`
+	Net1xWei         string `json:"net1x_wei,omitempty"`
+	Net2xWei         string `json:"net2x_wei,omitempty"`
+	Net3xWei         string `json:"net3x_wei,omitempty"`
 	// 本次 token 组评估的吞吐指标（性能验收用）
 	RpcCalls     int   `json:"rpc_calls,omitempty"`
 	UniquePools  int   `json:"unique_pools,omitempty"`
@@ -157,6 +166,24 @@ type candidateRecord struct {
 	StateFetchMs int64 `json:"state_fetch_ms,omitempty"`
 	LocalQuoteMs int64 `json:"local_quote_ms,omitempty"`
 	TotalEvalMs  int64 `json:"total_eval_ms,omitempty"`
+}
+
+// burstRecord 正利润机会的衰减复测行：T+0/100/250/500ms/1s/2s/5s 重新报价，
+// 记录 profit decay（机会半衰期、gross/net 归零时刻）。
+type burstRecord struct {
+	TS             int64  `json:"ts"`
+	Kind           string `json:"kind"` // "burst"
+	Token          string `json:"token"`
+	Route          string `json:"route"`
+	AmountWei      string `json:"amount_wei"`
+	Block          uint64 `json:"block"` // 触发评估的事件块
+	DelayMs        int64  `json:"delay_ms"`
+	Head           uint64 `json:"head"`
+	GrossProfitWei string `json:"gross_profit_wei"`
+	Net1xWei       string `json:"net1x_wei,omitempty"`
+	Net2xWei       string `json:"net2x_wei,omitempty"`
+	Net3xWei       string `json:"net3x_wei,omitempty"`
+	Done           string `json:"done,omitempty"` // "" | "gross_zero" | "completed"
 }
 
 // eventRecord 每个 WETH Swap 事件一行（含被跳过的事件；评估结果由 candidate 行承载）。
@@ -170,6 +197,7 @@ type eventRecord struct {
 	Pool                string `json:"pool"`
 	Token               string `json:"token,omitempty"`
 	Head                uint64 `json:"head"`
+	CausalFresh         bool   `json:"causal_fresh,omitempty"`
 	StateLagBlocks      uint64 `json:"state_lag_blocks"`
 	EventToEvaluationMs int64  `json:"event_to_evaluation_ms"`
 	Skipped             string `json:"skipped,omitempty"` // "" | "stale" | "non_weth" | "discovery_pending" | "head_error" | "eval_error" | "eval_throttled"
@@ -207,24 +235,29 @@ type canary struct {
 	outMu           sync.Mutex                  // JSONL 写入互斥（bufio.Writer 非线程安全）
 	// 注：无全局评估节流。同 token 连续事件由 (headHash,pool) 快照缓存吸收——
 	// 同一 head 的重复评估零 RPC（rpc_calls p50≈0），无需人为限速。
-	cursor     chain.LogCursor
-	logFilter  map[string]interface{} // eth_subscribe logs 参数（必须小写 key）
-	metrics    *metrics
-	out        *bufio.Writer
-	outFile    *os.File
-	maxObsLag  uint64
-	staleSkip  uint64
-	chunk      uint64
-	maxEvals   int
-	duration   time.Duration
-	startedAt  time.Time
-	startFrom  uint64        // 启动对齐：H0（首次恢复起点）
-	headMu     sync.Mutex    // latestHead 由 newHeads 订阅 goroutine 更新
-	headVal    uint64        // 最新 head（WSS 同流推送 → 与日志同延迟，lag 精确）
-	headHeader *types.Header // 与 headVal 同锁更新的最新 header（评估 hint 用）
-	publicRPC  string
-	poolFile   string
-	stopCh     chan struct{}
+	cursor  chain.LogCursor
+	metrics *metrics
+	// 订阅管理：route-capable 池集（address 过滤，服务器端减流）或全链（-all-pools）。
+	// resubscribe 置位后 consume 循环退出、重建订阅（新池加入时）。
+	subscribedPools []common.Address
+	allPools        bool
+	shardSize       int
+	resubscribe     bool
+	out             *bufio.Writer
+	outFile         *os.File
+	maxObsLag       uint64
+	staleSkip       uint64
+	chunk           uint64
+	maxRouteEvals   int
+	duration        time.Duration
+	startedAt       time.Time
+	startFrom       uint64        // 启动对齐：H0（首次恢复起点）
+	headMu          sync.Mutex    // latestHead 由 newHeads 订阅 goroutine 更新
+	headVal         uint64        // 最新 head（WSS 同流推送 → 与日志同延迟，lag 精确）
+	headHeader      *types.Header // 与 headVal 同锁更新的最新 header（评估 hint 用）
+	publicRPC       string
+	poolFile        string
+	stopCh          chan struct{}
 }
 
 // pendingLog 等待评估的 WETH Swap 事件（token 组批处理单元）。
@@ -238,7 +271,9 @@ type pendingLog struct {
 func main() {
 	cfgPath := flag.String("config", "configs/robinhood.yaml", "config file")
 	duration := flag.Duration("duration", 2*time.Hour, "max canary run duration")
-	maxEvals := flag.Int("max-evals", 1000, "stop after N fresh evaluations (lag <= max-obs-lag)")
+	maxRouteEvals := flag.Int("max-route-evals", 1000, "stop after N fresh route-bearing evaluations (lag <= max-obs-lag and route_count>0)")
+	allPools := flag.Bool("all-pools", false, "subscribe ALL V3 Swap/Mint/Burn without address filter (A/B lag comparison vs route-capable filter)")
+	shardSize := flag.Int("sub-shard", 200, "max pool addresses per logs subscription shard")
 	chunk := flag.Uint64("recovery-chunk", 10, "max blocks per getLogs recovery query (Alchemy free limit)")
 	staleSkip := flag.Uint64("stale-skip-lag", 10, "skip evaluation when state_lag > N (no signal, just noise)")
 	outDir := flag.String("out-dir", "data/canary", "output directory for results jsonl")
@@ -319,9 +354,11 @@ func main() {
 			}
 		}
 	}
+	var uni []v3.UniversePool
 	if len(wethPools) == 0 {
 		// 文件宇宙回退（PG 不可用/被清）：一次性 bootstrap 产物，静态池保留。
-		if uni, uerr := v3.LoadUniverse(*poolFile); uerr == nil && len(uni) > 0 {
+		var uerr error
+		if uni, uerr = v3.LoadUniverse(*poolFile); uerr == nil && len(uni) > 0 {
 			for _, u := range uni {
 				addr := common.HexToAddress(u.Address)
 				p := v3.NewPoolFromMetaWithCreated(addr, u.Exchange,
@@ -412,8 +449,19 @@ func main() {
 	defer outFile.Close()
 	out := bufio.NewWriter(outFile)
 
+	// 订阅池集：route-capable（token 有 >=2 个 WETH 池）——只有它们能成两跳环，
+	// 服务器端 address 过滤掉 38 万池里 99% 的无关 Swap/Mint/Burn 流量。
+	subscribedPools := v3.RouteCapablePools(uni, weth)
+	if len(subscribedPools) == 0 && len(wethPools) > 0 {
+		// PG 恢复路径没有 uni 切片：从 reg/graph 现算
+		subscribedPools = routeCapableFromRegistry(reg, weth)
+	}
+	slog.Info("subscription pool set", "route_capable_pools", len(subscribedPools),
+		"universe_pools", len(wethPools), "all_pools_mode", *allPools)
+
 	c := &canary{
 		cfg:             cfg,
+		subscribedPools: subscribedPools,
 		weth:            weth,
 		httpCli:         httpCli,
 		streamURL:       streamURL,
@@ -428,25 +476,20 @@ func main() {
 		discoverPending: make(map[common.Address]struct{}),
 		discoverCh:      make(chan common.Address, 4096),
 
-		// 订阅参数必须用小写 key map：go-ethereum 的 ethereum.FilterQuery 没有
-		// json tag，直接传 rpc.EthSubscribe 会把字段序列化成大写（"Topics"），
-		// Nitro 节点忽略未知 key → 订阅退化为全量日志。已验证格式：
-		// {"topics":[[swapTopic]]}（与 ethclient.toFilterArg 的 key 一致）。
-		logFilter: map[string]interface{}{
-			"topics": [][]common.Hash{{v3.SwapTopic()}},
-		},
-		metrics:   &metrics{v: metricsView{startedAt: startedAt}},
-		out:       out,
-		outFile:   outFile,
-		maxObsLag: maxObsLag,
-		staleSkip: *staleSkip,
-		chunk:     *chunk,
-		maxEvals:  *maxEvals,
-		duration:  *duration,
-		startedAt: startedAt,
-		publicRPC: publicRPC,
-		poolFile:  *poolFile,
-		stopCh:    make(chan struct{}),
+		metrics:       &metrics{v: metricsView{startedAt: startedAt}},
+		out:           out,
+		outFile:       outFile,
+		maxObsLag:     maxObsLag,
+		staleSkip:     *staleSkip,
+		chunk:         *chunk,
+		maxRouteEvals: *maxRouteEvals,
+		allPools:      *allPools,
+		shardSize:     *shardSize,
+		duration:      *duration,
+		startedAt:     startedAt,
+		publicRPC:     publicRPC,
+		poolFile:      *poolFile,
+		stopCh:        make(chan struct{}),
 	}
 
 	// ---- 启动对齐：H0 = 当前链头，只处理启动后的新鲜窗口 ----
@@ -464,7 +507,7 @@ func main() {
 	slog.Info("canary starting",
 		"stream", maskKey(streamURL), "alchemy", maskKey(alchemyURL),
 		"start_head", h0, "pools", len(wethPools),
-		"duration", c.duration, "max_fresh_evals", c.maxEvals,
+		"duration", c.duration, "max_fresh_route_evals", c.maxRouteEvals,
 		"recovery_chunk_blocks", c.chunk, "stale_skip_lag", c.staleSkip,
 		"out", outPath)
 
@@ -485,6 +528,99 @@ func main() {
 	// ---- 汇总 ----
 	m := c.metrics.snapshot()
 	summary(ctx, c, m, runErr)
+}
+
+// routeCapableFromRegistry 从 Registry 现算 route-capable 池集
+// （token 拥有 >=2 个 WETH 池）。PG 恢复路径没有 universe 切片时用。
+func routeCapableFromRegistry(reg *dex.Registry, weth common.Address) []common.Address {
+	counts := make(map[common.Address]int)
+	pools := make(map[common.Address]common.Address) // pool -> token
+	for _, st := range reg.AllPools() {
+		p := v3.UnwrapState(st)
+		if p == nil {
+			continue
+		}
+		tok := p.Token0
+		if tok == weth {
+			tok = p.Token1
+		} else if p.Token1 != weth {
+			continue
+		}
+		counts[tok]++
+		pools[p.Address] = tok
+	}
+	var out []common.Address
+	for addr, tok := range pools {
+		if counts[tok] >= 2 {
+			out = append(out, addr)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Hex() < out[j].Hex() })
+	return out
+}
+
+// rebuildSubscribedPools 重算订阅池集（新池加入 universe 后调用）。
+// 只在 !allPools 模式下有意义。
+func (c *canary) rebuildSubscribedPools() {
+	c.subscribedPools = routeCapableFromRegistry(c.reg, c.weth)
+	slog.Info("subscription pool set rebuilt", "pools", len(c.subscribedPools))
+}
+
+// logShard 一个 logs 订阅分片（Swap/Mint/Burn 三 topic；address 过滤可选）。
+type logShard struct {
+	sub *rpc.ClientSubscription
+	ch  chan types.Log
+}
+
+// logFilterFor 构造 eth_subscribe logs 参数（必须小写 key map：
+// go-ethereum 的 ethereum.FilterQuery 没有 json tag，直接传 rpc.EthSubscribe
+// 会把字段序列化成大写（"Topics"），Nitro 节点忽略未知 key → 订阅退化
+// 为全量日志。已验证格式：{"topics":[[...]],"address":[...]}）。
+func (c *canary) logFilterFor(shard []common.Address) map[string]interface{} {
+	f := map[string]interface{}{
+		"topics": [][]common.Hash{{v3.SwapTopic(), v3.MintTopic(), v3.BurnTopic()}},
+	}
+	if !c.allPools {
+		addrs := make([]string, 0, len(shard))
+		for _, a := range shard {
+			addrs = append(addrs, a.Hex())
+		}
+		f["address"] = addrs
+	}
+	return f
+}
+
+// subscribeLogShards 建立 Swap/Mint/Burn 订阅（按池集分片）。
+// allPools 模式：单片无 address 过滤（全链三 topic）。
+func (c *canary) subscribeLogShards(ctx context.Context, rc *rpc.Client) ([]*logShard, error) {
+	var shards [][]common.Address
+	if c.allPools {
+		shards = [][]common.Address{{}}
+	} else {
+		for i := 0; i < len(c.subscribedPools); i += c.shardSize {
+			end := i + c.shardSize
+			if end > len(c.subscribedPools) {
+				end = len(c.subscribedPools)
+			}
+			shards = append(shards, c.subscribedPools[i:end])
+		}
+	}
+	if len(shards) == 0 {
+		shards = [][]common.Address{{}} // 空池集也保持订阅（Mint/Burn 无需但无害）
+	}
+	out := make([]*logShard, 0, len(shards))
+	for _, sh := range shards {
+		ch := make(chan types.Log, 4096)
+		sub, err := rc.EthSubscribe(ctx, ch, "logs", c.logFilterFor(sh))
+		if err != nil {
+			for _, s := range out {
+				s.sub.Unsubscribe()
+			}
+			return nil, err
+		}
+		out = append(out, &logShard{sub: sub, ch: ch})
+	}
+	return out, nil
 }
 
 // run 订阅主循环：断线自动重连，每次（重）连接后先做缺口恢复再消费订阅。
@@ -531,12 +667,12 @@ func (c *canary) run(ctx context.Context) error {
 		} else {
 			slog.Warn("newHeads subscription failed; lag measured from stale head", "err", herr)
 		}
-		ch := make(chan types.Log, 4096)
-		sub, err := rc.EthSubscribe(ctx, ch, "logs", c.logFilter)
+		// 日志订阅分片（Swap/Mint/Burn 三 topic；route-capable 池 address 过滤）
+		shards, err := c.subscribeLogShards(ctx, rc)
 		if err != nil {
 			rc.Close()
 			c.metrics.inc(func(m *metricsView) { m.disconnects++ })
-			slog.Warn("eth_subscribe failed", "err", err)
+			slog.Warn("eth_subscribe logs failed", "err", err)
 			select {
 			case <-ctx.Done():
 				return nil
@@ -547,9 +683,64 @@ func (c *canary) run(ctx context.Context) error {
 			}
 			continue
 		}
-		slog.Info("logs subscription established", "url", maskKey(c.streamURL))
-		// 缺口恢复（首次：从 H0；重连后：从游标）。订阅先建、恢复后跑：
-		// 恢复期间到达的实时事件在 ch 缓冲，恢复处理后统一消费，LogCursor 去重。
+		// Factory PoolCreated 订阅：新池加入 universe；token 池数变化时重建订阅
+		factoryAddr := common.HexToAddress(c.cfg.Dexes.V3[0].Factory)
+		createdCh := make(chan types.Log, 256)
+		createdSub, err := rc.EthSubscribe(ctx, createdCh, "logs", map[string]interface{}{
+			"address": []string{factoryAddr.Hex()},
+			"topics":  [][]common.Hash{{v3.PoolCreatedTopic()}},
+		})
+		if err != nil {
+			// PoolCreated 订阅失败不致命：默认模式的已知池集仍完整，
+			// 新池只能等下次重建/自发现兜底
+			slog.Warn("pool-created subscription failed; new pools rely on discovery", "err", err)
+			createdSub = nil
+		}
+		slog.Info("logs subscriptions established", "shards", len(shards),
+			"subscribed_pools", len(c.subscribedPools), "all_pools", c.allPools,
+			"url", maskKey(c.streamURL))
+		// 分片聚合：每片 goroutine 转发到 aggCh；任一 sub 错误 → errCh
+		aggCh := make(chan types.Log, 8192)
+		errCh := make(chan struct{}, 1)
+		for _, sh := range shards {
+			go func(sh *logShard) {
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case _, ok := <-sh.sub.Err():
+						if !ok {
+							select {
+							case errCh <- struct{}{}:
+							default:
+							}
+							return
+						}
+						select {
+						case errCh <- struct{}{}:
+						default:
+						}
+						return
+					case l, ok := <-sh.ch:
+						if !ok {
+							select {
+							case errCh <- struct{}{}:
+							default:
+							}
+							return
+						}
+						select {
+						case aggCh <- l:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+			}(sh)
+		}
+		// 缺口恢复（首次：从 H0；重连/重建后：从游标）。订阅先建、恢复后跑：
+		// 恢复期间到达的实时事件在 aggCh 缓冲，恢复处理后统一消费，LogCursor 去重。
+		// 恢复查询覆盖 Swap/Mint/Burn 三种 topic（断线期间的 LP 变化不丢）。
 		from := c.startFrom
 		if c.cursor.Have {
 			from = c.cursor.BlockNumber
@@ -562,16 +753,17 @@ func (c *canary) run(ctx context.Context) error {
 		for !subErr {
 			select {
 			case <-ctx.Done():
-				sub.Unsubscribe()
+				for _, sh := range shards {
+					sh.sub.Unsubscribe()
+				}
+				if createdSub != nil {
+					createdSub.Unsubscribe()
+				}
 				rc.Close()
 				return nil
-			case _, ok := <-sub.Err():
-				if !ok {
-					subErr = true
-					break
-				}
+			case <-errCh:
 				subErr = true
-			case l, ok := <-ch:
+			case l, ok := <-aggCh:
 				if !ok {
 					subErr = true
 					break
@@ -582,21 +774,56 @@ func (c *canary) run(ctx context.Context) error {
 				c.cursor.Advance(l)
 				c.handleLog(ctx, l)
 				if c.stopReached() {
-					sub.Unsubscribe()
+					for _, sh := range shards {
+						sh.sub.Unsubscribe()
+					}
+					if createdSub != nil {
+						createdSub.Unsubscribe()
+					}
 					rc.Close()
 					return nil
 				}
+			case l, ok := <-createdCh:
+				if !ok {
+					createdCh = nil // 订阅已关闭：禁用该分支（nil channel 永久阻塞）
+					break
+				}
+				c.handlePoolCreated(ctx, l)
 			case <-time.After(5 * time.Second):
 				// 静默期（链上无事件）也检查结束条件，避免挂到 SIGINT
 				if c.stopReached() {
-					sub.Unsubscribe()
+					for _, sh := range shards {
+						sh.sub.Unsubscribe()
+					}
+					if createdSub != nil {
+						createdSub.Unsubscribe()
+					}
 					rc.Close()
 					return nil
 				}
+				if c.resubscribe {
+					subErr = true // 新池加入：退出重建订阅（缺口由 recovery 补）
+				}
 			}
 		}
-		sub.Unsubscribe()
+		for _, sh := range shards {
+			sh.sub.Unsubscribe()
+		}
+		if createdSub != nil {
+			createdSub.Unsubscribe()
+		}
 		rc.Close()
+		if c.resubscribe {
+			c.resubscribe = false
+			c.rebuildSubscribedPools()
+			slog.Info("subscription set updated; reconnecting")
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(500 * time.Millisecond):
+			}
+			continue
+		}
 		c.metrics.inc(func(m *metricsView) { m.disconnects++ })
 		slog.Warn("logs subscription lost; reconnecting")
 		select {
@@ -613,7 +840,7 @@ func (c *canary) stopReached() bool {
 	if time.Since(c.startedAt) >= c.duration {
 		return true
 	}
-	return c.maxEvals > 0 && m.eventsFresh >= uint64(c.maxEvals)
+	return c.maxRouteEvals > 0 && m.eventsFreshRoute >= uint64(c.maxRouteEvals)
 }
 
 // recoverAndProcess 用 Alchemy HTTP getLogs 补齐 [from, head] 缺口，每次 ≤ chunk blocks。
@@ -657,9 +884,11 @@ func (c *canary) recoverAndProcess(ctx context.Context, from uint64) error {
 
 // getLogsRetry getLogs 带 429 退避重试（Alchemy 免费版 10-block 上限由调用方保证）。
 func (c *canary) getLogsRetry(ctx context.Context, from, to uint64) ([]types.Log, error) {
-	// HTTP getLogs 走 ethclient.FilterLogs（toFilterArg 小写 key，过滤正确）
+	// HTTP getLogs 走 ethclient.FilterLogs（toFilterArg 小写 key，过滤正确）。
+	// 三种 topic 一起恢复：断线期间的 Mint/Burn（LP 变化）不能丢，
+	// 否则 bitmap 缓存会永久脏。
 	q := ethereum.FilterQuery{
-		Topics: [][]common.Hash{{v3.SwapTopic()}},
+		Topics: [][]common.Hash{{v3.SwapTopic(), v3.MintTopic(), v3.BurnTopic()}},
 	}
 	q.FromBlock = new(big.Int).SetUint64(from)
 	q.ToBlock = new(big.Int).SetUint64(to)
@@ -865,18 +1094,100 @@ func (c *canary) headAndHeader() (uint64, *types.Header) {
 	return c.headVal, c.headHeader
 }
 
-// handleLog 单个 Swap 事件：记录全流量延迟 → WETH 池过滤（异步自发现）→ local_only 评估 → JSONL。
-// state_lag 对全部事件采样（含非 WETH）：Alchemy WSS 的交付新鲜度是全流量问题，
-// 策略评估只对已知 WETH 池执行。事件循环不做任何同步 RPC（head 缓存除外）——
-// 8 events/s 下同步发现/评估会让消费者落后，lag 失真。
+// handleLog 事件分流：Swap → 套利评估；Mint/Burn → 状态失效（不评估）。
+// 防御：订阅过滤可能被节点忽略（曾发生：大写 key 导致全量日志）——
+// 非三类 topic 直接丢弃，不污染延迟样本。
 func (c *canary) handleLog(ctx context.Context, l types.Log) {
 	c.metrics.inc(func(m *metricsView) { m.eventsTotal++ })
-	// 防御：订阅过滤可能被节点忽略（曾发生：大写 key 导致全量日志）。
-	// 非 Swap topic 直接丢弃，不污染延迟样本。
-	if len(l.Topics) == 0 || l.Topics[0] != v3.SwapTopic() {
-		c.metrics.inc(func(m *metricsView) { m.eventsNonWeth++ })
+	if len(l.Topics) == 0 {
 		return
 	}
+	switch l.Topics[0] {
+	case v3.MintTopic(), v3.BurnTopic():
+		c.handleLPEvent(ctx, l)
+	case v3.SwapTopic():
+		c.handleSwap(ctx, l)
+	default:
+		c.metrics.inc(func(m *metricsView) { m.eventsNonWeth++ })
+	}
+}
+
+// handleLPEvent Mint/Burn：只做 bitmap/快照缓存失效，不评估。
+// 无条件执行（事件即使晚到也是链上事实）：旧 initialized ticks 必须作废，
+// 最多代价是下次评估多一次 RPC，绝不会继续用旧 bitmap 报价。
+func (c *canary) handleLPEvent(ctx context.Context, l types.Log) {
+	c.metrics.inc(func(m *metricsView) { m.lpEvents++ })
+	c.engineMu.Lock()
+	c.adapter.InvalidateBitmapCache(l.Address)
+	c.searcher.InvalidatePool(l.Address)
+	c.engineMu.Unlock()
+	rec := eventRecord{
+		TS:        time.Now().UnixMilli(),
+		Kind:      "lp",
+		Block:     l.BlockNumber,
+		BlockHash: l.BlockHash.Hex(),
+		TxHash:    l.TxHash.Hex(),
+		LogIndex:  l.Index,
+		Pool:      l.Address.Hex(),
+	}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	c.outMu.Lock()
+	c.out.Write(raw)
+	c.out.WriteByte('\n')
+	c.out.Flush()
+	c.outMu.Unlock()
+}
+
+// handlePoolCreated Factory PoolCreated：新 WETH 池注册进 universe；
+// 不在当前订阅集时置 resubscribe（重建后新池进入实时订阅流）。
+func (c *canary) handlePoolCreated(ctx context.Context, l types.Log) {
+	meta, err := c.adapter.DecodePoolCreated(l)
+	if err != nil {
+		return
+	}
+	if meta.Token0 != c.weth && meta.Token1 != c.weth {
+		return // 非 WETH 池：当前策略不关心
+	}
+	if c.poolState(meta.Pool) == 1 {
+		return // 已注册（recovery 重放）
+	}
+	d := c.cfg.Dexes.V3[0]
+	p := v3.NewPoolFromMetaWithCreated(meta.Pool, d.Name, meta.Token0, meta.Token1,
+		meta.Fee, meta.TickSpacing, l.BlockNumber, l.BlockHash, "pool_created_log")
+	c.engineMu.Lock()
+	c.reg.UpsertPool(v3.State(p))
+	c.graph.AddPool(p.Pool(), p.Address)
+	c.engineMu.Unlock()
+	c.pmu.Lock()
+	c.wethPools[p.Address] = struct{}{}
+	c.pmu.Unlock()
+	c.metrics.inc(func(m *metricsView) { m.poolsDiscovered++ })
+	needResub := !c.allPools
+	if needResub {
+		for _, a := range c.subscribedPools {
+			if a == p.Address {
+				needResub = false
+				break
+			}
+		}
+	}
+	if needResub {
+		c.resubscribe = true
+		slog.Info("new WETH pool; subscription rebuild scheduled", "pool", p.Address.Hex(),
+			"token0", p.Token0.Hex(), "token1", p.Token1.Hex(), "fee", p.Fee)
+	} else {
+		slog.Info("new WETH pool registered", "pool", p.Address.Hex(),
+			"token0", p.Token0.Hex(), "token1", p.Token1.Hex(), "fee", p.Fee)
+	}
+	c.writePool(p)
+}
+
+// handleSwap 单个 Swap 事件：延迟采样 → WETH 池过滤 → token-group 评估 → JSONL。
+// 事件循环不做任何同步 RPC（head 缓存除外）——同步发现/评估会让消费者落后。
+func (c *canary) handleSwap(ctx context.Context, l types.Log) {
 	head := c.head()
 	if head == 0 {
 		c.metrics.inc(func(m *metricsView) { m.evalErrors++ })
@@ -1008,6 +1319,9 @@ func (c *canary) evaluateTokenBatch(ctx context.Context, token common.Address, b
 	c.metrics.inc(func(m *metricsView) {
 		m.eventsEvaluated += uint64(len(batch))
 		m.eventsFresh += uint64(freshCnt)
+		if res.RouteCount > 0 {
+			m.eventsFreshRoute += uint64(freshCnt) // 真实路线样本（停止条件）
+		}
 	})
 	best := ""
 	for _, cand := range res.Candidates {
@@ -1020,6 +1334,117 @@ func (c *canary) evaluateTokenBatch(ctx context.Context, token common.Address, b
 		c.writeEvent(pe.l, pe.head, pe.lag, "", best)
 	}
 	c.writeCandidates(first.l, head, first.lag, totalMs, res, token)
+	// 正利润机会 → 衰减 burst 复测（机会半衰期研究）
+	for _, cand := range res.Candidates {
+		if cand != nil && cand.Decision == decisionProfitable &&
+			cand.GrossProfit != nil && cand.GrossProfit.Sign() > 0 {
+			c.metrics.inc(func(m *metricsView) { m.bursts++ })
+			go c.burstDecay(ctx, token, cand)
+			break // 一次评估只触发一个 burst
+		}
+	}
+}
+
+// burstDecay 正利润机会的衰减复测：T+0/100/250/500ms/1s/2s/5s 重新取当前
+// head 状态并重报价（DecayQuote：同 head 命中快照缓存零 RPC），记录
+// profit decay——机会半衰期、gross/net 归零时刻、max_profit/optimal_input。
+// 连续两点 gross<=0 视为机会已死，提前结束。
+func (c *canary) burstDecay(ctx context.Context, token common.Address, cand *arbitrage.Candidate) {
+	delays := []int64{0, 100, 250, 500, 1000, 2000, 5000}
+	mult := c.cfg.Arbitrage.LocalGasStressMultiplier
+	if mult <= 0 {
+		mult = 2
+	}
+	gas1x := new(big.Int)
+	if cand.GasCostWei != nil && cand.GasCostWei.Sign() > 0 {
+		gas1x.Div(cand.GasCostWei, big.NewInt(int64(mult)))
+	}
+	route := arbitrage.Route{Hops: cand.Route}
+	amount := cand.InputAmount
+	start := time.Now()
+	zeroStreak := 0
+	for i, d := range delays {
+		wait := start.Add(time.Duration(d) * time.Millisecond).Sub(time.Now())
+		if wait > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+		}
+		head := c.head()
+		if head == 0 {
+			continue
+		}
+		c.engineMu.Lock()
+		gross, err := c.engine.DecayQuote(ctx, route, amount, head)
+		c.engineMu.Unlock()
+		if err != nil {
+			slog.Warn("burst requote failed", "delay_ms", d, "err", err)
+			continue
+		}
+		rec := burstRecord{
+			Kind:           "burst",
+			Token:          token.Hex(),
+			Route:          routeStr(cand.Route),
+			AmountWei:      amount.String(),
+			Block:          cand.ObservedBlock,
+			DelayMs:        d,
+			Head:           head,
+			GrossProfitWei: gross.String(),
+		}
+		if gross.Sign() > 0 && gas1x.Sign() > 0 {
+			for m := 1; m <= 3; m++ {
+				net := new(big.Int).Sub(gross, new(big.Int).Mul(gas1x, big.NewInt(int64(m))))
+				switch m {
+				case 1:
+					rec.Net1xWei = net.String()
+				case 2:
+					rec.Net2xWei = net.String()
+				case 3:
+					rec.Net3xWei = net.String()
+				}
+			}
+		}
+		if gross.Sign() <= 0 {
+			zeroStreak++
+			if zeroStreak >= 2 {
+				rec.Done = "gross_zero"
+				c.writeBurst(rec)
+				return
+			}
+		} else {
+			zeroStreak = 0
+		}
+		if i == len(delays)-1 {
+			rec.Done = "completed"
+		}
+		c.writeBurst(rec)
+	}
+}
+
+// writeBurst burst 采样行落 JSONL（并发安全：burst goroutine 调用）。
+func (c *canary) writeBurst(rec burstRecord) {
+	rec.TS = time.Now().UnixMilli()
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	c.metrics.inc(func(m *metricsView) { m.burstSamples++ })
+	c.outMu.Lock()
+	c.out.Write(raw)
+	c.out.WriteByte('\n')
+	c.out.Flush()
+	c.outMu.Unlock()
+}
+
+// routeStr 路由池地址串（"poolA;poolB"）。
+func routeStr(hops []arbitrage.Hop) string {
+	parts := make([]string, 0, len(hops))
+	for _, h := range hops {
+		parts = append(parts, h.Pool.Hex())
+	}
+	return strings.Join(parts, ";")
 }
 
 // writeEvent 事件行落 JSONL（跳过原因 + 延迟；评估结果在 candidate 行）。
@@ -1033,6 +1458,7 @@ func (c *canary) writeEvent(l types.Log, head, lag uint64, skipped, best string)
 		LogIndex:       l.Index,
 		Pool:           l.Address.Hex(),
 		Head:           head,
+		CausalFresh:    lag <= c.maxObsLag,
 		StateLagBlocks: lag,
 		Skipped:        skipped,
 		BestDecision:   best,
@@ -1054,13 +1480,6 @@ func (c *canary) writeCandidates(l types.Log, head, lag uint64, evalMs int64, re
 	if mult <= 0 {
 		mult = 2
 	}
-	routeStr := func(hops []arbitrage.Hop) string {
-		parts := make([]string, 0, len(hops))
-		for _, h := range hops {
-			parts = append(parts, h.Pool.Hex())
-		}
-		return strings.Join(parts, ";")
-	}
 	for _, cand := range res.Candidates {
 		if cand == nil || cand.Route == nil {
 			continue
@@ -1080,6 +1499,8 @@ func (c *canary) writeCandidates(l types.Log, head, lag uint64, evalMs int64, re
 			Route:               routeStr(cand.Route),
 			Rank:                cand.Rank,
 			Token:               token.Hex(),
+			CausalFresh:         lag <= c.maxObsLag,
+			ActionableLatest:    cand.Decision == decisionProfitable,
 			RpcCalls:            res.RpcCalls,
 			UniquePools:         res.UniquePools,
 			RouteCount:          res.RouteCount,
@@ -1156,7 +1577,9 @@ func statsLoop(ctx context.Context, c *canary) {
 				"elapsed", time.Since(m.startedAt).Round(time.Second),
 				"events", m.eventsTotal, "non_weth", m.eventsNonWeth,
 				"evaluated", m.eventsEvaluated, "fresh", m.eventsFresh,
+				"fresh_route", m.eventsFreshRoute,
 				"stale_skipped", m.eventsStaleSkip, "eval_errors", m.evalErrors,
+				"lp_events", m.lpEvents, "bursts", m.bursts,
 				"lag_p50", lagP50, "eval_ms_p50", evalP50,
 				"gross_positive", m.grossPositive,
 				"pools_discovered", m.poolsDiscovered,
@@ -1219,10 +1642,15 @@ func summary(ctx context.Context, c *canary, m metricsView, runErr error) {
 	w("events_non_weth_filtered: %d", m.eventsNonWeth)
 	w("pools_preloaded: %d", len(c.wethPools)-int(m.poolsDiscovered))
 	w("pools_discovered: %d", m.poolsDiscovered)
+	w("pools_subscribed (route-capable): %d", len(c.subscribedPools))
+	w("subscription_mode: %s", map[bool]string{true: "all-pools (no filter)", false: "route-capable address filter"}[c.allPools])
 	w("events_evaluated: %d", m.eventsEvaluated)
 	w("events_fresh (lag<=%d): %d", c.maxObsLag, m.eventsFresh)
+	w("events_fresh_route (lag<=%d, route_count>0): %d", c.maxObsLag, m.eventsFreshRoute)
 	w("events_stale_skipped (lag>%d): %d", c.staleSkip, m.eventsStaleSkip)
 	w("eval_errors: %d", m.evalErrors)
+	w("lp_events (Mint/Burn invalidate): %d", m.lpEvents)
+	w("burst_decay runs/samples: %d/%d", m.bursts, m.burstSamples)
 	w("wss_disconnects: %d", m.disconnects)
 	w("gap_recoveries: %d", m.recoveries)
 	w("gap_recovered_blocks: %d", m.recoveredBlocks)

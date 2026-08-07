@@ -78,6 +78,16 @@ func SwapTopic() common.Hash {
 	return crypto.Keccak256Hash([]byte("Swap(address,address,int256,int256,uint160,uint128,int24)"))
 }
 
+// MintTopic Mint 事件 topic0（Mint 有 sender + owner 两个 address）。
+func MintTopic() common.Hash {
+	return crypto.Keccak256Hash([]byte("Mint(address,address,int24,int24,uint128,uint256,uint256)"))
+}
+
+// BurnTopic Burn 事件 topic0（Burn 只有 owner 一个 address）。
+func BurnTopic() common.Hash {
+	return crypto.Keccak256Hash([]byte("Burn(address,int24,int24,uint128,uint256,uint256)"))
+}
+
 // DiscoverPools 扫描工厂 PoolCreated 日志，构造池（惰性状态，不读 slot0/liquidity）。
 func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock uint64) ([]*Pool, error) {
 	logs, err := a.factoryLogs(ctx, fromBlock, toBlock, nil)
@@ -461,6 +471,14 @@ func (a *Adapter) RefreshPoolsStateAt(ctx context.Context, pools []*Pool, block 
 		}
 	}
 	return rpcCalls, nil
+}
+
+// InvalidateBitmapCache 使池的跨 head bitmap word 缓存失效（Mint/Burn 事件
+// 改变 initialized ticks 时调用）。只删该池条目，保留其他池缓存。
+// 注意：invalidate 后下一次 RefreshPoolsStateAt 会重新 RPC 读取，
+// 不会继续使用旧 word——这是 bitmap 缓存正确性的唯一失效路径。
+func (a *Adapter) InvalidateBitmapCache(pool common.Address) {
+	delete(a.bitmapWordCache, pool)
 }
 
 // mcAggregate Multicall3 主路径，失败回退 JSON-RPC batch（分块 eth_call）。

@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 // UniversePool 宇宙池的持久化元数据（与 dex_pools 表同构）。
@@ -39,6 +41,42 @@ func AppendUniverseLine(path string, p UniversePool) error {
 		return err
 	}
 	return nil
+}
+
+// RouteCapablePools 从宇宙池元数据构造"可成环池集"：
+// 仅 token 拥有 >=2 个 WETH 池时，这些池才可能参与 WETH→TOKEN→WETH 两跳环。
+// 单池 token 的池对当前策略无实时订阅价值（保留在 universe，但不出现在订阅）。
+// 返回池地址列表（去重，顺序稳定）。
+func RouteCapablePools(pools []UniversePool, weth common.Address) []common.Address {
+	byToken := make(map[common.Address][]common.Address)
+	for _, u := range pools {
+		t0 := common.HexToAddress(u.Token0)
+		t1 := common.HexToAddress(u.Token1)
+		var tok common.Address
+		if t0 == weth {
+			tok = t1
+		} else if t1 == weth {
+			tok = t0
+		} else {
+			continue
+		}
+		byToken[tok] = append(byToken[tok], common.HexToAddress(u.Address))
+	}
+	var out []common.Address
+	seen := make(map[common.Address]struct{})
+	for _, ps := range byToken {
+		if len(ps) < 2 {
+			continue
+		}
+		for _, p := range ps {
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // LoadUniverse 读取宇宙文件（.json = 数组；其他 = JSONL）。

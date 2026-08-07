@@ -224,6 +224,13 @@ func (s *LocalSearcher) OptimizeAt(ctx context.Context, r Route, snapshot *Route
 // 每个 hop 池克隆 + 刷新到该区块（slot0/liquidity/bitmap）。
 // 返回的 snapshot 供 TopKOptimize 的整个本地报价链显式使用——
 // 正式 Registry 只提供静态元数据（含创建高度），评估绝不修改实时池。
+// InvalidatePool 使该池的 (headHash, pool) 快照缓存失效（Mint/Burn 改变
+// initialized ticks 后调用）：下一次 SnapshotRoute/SnapshotTokenGroup 会重新
+// RPC 刷新，而不是复用旧状态。只删该池条目，其他池缓存保留。
+func (s *LocalSearcher) InvalidatePool(pool common.Address) {
+	delete(s.snapshotCache, pool.Hex())
+}
+
 // SetHeaderHint 注入流推送的当前 head header（newHeads 订阅，与日志同延迟）。
 // 评估时 block == hint 高度直接复用，省一次 HTTP header RPC。
 func (s *LocalSearcher) SetHeaderHint(h *types.Header) {
