@@ -30,6 +30,9 @@ run-indexer:
 run-arbitrage:
 	$(GO) run ./cmd/rh-arbitrage -config configs/robinhood.yaml
 
+run-canary:
+	$(GO) run ./cmd/rh-canary -config configs/robinhood.yaml
+
 run-liquidator:
 	$(GO) run ./cmd/rh-liquidator -config configs/morpho.yaml
 

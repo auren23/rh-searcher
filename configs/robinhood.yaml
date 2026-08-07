@@ -18,6 +18,10 @@ rpc:
       - "${RH_SIM_RPC:-https://rpc.mainnet.chain.robinhood.com}"
     send: # GMGN 快速 RPC（发送专用；M0 TODO: 确认 GMGN 是否支持 robinhood 链）
       - "${RH_GMGN_RPC}"
+    stream: # Alchemy Robinhood WSS（实时日志订阅，stream-first canary 主摄取）
+      - "${RH_STREAM_RPC:-}"
+    alchemy: # Alchemy Robinhood HTTP（状态读取 + getLogs 缺口恢复；免费版单次 ≤10 blocks）
+      - "${RH_ALCHEMY_RPC:-}"
   timeout_sec: 10
   max_retries: 3
 

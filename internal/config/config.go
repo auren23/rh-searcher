@@ -42,6 +42,10 @@ type RPCGroups struct {
 	Read    []string `yaml:"read"`
 	Sim     []string `yaml:"sim"`
 	Send    []string `yaml:"send"`
+	// Stream: 实时日志订阅 WSS（Alchemy Robinhood，stream-first 摄取）
+	Stream []string `yaml:"stream"`
+	// Alchemy: Alchemy Robinhood HTTP（状态读取 + getLogs 缺口恢复）
+	Alchemy []string `yaml:"alchemy"`
 }
 
 type DexesConfig struct {
@@ -256,6 +260,12 @@ func (c *Config) applyEnv() {
 	}
 	if v := os.Getenv("RH_SIM_RPCS"); v != "" {
 		c.RPC.Groups.Sim = splitCSV(v)
+	}
+	if v := os.Getenv("RH_STREAM_RPCS"); v != "" {
+		c.RPC.Groups.Stream = splitCSV(v)
+	}
+	if v := os.Getenv("RH_ALCHEMY_RPCS"); v != "" {
+		c.RPC.Groups.Alchemy = splitCSV(v)
 	}
 	if v := os.Getenv("RH_EXECUTOR_CONTRACT"); v != "" {
 		c.Executor.Contract = v

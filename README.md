@@ -108,6 +108,30 @@ make run-arbitrage
 **开发顺序：先完成共享底座 → DEX 池状态 → 套利 Shadow → 套利执行 → Morpho 索引 → 清算执行。**
 清算会复用套利约一半的基础能力（DEX 状态/报价/模拟），不要两个策略同时开写。
 
+## Stream-first freshness canary（`rh-canary`）
+
+M5 前置实验：验证 Alchemy Robinhood WSS 能否把 Swap 事件以 `state_lag <= 2` 的新鲜状态
+送进本地报价评估——这是「继续 Robinhood / 换链 / 付费 RPC」决策的证据门槛。
+
+- **摄取 stream-first**：`eth_subscribe(logs)`（topic0=Swap，全池订阅）+ 本地 WETH 池集过滤；
+  实时路径不做逐块/批量 getLogs。
+- **恢复 polling-recovery**：断线/启动缺口用 Alchemy HTTP `getLogs` 补齐，每次 ≤10 blocks
+  （Alchemy 免费版限制），与订阅事件按 (block, tx, logIndex) 身份去重（`chain.LogCursor`）。
+- **池宇宙**：PG `dex_pools` 预载（可选）+ 运行时自发现（首个事件校验 token 对，
+  WETH 池注册进图并缓存；非 WETH/非 Factory 池缓存后跳过）。
+- **评估**：事件 → 当前 head 快照 → `local_only` 本地报价（复用 arbitrage engine）。
+- **交叉校验**：公共 Robinhood RPC 仅作 secondary（head 对照，不参与摄取）。
+
+```bash
+export RH_STREAM_RPC=wss://robinhood-mainnet.g.alchemy.com/v2/{API_KEY}
+export RH_ALCHEMY_RPC=https://robinhood-mainnet.g.alchemy.com/v2/{API_KEY}
+make run-canary            # 默认 2h 或 1000 个 fresh 评估（-duration / -max-evals 可调）
+```
+
+输出：`data/canary/results-<ts>.jsonl`（事件行 + 候选行）+ 结束时 p50/p95/p99 汇总
+（`data/canary/summary-<ts>.txt`）。门槛：`state_lag_blocks` p50<=0 / p95<=1 / p99<=2；
+`event_to_evaluation_ms` p50<250ms / p95<750ms。
+
 ## 安全与运行隔离
 
 - 钱包 A：套利（rh-arbitrage + ArbitrageExecutor）；钱包 B：清算（rh-liquidator + LiquidationExecutor）；钱包 C：Admin（只做 pause/withdraw/部署，不跑自动交易）
