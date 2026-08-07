@@ -52,6 +52,7 @@ type RouteSnapshot struct {
 	BlockHash common.Hash
 	Hops      []SnapshotHop // 与 Route.Hops 同序（报价按序执行）
 	Pools     map[common.Address]*v3.Pool
+	BaseFee   *big.Int // 快照区块的 base fee（local_only 成本计算用）
 }
 
 func (s *LocalSearcher) SetFunding(maxInputWei, contractBal *big.Int) {
@@ -205,7 +206,8 @@ func (s *LocalSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64
 		return nil, fmt.Errorf("%w: header %d: %v", ErrInfra, block, err)
 	}
 	snap := &RouteSnapshot{Block: header.Number.Uint64(), BlockHash: header.Hash(),
-		Pools: make(map[common.Address]*v3.Pool, len(r.Hops))}
+		BaseFee: header.BaseFee,
+		Pools:   make(map[common.Address]*v3.Pool, len(r.Hops))}
 	for _, h := range r.Hops {
 		state := s.registry.Pool(h.Pool)
 		if state == nil {

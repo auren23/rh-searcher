@@ -28,11 +28,12 @@ type LogSource interface {
 
 // BlockEvent 区块事件。
 type BlockEvent struct {
-	Number  uint64
-	Hash    common.Hash
-	Parent  common.Hash
-	Time    uint64
-	Reorged bool // 由重组检测标记：该区块已被父链替换
+	Number       uint64
+	Hash         common.Hash
+	Parent       common.Hash
+	Time         uint64
+	Reorged      bool // 由重组检测标记：该区块已被父链替换
+	ReceivedAtMs int64 // 事件到达时间（ingest 持久化；state_age 计算基准）
 }
 
 // Source 组合数据源，由注册表管理。

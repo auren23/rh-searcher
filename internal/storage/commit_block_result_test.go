@@ -67,7 +67,7 @@ func TestCommitBlockResultFreshDB(t *testing.T) {
 		DELETE FROM strategy_checkpoints;`); err != nil {
 		t.Fatalf("clean: %v", err)
 	}
-	err := db.CommitBlockIngest(ctx, 100, "0xaaa", "0x999", nil, []string{"0xaa01"})
+	err := db.CommitBlockIngest(ctx, 100, "0xaaa", "0x999", nil, []string{"0xaa01"}, 1000)
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestMarkOrphansTwoLevelReorg(t *testing.T) {
 		pools := []Pool{{Address: "0x" + poolAddr, Exchange: "uniswap-v3",
 			Protocol: "v3", Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}}
 		if err := db.CommitBlockIngest(ctx, i, h, parent, pools,
-			[]string{"0xaa01"}); err != nil {
+			[]string{"0xaa01"}, 1000); err != nil {
 			t.Fatalf("ingest %d: %v", i, err)
 		}
 		if err := db.CommitEvaluation(ctx, i, h,
@@ -190,7 +190,7 @@ func TestCommitBlockResultRollsBackOnCandidateFailure(t *testing.T) {
 		DELETE FROM strategy_checkpoints;`); err != nil {
 		t.Fatalf("clean: %v", err)
 	}
-	if err := db.CommitBlockIngest(ctx, 200, "0xbbb", "0x999", nil, nil); err != nil {
+	if err := db.CommitBlockIngest(ctx, 200, "0xbbb", "0x999", nil, nil, 1000); err != nil {
 		t.Fatalf("first ingest: %v", err)
 	}
 	if err := db.CommitEvaluation(ctx, 200, "0xbbb",
@@ -271,7 +271,7 @@ func TestEvaluationQueueSurvivesCrash(t *testing.T) {
 	for i := uint64(100); i <= 102; i++ {
 		h := common.BigToHash(new(big.Int).SetUint64(i)).Hex()
 		if err := db.CommitBlockIngest(ctx, i, h, common.BigToHash(new(big.Int).SetUint64(i-1)).Hex(),
-			nil, []string{"0xaa01"}); err != nil {
+			nil, []string{"0xaa01"}, 1000); err != nil {
 			t.Fatalf("ingest %d: %v", i, err)
 		}
 	}
@@ -390,7 +390,7 @@ func TestCommitPoolsOverridesFallbackProvenance(t *testing.T) {
 	// 模拟动态发现：CommitBlockIngest 写观察块兜底（observed_swap_fallback）
 	if err := db.CommitBlockIngest(ctx, 110, "0x6e", "0x6d",
 		[]Pool{{Address: addr, Exchange: "uniswap-v3", Protocol: "v3",
-			Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}}, nil); err != nil {
+			Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}}, nil, 1000); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
 	var cb uint64
@@ -419,7 +419,7 @@ func TestCommitPoolsOverridesFallbackProvenance(t *testing.T) {
 	// 已确认的 pool_created_log 不允许被新观察块覆盖（提交不同观察块）
 	if err := db.CommitBlockIngest(ctx, 200, "0xc8", "0xc7",
 		[]Pool{{Address: addr, Exchange: "uniswap-v3", Protocol: "v3",
-			Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}}, nil); err != nil {
+			Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}}, nil, 1000); err != nil {
 		t.Fatalf("ingest2: %v", err)
 	}
 	q()
@@ -440,7 +440,7 @@ func TestCommitBlockIngestAtomicProvenanceUpgrade(t *testing.T) {
 	base := Pool{Address: addr, Exchange: "uniswap-v3", Protocol: "v3",
 		Token0: "0xaaa", Token1: "0xbbb", Fee: 3000, TickSpacing: 60}
 	// 1) 观察块兜底：110 / hash110 / observed_swap_fallback
-	if err := db.CommitBlockIngest(ctx, 110, "0x6e", "0x6d", []Pool{base}, nil); err != nil {
+	if err := db.CommitBlockIngest(ctx, 110, "0x6e", "0x6d", []Pool{base}, nil, 1000); err != nil {
 		t.Fatalf("ingest fallback: %v", err)
 	}
 	// 2) 真实日志：42 / 0x2a / pool_created_log → 三字段必须一起变
@@ -448,7 +448,7 @@ func TestCommitBlockIngestAtomicProvenanceUpgrade(t *testing.T) {
 	authoritative.CreatedBlock = 42
 	authoritative.CreatedBlockHash = "0x2a"
 	authoritative.ProvenanceSource = "pool_created_log"
-	if err := db.CommitBlockIngest(ctx, 130, "0x82", "0x81", []Pool{authoritative}, nil); err != nil {
+	if err := db.CommitBlockIngest(ctx, 130, "0x82", "0x81", []Pool{authoritative}, nil, 1000); err != nil {
 		t.Fatalf("ingest authoritative: %v", err)
 	}
 	var cb uint64
@@ -462,7 +462,7 @@ func TestCommitBlockIngestAtomicProvenanceUpgrade(t *testing.T) {
 		t.Fatalf("after upgrade = %d %q %q, want 42 0x2a pool_created_log", cb, deref(ch), deref(prov))
 	}
 	// 3) 后续观察块（observed_swap_fallback）不能降级权威
-	if err := db.CommitBlockIngest(ctx, 150, "0x96", "0x95", []Pool{base}, nil); err != nil {
+	if err := db.CommitBlockIngest(ctx, 150, "0x96", "0x95", []Pool{base}, nil, 1000); err != nil {
 		t.Fatalf("ingest fallback2: %v", err)
 	}
 	if err := db.pool.QueryRow(ctx,

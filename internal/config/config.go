@@ -85,6 +85,9 @@ type ArbitrageConfig struct {
 	//   latest_observe  - 需主网 executor：latest 状态对齐模拟，标记 latest
 	//   historical_strict - 需 archive RPC：固定块模拟，historical_complete 才准入正式 EV
 	SimulationMode string `yaml:"simulation_mode"`
+	// local_only 模式的保守 gas 成本：units × head baseFee × stress multiplier
+	LocalGasUnits             uint64 `yaml:"local_gas_units"`
+	LocalGasStressMultiplier  int    `yaml:"local_gas_stress_multiplier"`
 }
 
 // ExecutorConfig 执行合约与热钱包（模拟/发送用）。

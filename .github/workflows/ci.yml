@@ -70,6 +70,7 @@ jobs:
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0013_sanitize_legacy_historical.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0014_legacy_unverifiable.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0015_observation_modes.sql
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0016_state_lag.sql
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q route_json
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q opportunity_group_id
           psql "$RH_TEST_PG_URL" -c "\d dex_pools" | grep -q tick_spacing
@@ -94,6 +95,7 @@ jobs:
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0013_sanitize_legacy_historical.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0014_legacy_unverifiable.sql
           psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0015_observation_modes.sql
+          psql "$RH_TEST_PG_URL" -v ON_ERROR_STOP=1 -f internal/storage/migrations/0016_state_lag.sql
           psql "$RH_TEST_PG_URL" -c "\d opportunities" | grep -q route_json
           psql "$RH_TEST_PG_URL" -c "SELECT 1 FROM information_schema.table_constraints WHERE constraint_name='execution_attempts_opportunity_id_fkey'" | grep -q 1
 
@@ -105,7 +107,9 @@ jobs:
           # 集成库完全由迁移 runner 初始化（Fresh-safe 路径）
           go run ./cmd/rh-cli migrate
           go run ./cmd/rh-cli migrate  # 幂等二次执行
-          psql "$RH_POSTGRES_URL" -t -c "SELECT COUNT(*) FROM schema_migrations" | grep -q 14
+          EXPECTED=$(ls internal/storage/migrations/[0-9][0-9][0-9][0-9]_*.sql | wc -l)
+          ACTUAL=$(psql "$RH_POSTGRES_URL" -tAc "SELECT COUNT(*) FROM schema_migrations")
+          test "$ACTUAL" -eq "$EXPECTED"
           RH_TEST_PG_URL="$RH_POSTGRES_URL" go test ./internal/storage/ -count=1 -v
           RH_TEST_PG_URL="$RH_POSTGRES_URL" go test -race ./internal/storage/ -count=1
 

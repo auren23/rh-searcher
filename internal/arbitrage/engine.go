@@ -50,7 +50,8 @@ type Candidate struct {
 	// 观察模式字段（local_only / latest_observe / historical_strict）
 	SimulationMode   string // 本候选的评估模式
 	StateQuality     string // historical | latest_consistent | latest_mixed_state | local
-	StateAgeMs       int64  // 快照构建时的状态年龄
+	StateAgeMs       int64  // 评估开始 - 原始事件接收（基于持久化 received_at_ms）
+	StateLagBlocks   uint64 // state_block - observed_block
 	AnalysisSelected bool   // 研究用组内最佳（与 live selected 分离）
 	StateBlock         uint64 // 池状态对应区块（0 = 混合/未知）
 	SimulationBlock    uint64 // eth_call 执行时的链头（0 = 未知）
@@ -104,6 +105,9 @@ type Config struct {
 	// 状态对齐信息（latest_observe 用）
 	HeadAtSnapshot  uint64 // 快照构建时的 head（状态年龄计算）
 	HeadAtSnapshotMs int64
+	// local_only 保守成本：units × head baseFee × stress multiplier
+	LocalGasUnits            uint64
+	LocalGasStressMultiplier int
 }
 
 func NewEngine(cfg Config, sink Sink, searcher Searcher, evaluator Evaluator, executor Executor) *Engine {
@@ -289,13 +293,29 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 			continue
 		}
 		if e.cfg.SimulationMode == "local_only" {
-			// 零资金观察：本地毛利 + 保守 gas 估算（不调合约、不要求 executor）
+			// 零资金观察：本地毛利 - 保守 gas（不调合约、不要求 executor）。
+			// 成本 = local_gas_units × head baseFee × stress multiplier + safety margin。
+			// 失败关闭：未配置 gas units 或 base fee 缺失 → 整块保持未评估
+			if e.cfg.LocalGasUnits == 0 {
+				return nil, fmt.Errorf("local_only requires arbitrage.local_gas_units > 0")
+			}
+			if snapshot.BaseFee == nil || snapshot.BaseFee.Sign() <= 0 {
+				return nil, fmt.Errorf("local_only: head %d missing base fee", snapshot.Block)
+			}
+			mult := e.cfg.LocalGasStressMultiplier
+			if mult <= 0 {
+				mult = 2
+			}
+			gasCost := new(big.Int).Mul(
+				new(big.Int).SetUint64(e.cfg.LocalGasUnits),
+				snapshot.BaseFee)
+			gasCost.Mul(gasCost, big.NewInt(int64(mult)))
+			gasCost.Add(gasCost, e.cfg.SafetyMarginWei)
+			c.GasEstimate = new(big.Int).Set(gasCost) // 真实落盘：成本非零
 			if c.GrossProfit == nil || c.GrossProfit.Sign() <= 0 {
 				c.Decision = "local_unprofitable"
 				c.ExpectedNetProfit = new(big.Int)
 			} else {
-				// 保守净利 = 毛利 - 2×估算 gas（压力区间下限）
-				gasCost := new(big.Int).Mul(new(big.Int).SetUint64(uint64(c.GasEstimate.Int64()*2)), big.NewInt(2e8))
 				net := new(big.Int).Sub(c.GrossProfit, gasCost)
 				c.ExpectedNetProfit = net
 				if net.Sign() <= 0 {
@@ -319,8 +339,17 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 		c.Decision = verdict
 		c.RejectReason = reason
 		c.ExpectedNetProfit = profit
-		// 只有通过链上模拟的候选才能成为 best（rejected 永远不 selected）
-		if verdict == SimulationAccepted {
+		// best 选取按模式：historical_strict 只要 simulation_accepted；
+		// latest_observe 允许 cost_approx 且正净利（标记 analysis_selected，不 selected）
+		eligible := false
+		switch e.cfg.SimulationMode {
+		case "latest_observe":
+			eligible = verdict == "simulation_valid_cost_approx" &&
+				profit != nil && profit.Sign() > 0
+		default:
+			eligible = verdict == SimulationAccepted
+		}
+		if eligible {
 			if best == nil || c.ExpectedNetProfit.Cmp(best.ExpectedNetProfit) > 0 {
 				best = c
 			}

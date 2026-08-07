@@ -237,8 +237,9 @@ func insertCandidateTx(ctx context.Context, q interface {
 			calldata_hash, state_block, simulation_block,
 			opportunity_group_id, rank, selected,
 			l1_gas_units, l2_base_fee_wei, l1_base_fee_estimate_wei,
-			gas_estimate_mode, simulation_mode, state_quality, state_age_ms, analysis_selected
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)
+			gas_estimate_mode, simulation_mode, state_quality, state_age_ms, analysis_selected,
+			state_lag_blocks
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38)
 		ON CONFLICT (id) DO NOTHING`,
 		c.ID, StrategyArbitrage, c.ObservedBlock, c.ObservedAt, c.SourceEvent,
 		c.BlockHash.Hex(), c.TxHash.Hex(), c.LogIndex, c.RouteJSON,
@@ -253,6 +254,7 @@ func insertCandidateTx(ctx context.Context, q interface {
 		strOr(c.GasEstimateMode, "not_estimated"),
 		strOr(c.SimulationMode, "unknown"), strOr(c.StateQuality, "unknown"),
 		nullableInt64(c.StateAgeMs), c.AnalysisSelected,
+		nullableUint64(c.StateLagBlocks),
 	)
 	return err
 }
@@ -278,7 +280,7 @@ func (d *DB) SaveLiquidationCandidate(ctx context.Context, c *liquidation.Candid
 // 新池（含 PoolCreated 溯源）+ 受影响池（评估队列）+ 区块 checkpoint（含 hash）
 // + 规范区块历史。任一写入失败整体回滚——ingest 游标不前进。
 func (d *DB) CommitBlockIngest(ctx context.Context, block uint64, blockHash, parentHash string,
-	pools []Pool, affectedPools []string) error {
+	pools []Pool, affectedPools []string, receivedAtMs int64) error {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -334,10 +336,10 @@ func (d *DB) CommitBlockIngest(ctx context.Context, block uint64, blockHash, par
 	// 受影响池持久化（评估队列；ingest 提交后崩溃仍可重新聚合评估）
 	for _, pa := range affectedPools {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO block_affected_pools (strategy, block_number, block_hash, pool_address)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (strategy, block_hash, pool_address) DO NOTHING`,
-			CheckpointBlocks, block, blockHash, pa); err != nil {
+			INSERT INTO block_affected_pools (strategy, block_number, block_hash, pool_address, received_at_ms)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (strategy, block_hash, pool_address) DO UPDATE SET received_at_ms = EXCLUDED.received_at_ms`,
+			CheckpointBlocks, block, blockHash, pa, receivedAtMs); err != nil {
 			return fmt.Errorf("affected pool %s: %w", pa, err)
 		}
 	}
@@ -395,9 +397,10 @@ func (d *DB) CommitEvaluation(ctx context.Context, block uint64, blockHash strin
 
 // PendingBlock 一个待评估区块（固定状态评估的单位）。
 type PendingBlock struct {
-	Block uint64
-	Hash  string
-	Pools []string // 块内去重
+	Block        uint64
+	Hash         string
+	Pools        []string // 块内去重
+	ReceivedAtMs int64    // ingest 时持久化的原始事件接收时间（state_age 计算基准）
 }
 
 // LoadPendingAffected 读取 evaluate 游标之后尚未评估的区块队列（按块升序）。
@@ -405,7 +408,7 @@ type PendingBlock struct {
 // 否则丢失"当时的机会"且双游标恢复不完整。
 func (d *DB) LoadPendingAffected(ctx context.Context, fromBlock uint64) ([]PendingBlock, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT block_number, block_hash, pool_address
+		SELECT block_number, block_hash, pool_address, COALESCE(received_at_ms, 0)
 		FROM block_affected_pools
 		WHERE strategy = $1 AND block_number > $2
 		ORDER BY block_number ASC, pool_address ASC`,
@@ -419,14 +422,15 @@ func (d *DB) LoadPendingAffected(ctx context.Context, fromBlock uint64) ([]Pendi
 	for rows.Next() {
 		var n uint64
 		var h, pa string
-		if err := rows.Scan(&n, &h, &pa); err != nil {
+		var recv int64
+		if err := rows.Scan(&n, &h, &pa, &recv); err != nil {
 			return nil, err
 		}
 		i, ok := idx[n]
 		if !ok {
 			i = len(out)
 			idx[n] = i
-			out = append(out, PendingBlock{Block: n, Hash: h})
+			out = append(out, PendingBlock{Block: n, Hash: h, ReceivedAtMs: recv})
 		}
 		pools := out[i].Pools
 		if len(pools) > 0 && pools[len(pools)-1] == pa {
@@ -443,12 +447,12 @@ func (d *DB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 }
 
 // requiredSchemaVersion 启动要求的最高迁移版本（0014 统一旧 historical 命名）。
-const requiredSchemaVersion = "0015"
+const requiredSchemaVersion = "0016"
 
 // requiredVersions 启动要求的完整迁移版本集合（任何中间缺失都拒绝启动）。
 var requiredVersions = []string{
 	"0001", "0002", "0003", "0004", "0005", "0006", "0007",
-	"0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015",
+	"0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016",
 }
 
 // RollbackToAncestor：reorg 单事务回滚——

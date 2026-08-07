@@ -22,7 +22,8 @@ func (f *fakeSearcher) FindRoutes(ctx context.Context, pool common.Address, weth
 	return []Route{{Hops: []Hop{{Pool: pool}}}}
 }
 func (f *fakeSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64) (*RouteSnapshot, error) {
-	return &RouteSnapshot{Block: 100, BlockHash: common.Hash{}, Hops: []SnapshotHop{{}}}, nil
+	return &RouteSnapshot{Block: 100, BlockHash: common.Hash{}, BaseFee: big.NewInt(1e8),
+		Hops: []SnapshotHop{{}}}, nil
 }
 func (f *fakeSearcher) TopKOptimizeAt(ctx context.Context, r Route, snapshot *RouteSnapshot, k int, block uint64, ts int64) []*Candidate {
 	return f.cands
@@ -136,7 +137,8 @@ func (c *countingSearcher) TopKOptimizeAt(ctx context.Context, r Route, snapshot
 	return []*Candidate{{InputAmount: big.NewInt(1), Route: r.Hops, RouteJSON: "[]"}}
 }
 func (c *countingSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64) (*RouteSnapshot, error) {
-	return &RouteSnapshot{Block: 100, BlockHash: common.Hash{}, Hops: []SnapshotHop{{}}}, nil
+	return &RouteSnapshot{Block: 100, BlockHash: common.Hash{}, BaseFee: big.NewInt(1e8),
+		Hops: []SnapshotHop{{}}}, nil
 }
 
 // 全部 rejected 时：不得有任何 selected=true（best 必须来自 simulation_accepted）。
@@ -217,14 +219,16 @@ func (f *fakeV3) HeaderAt(ctx context.Context, block *big.Int) (*types.Header, e
 	if block != nil {
 		n = block.Uint64()
 	}
-	return &types.Header{Number: new(big.Int).SetUint64(n)}, nil
+	return &types.Header{Number: new(big.Int).SetUint64(n), BaseFee: big.NewInt(1e8)}, nil
 }
 func (f *fakeV3) RefreshPoolStateAt(ctx context.Context, p *v3.Pool, block *big.Int) error {
 	f.mu.Lock()
 	f.refreshed = append(f.refreshed, p.Address.Hex()+":"+block.String())
 	f.mu.Unlock()
-	price := block.Uint64()
-	p.SqrtPriceX96 = new(big.Int).SetUint64(price * 1e6) // 区块号即价格
+	// 价格按池地址区分：addr{1} 平价 1.00，addr{4} 溢价 1.04 → WETH→X 走
+	// 平价池、X→WETH 走溢价池 = 正毛利（环可获利）
+	price := block.Uint64()*1e6 + uint64(p.Address[0])*1e6/4
+	p.SqrtPriceX96 = new(big.Int).SetUint64(price)
 	p.Liquidity = big.NewInt(1e18)
 	p.Tick = 0
 	p.TickSpacing = 60
@@ -273,8 +277,8 @@ func TestSnapshotQuotesHistoricalState(t *testing.T) {
 	if snap.Block != 100 {
 		t.Fatalf("snapshot block=%d want 100", snap.Block)
 	}
-	if got := snap.Hops[0].Pool.SqrtPriceX96.Uint64(); got != 100e6 {
-		t.Fatalf("snapshot price=%d want 100e6 (historical state)", got)
+	if got := snap.Hops[0].Pool.SqrtPriceX96.Uint64(); got != 100250000 {
+		t.Fatalf("snapshot price=%d want 100250000 (historical state)", got)
 	}
 	// 正式 Registry 零污染：仍是区块 200 价格
 	if got := v3.UnwrapState(reg.Pool(common.Address{1})).SqrtPriceX96.Uint64(); got != 200e6 {
@@ -338,7 +342,9 @@ func TestLocalOnlyModeDecision(t *testing.T) {
 			GasEstimate: big.NewInt(2e5)},
 	}}
 	eng := NewEngine(Config{ChainID: 4663, MinProfitWei: big.NewInt(1), TopK: 1,
-		Mode: "shadow", SimulationMode: "local_only"}, nil, searcher, nil, &fakeExecutor{})
+		Mode: "shadow", SimulationMode: "local_only",
+		LocalGasUnits: 5e5, LocalGasStressMultiplier: 2,
+		SafetyMarginWei: big.NewInt(0)}, nil, searcher, nil, &fakeExecutor{})
 	res, err := eng.ProcessBlock(context.Background(), SwapEvent{
 		BlockNumber: 100, BlockHash: common.Hash{1}, ReceivedAt: 1,
 	}, []common.Address{{1}})
@@ -351,6 +357,10 @@ func TestLocalOnlyModeDecision(t *testing.T) {
 	c := res.Candidates[0]
 	if c.Decision != "local_profitable_observed" {
 		t.Fatalf("decision=%s want local_profitable_observed", c.Decision)
+	}
+	// Gas 成本必须非零且真实：gross 1e16，成本 = 5e5 units × baseFee(0.1gwei=1e8) × 2 = 1e14
+	if c.GasEstimate == nil || c.GasEstimate.Sign() <= 0 {
+		t.Fatalf("local_only gas cost must be non-zero")
 	}
 	if !c.AnalysisSelected {
 		t.Fatalf("analysis_selected must be true in local_only mode")
@@ -374,7 +384,9 @@ func TestLocalOnlyUnprofitable(t *testing.T) {
 	}}
 	// gross=1 wei，成本 = 2e6*2*2e8 = 8e14 → 必为 unprofitable
 	eng := NewEngine(Config{ChainID: 4663, MinProfitWei: big.NewInt(1), TopK: 1,
-		Mode: "shadow", SimulationMode: "local_only"}, nil, searcher, nil, &fakeExecutor{})
+		Mode: "shadow", SimulationMode: "local_only",
+		LocalGasUnits: 5e5, LocalGasStressMultiplier: 2,
+		SafetyMarginWei: big.NewInt(0)}, nil, searcher, nil, &fakeExecutor{})
 	res, err := eng.ProcessBlock(context.Background(), SwapEvent{
 		BlockNumber: 100, BlockHash: common.Hash{1}, ReceivedAt: 1,
 	}, []common.Address{{1}})
@@ -386,5 +398,51 @@ func TestLocalOnlyUnprofitable(t *testing.T) {
 	}
 	if res.Candidates[0].AnalysisSelected {
 		t.Fatalf("no analysis_selected for unprofitable")
+	}
+}
+
+// 真实 LocalSearcher + 完整引擎的 local_only 集成：
+// 候选 GasEstimate 由引擎按 local_gas_units × baseFee × multiplier 计算，
+// 不允许出现"未知 Gas = 零成本"。
+func TestLocalOnlyRealSearcherGasNonZero(t *testing.T) {
+	ctx := context.Background()
+	reg := dex.NewRegistry()
+	graph := dex.NewGraph()
+	mk := func(addr byte) *v3.Pool {
+		p := v3.NewPoolFromMeta(common.Address{addr}, "uniswap-v3",
+			common.Address{2}, common.Address{3}, 3000, 60)
+		p.SqrtPriceX96 = new(big.Int).SetUint64(100e6)
+		p.Liquidity = big.NewInt(1e18)
+		p.Tick = 0
+		reg.UpsertPool(v3.State(p))
+		graph.AddPool(p.Pool(), p.Address)
+		return p
+	}
+	mk(1)
+	mk(4) // WETH→X→WETH 两跳环需要两个池
+	fv := &fakeV3{}
+	searcher := NewLocalSearcher(graph, reg, fv, common.Address{2})
+	searcher.SetFunding(nil, big.NewInt(1e18))
+	eng := NewEngine(Config{ChainID: 4663, WETH: common.Address{2}, MinProfitWei: big.NewInt(1),
+		TopK: 3, Mode: "shadow", SimulationMode: "local_only",
+		LocalGasUnits: 5e5, LocalGasStressMultiplier: 2,
+		SafetyMarginWei: big.NewInt(5e12)}, nil, searcher, nil, &fakeExecutor{})
+	res, err := eng.ProcessBlock(ctx, SwapEvent{BlockNumber: 100, BlockHash: common.Hash{0x64}, ReceivedAt: 1},
+		[]common.Address{{1}})
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if len(res.Candidates) == 0 {
+		t.Fatalf("no candidates from real searcher")
+	}
+	for _, c := range res.Candidates {
+		// 真实链路：GasEstimate 必须由引擎填充（>0），不允许 0
+		t.Logf("cand id=%s decision=%s gross=%v gas=%v reject=%s", c.ID[:16], c.Decision, c.GrossProfit, c.GasEstimate, c.RejectReason)
+		if c.GasEstimate == nil || c.GasEstimate.Sign() <= 0 {
+			t.Fatalf("candidate %s gas cost must be non-zero (got %v)", c.ID, c.GasEstimate)
+		}
+		if c.Decision != "local_unprofitable" && c.Decision != "local_profitable_observed" {
+			t.Fatalf("decision=%s must be local_*", c.Decision)
+		}
 	}
 }

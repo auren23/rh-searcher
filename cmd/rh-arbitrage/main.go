@@ -290,6 +290,8 @@ func main() {
 		TopK:            topK,
 		Mode:            cfg.Mode.Run,
 		SimulationMode:  simMode,
+		LocalGasUnits:   cfg.Arbitrage.LocalGasUnits,
+		LocalGasStressMultiplier: cfg.Arbitrage.LocalGasStressMultiplier,
 	}
 	engine := arbitrage.NewEngine(
 		engineCfg,
@@ -566,7 +568,7 @@ func main() {
 			for p := range affected {
 				affectedList = append(affectedList, p.Hex())
 			}
-			if err := sink.CommitBlockIngest(ctx, h.Number, h.Hash.Hex(), h.Parent.Hex(), newPools, affectedList); err != nil {
+			if err := sink.CommitBlockIngest(ctx, h.Number, h.Hash.Hex(), h.Parent.Hex(), newPools, affectedList, h.ReceivedAtMs); err != nil {
 				rollbackTempPools(pending)
 				return fmt.Errorf("commit block %d: %w", h.Number, err)
 			}
@@ -676,7 +678,8 @@ func main() {
 				}
 				continue // 回退后重新计算 bn
 			}
-			ev := chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash}
+			ev := chain.BlockEvent{Number: bn, Hash: hdr.Hash(), Parent: hdr.ParentHash,
+				ReceivedAtMs: time.Now().UnixMilli()}
 			res, a, pending, err := processBlock(ev, false)
 			if err != nil {
 				return fmt.Errorf("backfill block %d: %w", bn, err)
@@ -703,26 +706,43 @@ func main() {
 			for _, p := range pb.Pools {
 				addrs = append(addrs, common.HexToAddress(p))
 			}
-			if simMode == "latest_observe" {
-				// latest 模式状态对齐：快照与 eth_call 都固定在当前 head H，
-				// 本地利润与链上模拟在同一时点（不允许"本地区块 N + 模拟 N+k"）
+			evalStart := time.Now().UnixMilli()
+			// 状态年龄基于 ingest 时持久化的原始接收时间（不允许恢复时重填 now）
+			ageMs := int64(0)
+			if pb.ReceivedAtMs > 0 {
+				ageMs = evalStart - pb.ReceivedAtMs
+				if ageMs < 0 {
+					ageMs = 0
+				}
+			}
+			if simMode != "historical_strict" {
+				// local_only / latest_observe：快照与（latest_observe 的）
+				// eth_call 都固定在当前 head H——公共 RPC 非 archive 时历史块
+				// 状态不可读，只有 head 快照可行；local_only 不查 executor 余额
 				hd, herr := readCli.HeaderByNumber(ctx, nil)
 				if herr != nil {
-					return fmt.Errorf("latest head: %w", herr)
+					return fmt.Errorf("head for %s: %w", simMode, herr)
 				}
 				head := hd.Number.Uint64()
 				cfgCopy := engineCfg
 				cfgCopy.HeadAtSnapshot = head
-				cfgCopy.HeadAtSnapshotMs = time.Now().UnixMilli()
+				cfgCopy.HeadAtSnapshotMs = evalStart
 				engine.SetConfig(cfgCopy)
 				ev := arbitrage.SwapEvent{
 					BlockNumber: pb.Block,
 					BlockHash:   common.HexToHash(pb.Hash),
-					ReceivedAt:  time.Now().UnixMilli(),
+					ReceivedAt:  pb.ReceivedAtMs, // 原始接收时间（age 基准）
 				}
 				processed, err := engine.ProcessBlockAt(ctx, ev, addrs, head)
 				if err != nil {
-					return fmt.Errorf("evaluate block %d (latest): %w", pb.Block, err)
+					return fmt.Errorf("evaluate block %d (%s): %w", pb.Block, simMode, err)
+				}
+				// state_age_ms / state_lag_blocks 按持久化数据填充
+				for _, c := range processed.Candidates {
+					c.StateAgeMs = ageMs
+					if head > pb.Block {
+						c.StateLagBlocks = head - pb.Block
+					}
 				}
 				if err := sink.CommitEvaluation(ctx, pb.Block, pb.Hash, processed.Candidates); err != nil {
 					return fmt.Errorf("evaluate block %d commit: %w", pb.Block, err)
@@ -730,7 +750,7 @@ func main() {
 				lastEvaluated = pb.Block
 				continue
 			}
-			// 历史资金：执行合约在该区块的 WETH 余额（不是 latest）——
+			// historical_strict：历史资金（执行合约在该区块的 WETH 余额）——
 			// 优化器上限必须与历史状态一致；读取失败 = 基础设施（可重试）
 			bal, err := wethBalanceAt(ctx, readCli, weth, executorAddr, pb.Block)
 			if err != nil {
@@ -740,11 +760,14 @@ func main() {
 			processed, err := engine.ProcessBlock(ctx, arbitrage.SwapEvent{
 				BlockNumber: pb.Block,
 				BlockHash:   common.HexToHash(pb.Hash),
-				ReceivedAt:  time.Now().UnixMilli(),
+				ReceivedAt:  pb.ReceivedAtMs,
 			}, addrs)
 			if err != nil {
 				// 基础设施错误：区块保持未评估，游标不前进（下轮重试整块）
 				return fmt.Errorf("evaluate block %d: %w", pb.Block, err)
+			}
+			for _, c := range processed.Candidates {
+				c.StateAgeMs = ageMs
 			}
 			if err := sink.CommitEvaluation(ctx, pb.Block, pb.Hash, processed.Candidates); err != nil {
 				return fmt.Errorf("evaluate block %d commit: %w", pb.Block, err)
