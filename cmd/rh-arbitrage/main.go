@@ -785,11 +785,19 @@ func main() {
 					return err
 				}
 			}
-			// chunk 末尾推进游标（内存；DB checkpoint 停在上次有日志块的提交）
+			// chunk 末尾：锚点提交（processed_blocks + checkpoint 写 chunk 末块）。
+			// 无日志块不逐块提交，但锚点保证 DB 历史链连续——reorg 祖先查找
+			// 可以从任意 chunk 末块回溯（锚点间距 ≤256，64 层覆盖 16k 块）
 			{
 				hdr, err := headerAt(chunkTo)
 				if err != nil {
 					return fmt.Errorf("backfill chunk header %d: %w", chunkTo, err)
+				}
+				if sink != nil {
+					if err := sink.CommitBlockIngest(ctx, chunkTo, hdr.Hash().Hex(),
+						hdr.ParentHash.Hex(), nil, nil, time.Now().UnixMilli()); err != nil {
+						return fmt.Errorf("backfill chunk anchor %d: %w", chunkTo, err)
+					}
 				}
 				lastApplied = chunkTo
 				lastAppliedHash = hdr.Hash()
