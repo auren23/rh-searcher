@@ -125,8 +125,10 @@ func main() {
 		},
 	})
 
-	root.AddCommand(poolsBootstrapCmd())
-	root.AddCommand(poolsCountCmd())
+	pools := &cobra.Command{Use: "pools", Short: "WETH pool universe tooling"}
+	pools.AddCommand(poolsBootstrapCmd())
+	pools.AddCommand(poolsCountCmd())
+	root.AddCommand(pools)
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -148,7 +150,7 @@ func poolsBootstrapCmd() *cobra.Command {
 		maxBatches int
 	)
 	cmd := &cobra.Command{
-		Use:   "pools bootstrap",
+		Use:   "bootstrap",
 		Short: "Scan factory PoolCreated logs and persist the full WETH pool universe",
 		Run: func(cmd *cobra.Command, args []string) {
 			ctx := context.Background()
@@ -339,7 +341,7 @@ func poolsBootstrapCmd() *cobra.Command {
 func poolsCountCmd() *cobra.Command {
 	var file string
 	cmd := &cobra.Command{
-		Use:   "pools count",
+		Use:   "count",
 		Short: "Summarize the WETH pool universe file",
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg, err := config.Load(cfgPath)
