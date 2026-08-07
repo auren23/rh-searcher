@@ -888,15 +888,6 @@ func main() {
 		return evaluatePendingCore(ctx, 1<<30, metrics)
 	}
 
-	// 启动：先补 ingest 到链头，再评估未处理批次（崩溃恢复路径同此）
-	if err := backfill(startHead); err != nil {
-		slog.Error("startup backfill failed, cursor stays at", "block", lastApplied, "err", err)
-		os.Exit(1)
-	}
-	if err := evaluatePending(); err != nil {
-		slog.Error("startup evaluation failed (cursor stays; retried next head)", "err", err)
-	}
-
 	// 指标采样循环（60s 周期）：落库吞吐/lag/限速/缓存命中率
 	go func() {
 		prevIngest := metrics.ingestBlocks
@@ -944,6 +935,16 @@ func main() {
 			}
 		}
 	}()
+	// 启动：先补 ingest 到链头，再评估未处理批次（崩溃恢复路径同此）
+	if err := backfill(startHead); err != nil {
+		slog.Error("startup backfill failed, cursor stays at", "block", lastApplied, "err", err)
+		os.Exit(1)
+	}
+	if err := evaluatePending(); err != nil {
+		slog.Error("startup evaluation failed (cursor stays; retried next head)", "err", err)
+	}
+
+
 
 	for {
 		select {
