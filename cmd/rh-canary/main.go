@@ -53,7 +53,6 @@ import (
 
 const (
 	decisionProfitable = "local_profitable_observed"
-	headCacheTTL       = 300 * time.Millisecond
 )
 
 // metricsView 无锁指标视图（snapshot 输出，禁止复制带锁结构）。
@@ -194,9 +193,8 @@ type canary struct {
 	duration   time.Duration
 	startedAt  time.Time
 	startFrom  uint64 // 启动对齐：H0（首次恢复起点）
-	headMu     sync.Mutex
-	headVal    uint64
-	headAt     time.Time
+	headMu     sync.Mutex // latestHead 由 newHeads 订阅 goroutine 更新
+	headVal    uint64     // 最新 head（WSS 同流推送 → 与日志同延迟，lag 精确）
 	publicRPC  string
 	stopCh     chan struct{}
 }
@@ -390,7 +388,7 @@ func main() {
 		os.Exit(1)
 	}
 	c.startFrom = h0
-	c.headVal, c.headAt = h0, time.Now()
+	c.setHead(h0)
 	slog.Info("canary starting",
 		"stream", maskKey(streamURL), "alchemy", maskKey(alchemyURL),
 		"start_head", h0, "pools", len(wethPools),
@@ -440,6 +438,27 @@ func (c *canary) run(ctx context.Context) error {
 			continue
 		}
 		c.wss = rc
+		// newHeads 与 logs 同连接订阅：两者共享交付延迟，lag = latestHead - logBlock
+		// 是真实的链相对新鲜度（不用 HTTP head，省 RPC 且不受缓存偏差影响）
+		headsCh := make(chan *types.Header, 256)
+		if hsub, herr := rc.EthSubscribe(ctx, headsCh, "newHeads"); herr == nil {
+			go func() {
+				for {
+					select {
+					case <-ctx.Done():
+						hsub.Unsubscribe()
+						return
+					case h, ok := <-headsCh:
+						if !ok {
+							return
+						}
+						c.setHead(h.Number.Uint64())
+					}
+				}
+			}()
+		} else {
+			slog.Warn("newHeads subscription failed; lag measured from stale head", "err", herr)
+		}
 		ch := make(chan types.Log, 4096)
 		sub, err := rc.EthSubscribe(ctx, ch, "logs", c.logFilter)
 		if err != nil {
@@ -743,19 +762,18 @@ func (c *canary) tokenPair(ctx context.Context, addr common.Address) (common.Add
 	return common.BytesToAddress(t0raw[12:32]), common.BytesToAddress(t1raw[12:32]), nil
 }
 
-// head 读取当前链头（≤300ms 缓存；评估批内共享同一 head 快照）。
-func (c *canary) head(ctx context.Context) (uint64, error) {
+// head 返回最新链头（由 newHeads 订阅 goroutine 维护，无 HTTP 调用）。
+func (c *canary) head() uint64 {
 	c.headMu.Lock()
 	defer c.headMu.Unlock()
-	if time.Since(c.headAt) < headCacheTTL {
-		return c.headVal, nil
-	}
-	h, err := c.httpCli.BlockNumber(ctx)
-	if err != nil {
-		return 0, err
-	}
-	c.headVal, c.headAt = h, time.Now()
-	return h, nil
+	return c.headVal
+}
+
+// setHead 更新最新链头（newHeads 订阅 goroutine 调用）。
+func (c *canary) setHead(h uint64) {
+	c.headMu.Lock()
+	c.headVal = h
+	c.headMu.Unlock()
 }
 
 // handleLog 单个 Swap 事件：记录全流量延迟 → WETH 池过滤（异步自发现）→ local_only 评估 → JSONL。
@@ -770,15 +788,14 @@ func (c *canary) handleLog(ctx context.Context, l types.Log) {
 		c.metrics.inc(func(m *metricsView) { m.eventsNonWeth++ })
 		return
 	}
-	head, err := c.head(ctx)
-	if err != nil {
+	head := c.head()
+	if head == 0 {
 		c.metrics.inc(func(m *metricsView) { m.evalErrors++ })
-		slog.Warn("head read failed", "block", l.BlockNumber, "err", err)
 		c.writeEvent(l, 0, 0, "head_error", "")
-		return
+		return // newHeads 订阅未就绪
 	}
 	if head < l.BlockNumber {
-		head = l.BlockNumber // 防御：head 缓存不可能落后于刚投递的日志区块
+		head = l.BlockNumber // 防御：同流推送不可能落后于日志区块
 	}
 	lag := head - l.BlockNumber
 	c.metrics.recordLag(lag)
