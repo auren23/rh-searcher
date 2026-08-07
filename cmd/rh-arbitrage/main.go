@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -408,8 +409,11 @@ func main() {
 		}
 	}
 	// processBlockWithLogs：日志由调用方提供（批量拉取按块分发，或单块拉取）。
-	// evaluate=false 时只取日志不评估（补扫路径用，避免重复评估同一当前状态）
-	processBlockWithLogs := func(h chain.BlockEvent, logs []types.Log, evaluate bool) (*arbitrage.BlockResult, map[common.Address]struct{}, map[common.Address]*pendingPool, error) {
+	// evaluate=false 时只取日志不评估（补扫路径用，避免重复评估同一当前状态）。
+	// skipPoolVerify=true（补扫）：bootstrap 已扫描到 head，补扫范围内不存在
+	// 未发现的新池——未知池直接跳过，不做 PoolByAddress 验证（避免补扫期间
+	// 每池 5 个 RPC 被限速打死）
+	processBlockWithLogs := func(h chain.BlockEvent, logs []types.Log, evaluate, skipPoolVerify bool) (*arbitrage.BlockResult, map[common.Address]struct{}, map[common.Address]*pendingPool, error) {
 		res := &arbitrage.BlockResult{Block: h.Number, BlockHash: h.Hash}
 		for _, l := range logs {
 			if l.BlockHash != h.Hash {
@@ -429,6 +433,10 @@ func main() {
 			pp, ok := pending[l.Address]
 			if !ok {
 				state := reg.Pool(l.Address)
+				if state == nil && skipPoolVerify {
+					// 补扫：bootstrap 已注册全部池；未知 = WETH 过滤跳过
+					continue
+				}
 				if state == nil {
 					// 启动后新创建的池：验证归属。非本 Factory 池 → 跳过；
 					// RPC 类错误 → 禁止推进（不能永久跳过这个事件）。
@@ -531,18 +539,6 @@ func main() {
 		return res, affected, pending, nil
 	}
 
-	// 单块拉日志包装（实时 head 路径用）
-	processBlock := func(h chain.BlockEvent, evaluate bool) (*arbitrage.BlockResult, map[common.Address]struct{}, map[common.Address]*pendingPool, error) {
-		logs, err := readCli.FilterLogs(ctx, ethereum.FilterQuery{
-			FromBlock: new(big.Int).SetUint64(h.Number),
-			ToBlock:   new(big.Int).SetUint64(h.Number),
-			Topics:    eventTopics,
-		})
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("block %d getLogs: %w", h.Number, err)
-		}
-		return processBlockWithLogs(h, logs, evaluate)
-	}
 
 	// 事务成功后应用日志到内存（exactly-once）。Resync 失败仅该池滞后，
 	// 下次 RefreshRoute 的 RPC 状态会自愈，不影响已提交数据。
@@ -712,11 +708,34 @@ func main() {
 			size /= 2 // 429/超大 → 二分缩小重试
 		}
 	}
-	// 单块摄取（header 校验 + 日志应用 + 逐块提交）
-	ingestOne := func(bn uint64, header *types.Header) error {
+	// headerAt 拉取 header（429/限速 → 2s 退避重试 ≤6 次；其余错误直接返回）
+	headerAt := func(bn uint64) (*types.Header, error) {
+		var lastErr error
+		for attempt := 0; attempt < 6; attempt++ {
+			hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
+			if err == nil {
+				return hdr, nil
+			}
+			lastErr = err
+			if strings.Contains(strings.ToLower(err.Error()), "429") ||
+				strings.Contains(strings.ToLower(err.Error()), "rate limit") {
+				metrics.rpc429++
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+			return nil, err
+		}
+		return nil, lastErr
+	}
+	// 单块摄取（批量日志按块分发 + header 校验 + 逐块提交）
+	ingestOne := func(bn uint64, header *types.Header, logs []types.Log) error {
 		ev := chain.BlockEvent{Number: bn, Hash: header.Hash(), Parent: header.ParentHash,
 			ReceivedAtMs: time.Now().UnixMilli()}
-		res, a, pending, err := processBlock(ev, false)
+		res, a, pending, err := processBlockWithLogs(ev, logs, false, true)
 		if err != nil {
 			return fmt.Errorf("backfill block %d: %w", bn, err)
 		}
@@ -740,16 +759,12 @@ func main() {
 			}
 			// 按块分组（块内按 txIndex/logIndex 排序由 processBlock 处理）
 			byBlock := map[uint64][]types.Log{}
-			blocks := []uint64{}
 			for _, l := range logs {
-				if _, ok := byBlock[l.BlockNumber]; !ok {
-					blocks = append(blocks, l.BlockNumber)
-				}
 				byBlock[l.BlockNumber] = append(byBlock[l.BlockNumber], l)
 			}
 			// 逐块顺序处理：header 校验 + parent 衔接 + 逐块提交
 			for bn := from; bn <= chunkTo; bn++ {
-				hdr, err := readCli.HeaderByNumber(ctx, new(big.Int).SetUint64(bn))
+				hdr, err := headerAt(bn)
 				if err != nil {
 					return fmt.Errorf("backfill header %d: %w", bn, err)
 				}
@@ -759,12 +774,10 @@ func main() {
 					}
 					break // 回退后外层循环重新计算
 				}
-				// 该块日志注入（processBlock 需要自己拉日志——改为传入）
-				if err := ingestOne(bn, hdr); err != nil {
+				// 该块日志来自批量拉取（无日志块也提交空 ingest）
+				if err := ingestOne(bn, hdr, byBlock[bn]); err != nil {
 					return err
 				}
-				_ = byBlock
-				_ = blocks
 			}
 			// 补扫与评估交错（有预算）：每 chunk 评估 ≤8 块
 			if err := evaluateBudgeted(8); err != nil {
