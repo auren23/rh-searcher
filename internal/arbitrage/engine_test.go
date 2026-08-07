@@ -25,6 +25,11 @@ func (f *fakeSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64)
 	return &RouteSnapshot{Block: 100, BlockHash: common.Hash{}, BaseFee: big.NewInt(1e8),
 		Hops: []SnapshotHop{{}}}, nil
 }
+func (f *fakeSearcher) SnapshotTokenGroup(ctx context.Context, token common.Address, block uint64) (*TokenGroupSnapshot, error) {
+	return &TokenGroupSnapshot{Block: 100, BlockHash: common.Hash{}, BaseFee: big.NewInt(1e8),
+		Pools:    map[common.Address]*v3.Pool{{1}: {Address: common.Address{1}, TickSpacing: 60, Liquidity: big.NewInt(1), SqrtPriceX96: new(big.Int).Lsh(big.NewInt(1), 96)}},
+		RpcCalls: 2}, nil
+}
 func (f *fakeSearcher) TopKOptimizeAt(ctx context.Context, r Route, snapshot *RouteSnapshot, k int, block uint64, ts int64) []*Candidate {
 	return f.cands
 }
@@ -51,7 +56,7 @@ func (f *fakeExecutor) Execute(ctx context.Context, c *Candidate) (common.Hash, 
 
 // 假 Sink：收集落盘
 type fakeSink struct {
-	mu   sync.Mutex
+	mu    sync.Mutex
 	saved []*Candidate
 }
 
@@ -140,6 +145,11 @@ func (c *countingSearcher) SnapshotRoute(ctx context.Context, r Route, block uin
 	return &RouteSnapshot{Block: 100, BlockHash: common.Hash{}, BaseFee: big.NewInt(1e8),
 		Hops: []SnapshotHop{{}}}, nil
 }
+func (c *countingSearcher) SnapshotTokenGroup(ctx context.Context, token common.Address, block uint64) (*TokenGroupSnapshot, error) {
+	return &TokenGroupSnapshot{Block: 100, BlockHash: common.Hash{}, BaseFee: big.NewInt(1e8),
+		Pools:    map[common.Address]*v3.Pool{{1}: {Address: common.Address{1}, TickSpacing: 60, Liquidity: big.NewInt(1), SqrtPriceX96: new(big.Int).Lsh(big.NewInt(1), 96)}},
+		RpcCalls: 1}, nil
+}
 
 // 全部 rejected 时：不得有任何 selected=true（best 必须来自 simulation_accepted）。
 func TestEngineNoSelectedWhenAllRejected(t *testing.T) {
@@ -221,6 +231,15 @@ func (f *fakeV3) HeaderAt(ctx context.Context, block *big.Int) (*types.Header, e
 	}
 	return &types.Header{Number: new(big.Int).SetUint64(n), BaseFee: big.NewInt(1e8)}, nil
 }
+func (f *fakeV3) RefreshPoolsStateAt(ctx context.Context, pools []*v3.Pool, block *big.Int) (int, error) {
+	for _, p := range pools {
+		if err := f.RefreshPoolStateAt(ctx, p, block); err != nil {
+			return 0, err
+		}
+	}
+	return 1, nil
+}
+
 func (f *fakeV3) RefreshPoolStateAt(ctx context.Context, p *v3.Pool, block *big.Int) error {
 	f.mu.Lock()
 	f.refreshed = append(f.refreshed, p.Address.Hex()+":"+block.String())
@@ -444,5 +463,79 @@ func TestLocalOnlyRealSearcherGasNonZero(t *testing.T) {
 		if c.Decision != "local_unprofitable" && c.Decision != "local_profitable_observed" {
 			t.Fatalf("decision=%s must be local_*", c.Decision)
 		}
+	}
+}
+
+// token-group/head-batch：3 个 WETH 池共享同一 token → 6 条 route，
+// 全部路由只做一次组快照（RpcCalls=header+1 批量），每池只刷一次。
+func TestEngineProcessTokenGroupAt(t *testing.T) {
+	ctx := context.Background()
+	reg := dex.NewRegistry()
+	graph := dex.NewGraph()
+	weth := common.Address{2}
+	token := common.Address{3}
+	// 三个 WETH/TOKEN 池（不同 fee 档）：pools {1,4,5}，token 侧一致
+	for _, addr := range []byte{1, 4, 5} {
+		p := v3.NewPoolFromMeta(common.Address{addr}, "uniswap-v3",
+			weth, token, uint32(addr)*100, 60)
+		p.SqrtPriceX96 = new(big.Int).SetUint64(100e6)
+		p.Liquidity = big.NewInt(1e18)
+		p.Tick = 0
+		reg.UpsertPool(v3.State(p))
+		graph.AddPool(p.Pool(), p.Address)
+	}
+	fv := &fakeV3{}
+	searcher := NewLocalSearcher(graph, reg, fv, weth)
+	searcher.SetFunding(nil, big.NewInt(1e18))
+	eng := NewEngine(Config{ChainID: 4663, WETH: weth, MinProfitWei: big.NewInt(1),
+		TopK: 2, Mode: "shadow", SimulationMode: "local_only",
+		LocalGasUnits: 5e5, LocalGasStressMultiplier: 2,
+		SafetyMarginWei: big.NewInt(5e12)}, nil, searcher, nil, &fakeExecutor{})
+	res, err := eng.ProcessTokenGroupAt(ctx, SwapEvent{
+		BlockNumber: 100, BlockHash: common.Hash{0x64}, TxHash: common.Hash{1}, LogIndex: 0, ReceivedAt: 1,
+	}, []common.Address{{1}}, token, 100)
+	if err != nil {
+		t.Fatalf("process token group: %v", err)
+	}
+	// 3 池 → 触发池 {1} 的 route = (1→4, 1→5, 4→1, 5→1) = 4 条
+	if res.RouteCount != 4 {
+		t.Fatalf("route_count=%d want 4", res.RouteCount)
+	}
+	if res.UniquePools != 3 {
+		t.Fatalf("unique_pools=%d want 3", res.UniquePools)
+	}
+	// header(1) + 批量刷新(1)（fake 记 1 次批量调用）
+	if res.RpcCalls != 2 {
+		t.Fatalf("rpc_calls=%d want 2", res.RpcCalls)
+	}
+	// 每池只刷新一次（3 个池各 1 条记录），不允许 route 级重复 RPC
+	fv.mu.Lock()
+	defer fv.mu.Unlock()
+	seen := map[string]int{}
+	for _, r := range fv.refreshed {
+		seen[r]++
+	}
+	if len(seen) != 3 {
+		t.Fatalf("refreshed pools=%d want 3: %v", len(seen), seen)
+	}
+	for k, n := range seen {
+		if n != 1 {
+			t.Fatalf("pool %s refreshed %d times, want 1 (route-level dedup failed)", k, n)
+		}
+	}
+	// TopK 2 但最优量已触到资金上限 1e18：邻域采样点 clamp 后去重 → 每 route 1 候选。
+	// 断言重点是 route 全覆盖（4 条 route 各至少 1 候选），不是数量恒等于 8。
+	if len(res.Candidates) < 4 {
+		t.Fatalf("candidates=%d want >=4 (one per route)", len(res.Candidates))
+	}
+	routeSeen := map[string]bool{}
+	for _, c := range res.Candidates {
+		routeSeen[routeID(Route{Hops: c.Route})] = true
+	}
+	if len(routeSeen) != 4 {
+		t.Fatalf("routes covered=%d want 4: %v", len(routeSeen), routeSeen)
+	}
+	if res.TotalEvalMs < 0 || res.StateFetchMs < 0 || res.LocalQuoteMs < 0 {
+		t.Fatalf("eval ms stats invalid: %+v", res)
 	}
 }

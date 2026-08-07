@@ -99,6 +99,12 @@ func (g *Graph) FindCycles(start common.Address, startPool common.Address) []Rou
 	return out
 }
 
+// PoolsWithToken 返回包含该 token 的全部池引用（含 WETH 与非 WETH 池）。
+// 每个池在邻接表中每 token 只出现一次，无需去重。
+func (g *Graph) PoolsWithToken(token common.Address) []PoolRef {
+	return g.adj[token]
+}
+
 // other 返回这条边的另一端 token。
 func (r PoolRef) other() common.Address {
 	if r.TokenInIsToken0 {

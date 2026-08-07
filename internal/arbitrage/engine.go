@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"golang.org/x/crypto/sha3"
@@ -53,12 +54,12 @@ type Candidate struct {
 	StateAgeMs       int64  // 评估开始 - 原始事件接收（基于持久化 received_at_ms）
 	StateLagBlocks   uint64 // state_block - observed_block
 	AnalysisSelected bool   // 研究用组内最佳（与 live selected 分离）
-	StateBlock         uint64 // 池状态对应区块（0 = 混合/未知）
-	SimulationBlock    uint64 // eth_call 执行时的链头（0 = 未知）
+	StateBlock       uint64 // 池状态对应区块（0 = 混合/未知）
+	SimulationBlock  uint64 // eth_call 执行时的链头（0 = 未知）
 
 	// Arbitrum 费用组件（仅分析，不参与净利扣减）
-	L1GasUnits         uint64
-	L2BaseFeeWei       *big.Int
+	L1GasUnits           uint64
+	L2BaseFeeWei         *big.Int
 	L1BaseFeeEstimateWei *big.Int
 
 	// 同一机会（事件+路由）的 Top-K 分组：仅 Selected 候选可发送
@@ -98,12 +99,12 @@ type Config struct {
 	MinProfitWei    *big.Int
 	SafetyMarginWei *big.Int
 	MaxHops         int
-	TopK            int    // 本地 Top-K 输入量逐个链上模拟
-	Mode            string // dry | shadow | live
-	SimulationMode  string // local_only | latest_observe | historical_strict（显式，禁止静默降级）
+	TopK            int      // 本地 Top-K 输入量逐个链上模拟
+	Mode            string   // dry | shadow | live
+	SimulationMode  string   // local_only | latest_observe | historical_strict（显式，禁止静默降级）
 	StateBlock      *big.Int // 评估固定区块（eth_call 与该高度对齐；nil = latest）
 	// 状态对齐信息（latest_observe 用）
-	HeadAtSnapshot  uint64 // 快照构建时的 head（状态年龄计算）
+	HeadAtSnapshot   uint64 // 快照构建时的 head（状态年龄计算）
 	HeadAtSnapshotMs int64
 	// local_only 保守成本：units × head baseFee × stress multiplier
 	LocalGasUnits            uint64
@@ -140,6 +141,14 @@ type BlockResult struct {
 	BlockHash  common.Hash
 	Candidates []*Candidate
 	NewPools   []PoolMeta
+	// 评估吞吐指标（token-group 路径填充；per-route 路径保持零值）：
+	// 同一 head 一次 token 组评估的 RPC 调用数 / 唯一池数 / route 数 / 各阶段耗时。
+	RpcCalls     int
+	UniquePools  int
+	RouteCount   int
+	StateFetchMs int64
+	LocalQuoteMs int64
+	TotalEvalMs  int64
 }
 
 // PoolMeta 动态发现的新池（提交时写入 dex_pools）。
@@ -208,6 +217,76 @@ func (e *Engine) ProcessBlockAt(ctx context.Context, ev SwapEvent, affectedPools
 	return res, nil
 }
 
+// ProcessTokenGroupAt token-group/head-batch 评估（canary 实时路径）：
+//  1. 事件确认相关 TOKEN；
+//  2. 一次性得到该 TOKEN 所有 WETH 池（静态池也在组内）；
+//  3. 同一个 Head H 批量获取所有池状态（Multicall3/batch，每池只刷一次）；
+//  4. 本地一次算完全部 pair 组合（触发池第一跳或第二跳的 route 全集）。
+//
+// 快照缓存 key=(headHash,poolAddress)：同一 head 下重复评估零额外 RPC。
+// 返回 error = 可重试基础设施错误：调用方不得提交候选，保持事件未评估。
+func (e *Engine) ProcessTokenGroupAt(ctx context.Context, ev SwapEvent, triggerPools []common.Address, token common.Address, stateBlock uint64) (*BlockResult, error) {
+	res := &BlockResult{Block: ev.BlockNumber, BlockHash: ev.BlockHash}
+	allRoutes := make([]Route, 0, len(triggerPools)*2)
+	seenRoutes := make(map[string]struct{})
+	for _, pool := range triggerPools {
+		for _, r := range e.searcher.FindRoutes(ctx, pool, e.cfg.WETH, e.cfg.MaxHops) {
+			key := routeID(r)
+			if _, dup := seenRoutes[key]; dup {
+				continue
+			}
+			seenRoutes[key] = struct{}{}
+			allRoutes = append(allRoutes, r)
+		}
+	}
+	res.RouteCount = len(allRoutes)
+	if len(allRoutes) == 0 {
+		return res, nil // 单池 token：无循环，零 RPC
+	}
+	t0 := time.Now()
+	snap, err := e.searcher.SnapshotTokenGroup(ctx, token, stateBlock)
+	if err != nil {
+		return nil, err
+	}
+	res.StateFetchMs = time.Since(t0).Milliseconds()
+	res.RpcCalls = snap.RpcCalls
+	res.UniquePools = len(snap.Pools)
+	t1 := time.Now()
+	for _, r := range allRoutes {
+		rs := routeSnapshotFromGroup(r, snap)
+		if rs == nil {
+			continue // 路由池不在组内（图/注册表不一致）：跳过
+		}
+		cands, err := e.evaluateRouteWithSnapshot(ctx, ev, r, stateBlock, rs)
+		if err != nil {
+			return res, err
+		}
+		res.Candidates = append(res.Candidates, cands...)
+	}
+	res.LocalQuoteMs = time.Since(t1).Milliseconds()
+	res.TotalEvalMs = res.StateFetchMs + res.LocalQuoteMs
+	return res, nil
+}
+
+// routeSnapshotFromGroup 从 token 组快照构造单条 route 的评估视图（纯本地，零 RPC）。
+func routeSnapshotFromGroup(r Route, snap *TokenGroupSnapshot) *RouteSnapshot {
+	hops := make([]SnapshotHop, 0, len(r.Hops))
+	for _, h := range r.Hops {
+		p, ok := snap.Pools[h.Pool]
+		if !ok {
+			return nil
+		}
+		hops = append(hops, SnapshotHop{Pool: p, TokenIn: h.TokenIn})
+	}
+	return &RouteSnapshot{
+		Block:     snap.Block,
+		BlockHash: snap.BlockHash,
+		BaseFee:   snap.BaseFee,
+		Hops:      hops,
+		Pools:     snap.Pools,
+	}
+}
+
 // OnSwap 收到 Swap 事件后调用：找循环 → 优化 → 评估 → 落盘（含拒绝）。
 func (e *Engine) OnSwap(ctx context.Context, ev SwapEvent) {
 	routes := e.searcher.FindRoutes(ctx, ev.Pool, e.cfg.WETH, e.cfg.MaxHops)
@@ -236,6 +315,12 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 		e.finalizeCandidate(rej, ev, r, 0)
 		return []*Candidate{rej}, nil
 	}
+	return e.evaluateRouteWithSnapshot(ctx, ev, r, stateBlock, snapshot)
+}
+
+// evaluateRouteWithSnapshot 在已就绪的快照上完成 Top-K 模拟与统一落盘
+// （token-group 路径与 per-route 路径共用；快照来源不同，评估语义一致）。
+func (e *Engine) evaluateRouteWithSnapshot(ctx context.Context, ev SwapEvent, r Route, stateBlock uint64, snapshot *RouteSnapshot) ([]*Candidate, error) {
 	// read RPC 与 sim RPC 的区块 hash 一致性校验：
 	// 不一致 = sim 节点落后/分歧（基础设施），区块保持未评估等待追平
 	if v, ok := e.evaluator.(interface {
@@ -409,6 +494,7 @@ func (e *Engine) DecayQuote(ctx context.Context, r Route, amount *big.Int, state
 // ErrInfra 标记可重试的基础设施错误（RPC 超时/限流/节点落后/历史状态不可用）。
 // 区别于确定性的合约/路由错误——前者必须保持区块未评估，后者落成拒绝候选。
 var ErrInfra = errors.New("infrastructure error")
+
 func routeID(r Route) string {
 	out := ""
 	for _, h := range r.Hops {
@@ -467,6 +553,10 @@ type Searcher interface {
 	// SnapshotRoute 把路由所有池的状态固定读取到 block 高度并克隆成不可变视图。
 	// 逐块评估时 block 必须是该队列区块本身，不能读取 latest。
 	SnapshotRoute(ctx context.Context, r Route, block uint64) (*RouteSnapshot, error)
+	// SnapshotTokenGroup 一次性批量刷新 token 全部 WETH 池到 block 高度
+	// （token-group/head-batch 模型：同一 head 每个池只刷新一次，组内所有
+	// route 本地报价共享状态，禁止 route 级重复 RPC）。
+	SnapshotTokenGroup(ctx context.Context, token common.Address, block uint64) (*TokenGroupSnapshot, error)
 	// TopKOptimizeAt 在固定 snapshot 上返回本地毛利最高的 k 个输入量候选
 	// （供逐个链上模拟后选优）。报价链必须只用 snapshot，不得触碰实时 Registry。
 	TopKOptimizeAt(ctx context.Context, r Route, snapshot *RouteSnapshot, k int, block uint64, ts int64) []*Candidate

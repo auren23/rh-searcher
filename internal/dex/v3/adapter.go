@@ -13,9 +13,11 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 // Factory 事件与函数签名（完整 ABI 只需用到的事件/方法）。
@@ -38,13 +40,20 @@ type Adapter struct {
 	initCodeHash common.Hash
 	factoryBlock uint64
 	events       map[common.Hash]abi.Event
+	mc3          *multicall3 // 批量只读调用（token-group 快照）
+	// bitmapWordCache 跨 head 持久：tickBitmap word 只在 mint/burn 时变化
+	// （远慢于价格变动），wordPos 覆盖 ~51k ticks。缓存 (pool, wordPos)→word，
+	// 避免每次评估为全部组池重复拉 bitmap（省一次 RPC 往返）。
+	bitmapWordCache map[common.Address]map[int64]*big.Int
 }
 
 func NewAdapter(cli *ethclient.Client, exchange string, factory, router common.Address, routerKind string, initCodeHash common.Hash, factoryBlock uint64) (*Adapter, error) {
 	a := &Adapter{
 		cli: cli, exchange: exchange, factory: factory, router: router,
 		routerKind: routerKind, initCodeHash: initCodeHash, factoryBlock: factoryBlock,
-		events: make(map[common.Hash]abi.Event),
+		events:          make(map[common.Hash]abi.Event),
+		mc3:             newMulticall3(cli),
+		bitmapWordCache: make(map[common.Address]map[int64]*big.Int),
 	}
 	fullABI := fmt.Sprintf(`[{"anonymous":false,"inputs":[{"indexed":true,"name":"token0","type":"address"},{"indexed":true,"name":"token1","type":"address"},{"indexed":true,"name":"fee","type":"uint24"},{"indexed":false,"name":"tickSpacing","type":"int24"},{"indexed":false,"name":"pool","type":"address"}],"name":"PoolCreated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"sender","type":"address"},{"indexed":true,"name":"recipient","type":"address"},{"indexed":false,"name":"amount0","type":"int256"},{"indexed":false,"name":"amount1","type":"int256"},{"indexed":false,"name":"sqrtPriceX96","type":"uint160"},{"indexed":false,"name":"liquidity","type":"uint128"},{"indexed":false,"name":"tick","type":"int24"}],"name":"Swap","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"},{"indexed":true,"name":"owner","type":"address"},{"indexed":true,"name":"tickLower","type":"int24"},{"indexed":true,"name":"tickUpper","type":"int24"},{"indexed":false,"name":"amount","type":"uint128"},{"indexed":false,"name":"amount0","type":"uint256"},{"indexed":false,"name":"amount1","type":"uint256"}],"name":"Mint","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":true,"name":"tickLower","type":"int24"},{"indexed":true,"name":"tickUpper","type":"int24"},{"indexed":false,"name":"amount","type":"uint128"},{"indexed":false,"name":"amount0","type":"uint256"},{"indexed":false,"name":"amount1","type":"uint256"}],"name":"Burn","type":"event"}]`)
 	parsed, err := abi.JSON(strings.NewReader(fullABI))
@@ -69,62 +78,117 @@ func SwapTopic() common.Hash {
 	return crypto.Keccak256Hash([]byte("Swap(address,address,int256,int256,uint160,uint128,int24)"))
 }
 
-// DiscoverPools 扫描工厂 PoolCreated 日志，构造池并读取初始 slot0/liquidity。
+// DiscoverPools 扫描工厂 PoolCreated 日志，构造池（惰性状态，不读 slot0/liquidity）。
 func (a *Adapter) DiscoverPools(ctx context.Context, fromBlock uint64, toBlock uint64) ([]*Pool, error) {
+	logs, err := a.factoryLogs(ctx, fromBlock, toBlock, nil)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Pool, 0, len(logs))
+	for _, l := range logs {
+		p, err := a.poolFromCreatedLog(l)
+		if err != nil {
+			continue // 单条解码失败不影响批次（防御）
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// DiscoverWETHPools 只返回包含 weth 的池（节点端 topics 过滤）：
+// PoolCreated(token0, token1, fee, ...) 的 indexed token0/token1 各查一次。
+// Bootstrap WETH 宇宙用：响应体积小、客户端零过滤开销。
+func (a *Adapter) DiscoverWETHPools(ctx context.Context, fromBlock, toBlock uint64, weth common.Address) ([]*Pool, error) {
+	wethTopic := common.BytesToHash(common.LeftPadBytes(weth.Bytes(), 32))
+	var out []*Pool
+	for _, topics := range [][][]common.Hash{
+		{{PoolCreatedTopic()}, {wethTopic}, {}}, // token0 == weth
+		{{PoolCreatedTopic()}, {}, {wethTopic}}, // token1 == weth
+	} {
+		logs, err := a.factoryLogs(ctx, fromBlock, toBlock, topics)
+		if err != nil {
+			return nil, err
+		}
+		for _, l := range logs {
+			p, err := a.poolFromCreatedLog(l)
+			if err != nil {
+				continue
+			}
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// factoryLogs 工厂 PoolCreated 日志查询（429 退避重试；topics 可为 nil=不过滤）。
+func (a *Adapter) factoryLogs(ctx context.Context, fromBlock, toBlock uint64, topics [][]common.Hash) ([]types.Log, error) {
 	q := ethereum.FilterQuery{
 		FromBlock: big.NewInt(int64(fromBlock)),
 		ToBlock:   big.NewInt(int64(toBlock)),
 		Addresses: []common.Address{a.factory},
+		Topics:    topics,
 	}
-	logs, err := a.cli.FilterLogs(ctx, q)
-	if err != nil {
-		if strings.Contains(err.Error(), "429") {
+	var lastErr error
+	backoff := time.Second
+	for attempt := 0; attempt < 120; attempt++ {
+		logs, err := a.cli.FilterLogs(ctx, q)
+		if err == nil {
+			return logs, nil
+		}
+		lastErr = err
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "429") || strings.Contains(msg, "rate limit") ||
+			strings.Contains(msg, "timeout") || strings.Contains(msg, "timed out") {
+			// 公共 RPC 限速/查询超时风暴：指数退避（1s→60s 封顶），持续重试
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(3 * time.Second): // ponytail: 公共 RPC 限速退避
+			case <-time.After(backoff):
 			}
-			return a.DiscoverPools(ctx, fromBlock, toBlock) // 重试同批
+			backoff *= 2
+			if backoff > 60*time.Second {
+				backoff = 60 * time.Second
+			}
+			continue
 		}
 		return nil, err
 	}
+	return nil, lastErr
+}
+
+// poolFromCreatedLog 从单条 PoolCreated 日志构造池（indexed: token0/token1/fee；
+// data: tickSpacing, pool）。解码失败返回错误（由调用方决定跳过或中止）。
+func (a *Adapter) poolFromCreatedLog(l types.Log) (*Pool, error) {
 	ev := a.events[PoolCreatedTopic()]
 	if ev.Name == "" {
 		return nil, fmt.Errorf("PoolCreated event not found in abi")
 	}
-	out := []*Pool{}
-	for _, l := range logs {
-		if len(l.Topics) < 4 {
-			continue
-		}
-		// indexed: token0, token1, fee；data: tickSpacing, pool
-		v, err := ev.Inputs.Unpack(l.Data)
-		if err != nil || len(v) < 2 {
-			continue
-		}
-		poolAddr := v[1].(common.Address)
-		tickSpacing := int(v[0].(*big.Int).Int64())
-		if tickSpacing <= 0 {
-			continue // 非法 spacing（防御）
-		}
-		p := &Pool{
-			Address: poolAddr, Exchange: a.exchange,
-			Token0:        common.BytesToAddress(l.Topics[1][12:]),
-			Token1:        common.BytesToAddress(l.Topics[2][12:]),
-			Fee:           uint32(new(big.Int).SetBytes(l.Topics[3][29:]).Uint64()),
-			TickSpacing:   tickSpacing,
-			ObservedBlock: l.BlockNumber,
-			CreatedBlock:  l.BlockNumber,
-			CreatedBlockHash: l.BlockHash,
-			ProvenanceSource: "pool_created_log",
-			ticks:         make(map[int]*Tick),
-			bitmap:        make(map[int64]*big.Int),
-			bitmapLoaded:  make(map[int64]bool),
-		}
-		// 惰性状态：slot0/liquidity 首次事件时加载，避免全量发现的 RPC 开销
-		out = append(out, p)
+	if len(l.Topics) < 4 {
+		return nil, fmt.Errorf("PoolCreated: %d topics, want 4", len(l.Topics))
 	}
-	return out, nil
+	v, err := ev.Inputs.Unpack(l.Data)
+	if err != nil || len(v) < 2 {
+		return nil, fmt.Errorf("unpack PoolCreated: %w", err)
+	}
+	poolAddr := v[1].(common.Address)
+	tickSpacing := int(v[0].(*big.Int).Int64())
+	if tickSpacing <= 0 {
+		return nil, fmt.Errorf("invalid tickSpacing %d", tickSpacing)
+	}
+	return &Pool{
+		Address: poolAddr, Exchange: a.exchange,
+		Token0:           common.BytesToAddress(l.Topics[1][12:]),
+		Token1:           common.BytesToAddress(l.Topics[2][12:]),
+		Fee:              uint32(new(big.Int).SetBytes(l.Topics[3][29:]).Uint64()),
+		TickSpacing:      tickSpacing,
+		ObservedBlock:    l.BlockNumber,
+		CreatedBlock:     l.BlockNumber,
+		CreatedBlockHash: l.BlockHash,
+		ProvenanceSource: "pool_created_log",
+		ticks:            make(map[int]*Tick),
+		bitmap:           make(map[int64]*big.Int),
+		bitmapLoaded:     make(map[int64]bool),
+	}, nil
 }
 
 // loadSlot0 读取池的 slot0（sqrtPriceX96/tick）与 liquidity。
@@ -162,9 +226,10 @@ func (a *Adapter) loadSlot0(ctx context.Context, p *Pool, block *big.Int) error 
 
 // DecodeLog 解码一条事件到池状态。返回 (池状态变更闭包, 是否认识的事件)。
 // 事件 ABI（data 字段顺序，indexed 参数在 topics）：
-//   Swap:   amount0, amount1, sqrtPriceX96, liquidity, tick
-//   Mint:   sender, amount, amount0, amount1（sender 非 indexed！）
-//   Burn:   amount, amount0, amount1
+//
+//	Swap:   amount0, amount1, sqrtPriceX96, liquidity, tick
+//	Mint:   sender, amount, amount0, amount1（sender 非 indexed！）
+//	Burn:   amount, amount0, amount1
 func (a *Adapter) DecodeLog(p *Pool, log types.Log) (apply func(), err error) {
 	ev, ok := a.events[log.Topics[0]]
 	if !ok {
@@ -259,32 +324,205 @@ func (a *Adapter) LoadBitmapWordAt(ctx context.Context, p *Pool, wordPos int64, 
 	return nil
 }
 
-// RefreshPoolStateAt 执行 Shadow 模式的状态刷新：路由中所有池统一读取指定高度的状态
-// （slot0/liquidity/当前 bitmap word 全部固定在同一 block），消除混合状态。
-// 先清空 bitmap 缓存再按固定区块重载（缓存不带区块版本，旧高度的 word 不得被复用）。
+// RefreshPoolStateAt 单池固定高度刷新：委托批量路径（Multicall3 单次往返），
+// 与 token-group 批量刷新共享同一实现与错误语义。
 func (a *Adapter) RefreshPoolStateAt(ctx context.Context, p *Pool, block *big.Int) error {
-	p.bitmap = make(map[int64]*big.Int)
-	p.bitmapLoaded = make(map[int64]bool)
-	if err := a.loadSlot0(ctx, p, block); err != nil {
-		return err
+	_, err := a.RefreshPoolsStateAt(ctx, []*Pool{p}, block)
+	return err
+}
+
+// RefreshPoolsStateAt 批量刷新多个池在固定高度的状态（slot0/liquidity/tickBitmap
+// 全部固定在同一 block，消除混合状态）。两次 RPC 往返：
+//  1. Multicall3.aggregate3 读全部 slot0() + liquidity()（+缺失的 tickSpacing()）
+//  2. 按新 tick 计算 wordPos 后读全部 tickBitmap(word)
+//
+// Multicall3 不可用时回退 JSON-RPC batch（分块）。返回实际 RPC 调用次数。
+// 任一步失败返回错误（调用方保持整批未评估，绝不落成混合状态）。
+func (a *Adapter) RefreshPoolsStateAt(ctx context.Context, pools []*Pool, block *big.Int) (int, error) {
+	rpcCalls := 0
+	if len(pools) == 0 {
+		return 0, nil
 	}
-	if p.TickSpacing <= 0 {
-		ts, err := a.readTickSpacing(ctx, p.Address)
-		if err != nil {
-			return err
+	// 旧 bitmap 缓存不带区块版本：先清空再按固定区块重载（与单池刷新一致）。
+	// 已加载的 word 先并入持久 word 缓存（跨 head 复用）。
+	for _, p := range pools {
+		for w, word := range p.bitmap {
+			if a.bitmapWordCache[p.Address] == nil {
+				a.bitmapWordCache[p.Address] = make(map[int64]*big.Int)
+			}
+			a.bitmapWordCache[p.Address][w] = new(big.Int).Set(word)
 		}
-		p.TickSpacing = ts
+		p.bitmap = make(map[int64]*big.Int)
+		p.bitmapLoaded = make(map[int64]bool)
 	}
-	if err := a.LoadBitmapWordAt(ctx, p, p.WordPos(), block); err != nil {
-		return err
+	slot0Sel := crypto.Keccak256([]byte("slot0()"))[:4]
+	liqSel := crypto.Keccak256([]byte("liquidity()"))[:4]
+	tsSel := crypto.Keccak256([]byte("tickSpacing()"))[:4]
+	bitmapSel := crypto.Keccak256([]byte("tickBitmap(int16)"))[:4]
+
+	// 阶段 1：slot0 + liquidity（+ tickSpacing 若缺失）
+	type poolIdx struct {
+		p                       *Pool
+		slot0Idx, liqIdx, tsIdx int
 	}
-	return nil
+	calls := make([]mcCall, 0, 2*len(pools))
+	order := make([]poolIdx, 0, len(pools))
+	for _, p := range pools {
+		pi := poolIdx{p: p, slot0Idx: len(calls), tsIdx: -1}
+		calls = append(calls, mcCall{Target: p.Address, CallData: slot0Sel})
+		pi.liqIdx = len(calls)
+		calls = append(calls, mcCall{Target: p.Address, CallData: liqSel})
+		if p.TickSpacing <= 0 {
+			pi.tsIdx = len(calls)
+			calls = append(calls, mcCall{Target: p.Address, CallData: tsSel})
+		}
+		order = append(order, pi)
+	}
+	res, err := a.mcAggregate(ctx, calls, block)
+	rpcCalls++
+	if err != nil {
+		return rpcCalls, err
+	}
+	for _, pi := range order {
+		r := res[pi.slot0Idx]
+		if !r.Success || len(r.ReturnData) < 64 {
+			return rpcCalls, fmt.Errorf("slot0 %s at %s: success=%v len=%d", pi.p.Address.Hex(), block, r.Success, len(r.ReturnData))
+		}
+		sqrtPrice := new(big.Int).SetBytes(r.ReturnData[0:32])
+		rawTick := new(big.Int).SetBytes(r.ReturnData[61:64])
+		t := rawTick.Int64()
+		if t >= 1<<23 {
+			t -= 1 << 24
+		}
+		r = res[pi.liqIdx]
+		if !r.Success || len(r.ReturnData) < 32 {
+			return rpcCalls, fmt.Errorf("liquidity %s at %s: success=%v len=%d", pi.p.Address.Hex(), block, r.Success, len(r.ReturnData))
+		}
+		liq := new(big.Int).SetBytes(r.ReturnData[:32])
+		pi.p.SqrtPriceX96 = sqrtPrice
+		pi.p.Tick = int(t)
+		pi.p.Liquidity = liq
+		if pi.tsIdx >= 0 {
+			r = res[pi.tsIdx]
+			if !r.Success || len(r.ReturnData) < 32 {
+				return rpcCalls, fmt.Errorf("tickSpacing %s at %s: success=%v", pi.p.Address.Hex(), block, r.Success)
+			}
+			ts := int(new(big.Int).SetBytes(r.ReturnData[29:32]).Int64())
+			if ts <= 0 {
+				return rpcCalls, fmt.Errorf("invalid tickSpacing %d for %s", ts, pi.p.Address.Hex())
+			}
+			pi.p.TickSpacing = ts
+		}
+	}
+	// 阶段 2：tickBitmap（wordPos 依赖阶段 1 的新 tick）
+	int16Type, err := abi.NewType("int16", "", nil)
+	if err != nil {
+		return rpcCalls, err
+	}
+	bmCalls := make([]mcCall, 0, len(pools))
+	bmOrder := make([]*Pool, 0, len(pools))
+	for _, p := range pools {
+		if p.Liquidity == nil || p.Liquidity.Sign() <= 0 || p.TickSpacing <= 0 {
+			continue // 无流动性池无需 bitmap（报价本来就会失败）
+		}
+		wordPos := p.WordPos()
+		if cached, ok := a.bitmapWordCache[p.Address][wordPos]; ok {
+			// 持久缓存命中：word 几乎不变，直接复用（省一次 RPC 往返）
+			p.bitmap[wordPos] = new(big.Int).Set(cached)
+			p.bitmapLoaded[wordPos] = true
+			continue
+		}
+		encoded, err := abi.Arguments{{Type: int16Type}}.Pack(int16(wordPos))
+		if err != nil {
+			return rpcCalls, err
+		}
+		bmCalls = append(bmCalls, mcCall{Target: p.Address, CallData: append(append([]byte{}, bitmapSel...), encoded...)})
+		bmOrder = append(bmOrder, p)
+	}
+	if len(bmCalls) > 0 {
+		res, err := a.mcAggregate(ctx, bmCalls, block)
+		rpcCalls++
+		if err != nil {
+			return rpcCalls, err
+		}
+		for i, p := range bmOrder {
+			r := res[i]
+			if !r.Success || len(r.ReturnData) < 32 {
+				return rpcCalls, fmt.Errorf("tickBitmap %s at %s: success=%v len=%d", p.Address.Hex(), block, r.Success, len(r.ReturnData))
+			}
+			wordPos := p.WordPos()
+			word := new(big.Int).SetBytes(r.ReturnData[:32])
+			p.bitmap[wordPos] = word
+			p.bitmapLoaded[wordPos] = true
+			if a.bitmapWordCache[p.Address] == nil {
+				a.bitmapWordCache[p.Address] = make(map[int64]*big.Int)
+			}
+			a.bitmapWordCache[p.Address][wordPos] = new(big.Int).Set(word)
+		}
+	}
+	return rpcCalls, nil
+}
+
+// mcAggregate Multicall3 主路径，失败回退 JSON-RPC batch（分块 eth_call）。
+func (a *Adapter) mcAggregate(ctx context.Context, calls []mcCall, block *big.Int) ([]mcResult, error) {
+	if a.mc3 != nil {
+		if res, err := a.mc3.aggregate3(ctx, calls, block); err == nil {
+			return res, nil
+		} else {
+			// Multicall3 不可用（无代码/被拒）：回退 batch，不重复尝试
+			a.mc3 = nil
+		}
+	}
+	return a.batchEthCall(ctx, calls, block)
+}
+
+// batchEthCall JSON-RPC batch 回退：分块（≤64/请求）顺序执行。
+func (a *Adapter) batchEthCall(ctx context.Context, calls []mcCall, block *big.Int) ([]mcResult, error) {
+	rc := a.cli.Client()
+	blockArg := hexutil.EncodeBig(block)
+	out := make([]mcResult, len(calls))
+	const chunk = 64
+	for start := 0; start < len(calls); start += chunk {
+		end := start + chunk
+		if end > len(calls) {
+			end = len(calls)
+		}
+		elems := make([]rpc.BatchElem, 0, end-start)
+		for i := start; i < end; i++ {
+			elems = append(elems, rpc.BatchElem{
+				Method: "eth_call",
+				Args: []interface{}{
+					map[string]interface{}{"to": calls[i].Target.Hex(), "data": hexutil.Encode(calls[i].CallData)},
+					blockArg,
+				},
+				Result: new(hexutil.Bytes),
+			})
+		}
+		if err := rc.BatchCallContext(ctx, elems); err != nil {
+			return nil, fmt.Errorf("batch eth_call %d..%d: %w", start, end, err)
+		}
+		for i, e := range elems {
+			if e.Error != nil {
+				out[start+i] = mcResult{Success: false}
+				continue
+			}
+			hb, ok := e.Result.(*hexutil.Bytes)
+			if !ok || hb == nil {
+				out[start+i] = mcResult{Success: false}
+				continue
+			}
+			out[start+i] = mcResult{Success: true, ReturnData: append([]byte{}, *hb...)}
+		}
+	}
+	return out, nil
 }
 
 // EnsureQuoteState 报价前统一确保池状态就绪：
-//   tickSpacing → 读取 tickSpacing()
-//   slot0/liquidity → 读取 slot0() 与 liquidity()
-//   当前 bitmap word → 读取 tickBitmap(wordPos)
+//
+//	tickSpacing → 读取 tickSpacing()
+//	slot0/liquidity → 读取 slot0() 与 liquidity()
+//	当前 bitmap word → 读取 tickBitmap(wordPos)
+//
 // 任一失败返回错误（调用方不得降级报价）。
 func (a *Adapter) EnsureQuoteState(ctx context.Context, p *Pool) error {
 	if p.TickSpacing <= 0 {
@@ -385,10 +623,10 @@ func (a *Adapter) DecodePoolCreated(log types.Log) (*PoolMeta, error) {
 }
 
 // QuoteExactIn 本地精确报价（严格单 tick 模式）。
-// - 双向公式与官方 SqrtPriceMath 一致（token0 输入走 getNextSqrtPriceFromAmount0RoundingUp(add=false)，
-//   token1 输入走 getNextSqrtPriceFromAmount1RoundingDown(add=true)）
-// - 输入超过下一 initialized tick 边界 → ErrTickCrossed（绝不近似）
-// - tick 索引不完整（无 slot0/流动性）→ ErrStateIncomplete
+//   - 双向公式与官方 SqrtPriceMath 一致（token0 输入走 getNextSqrtPriceFromAmount0RoundingUp(add=false)，
+//     token1 输入走 getNextSqrtPriceFromAmount1RoundingDown(add=true)）
+//   - 输入超过下一 initialized tick 边界 → ErrTickCrossed（绝不近似）
+//   - tick 索引不完整（无 slot0/流动性）→ ErrStateIncomplete
 func (a *Adapter) QuoteExactIn(p *Pool, tokenIn common.Address, amountIn *big.Int) (*big.Int, error) {
 	if amountIn.Sign() <= 0 {
 		return big.NewInt(0), nil
@@ -448,8 +686,6 @@ func (a *Adapter) QuoteExactIn(p *Pool, tokenIn common.Address, amountIn *big.In
 	return out, nil
 }
 
-
-
 // ErrNotFactoryPool 表示地址不属于本 Factory（确认非本池，可安全跳过；
 // 区别于 RPC 类错误——那些必须阻止区块游标推进）。
 var ErrNotFactoryPool = errors.New("not a factory pool")
@@ -499,12 +735,12 @@ func (a *Adapter) PoolByAddress(ctx context.Context, addr common.Address) (*Pool
 	}
 	p := &Pool{
 		Address: addr, Exchange: a.exchange,
-		Token0:      common.BytesToAddress(t0raw[12:32]),
-		Token1:      common.BytesToAddress(t1raw[12:32]),
-		Fee:         uint32(new(big.Int).SetBytes(feeraw[29:32]).Uint64()),
-		TickSpacing: ts,
-		ticks:       make(map[int]*Tick),
-		bitmap:      make(map[int64]*big.Int),
+		Token0:       common.BytesToAddress(t0raw[12:32]),
+		Token1:       common.BytesToAddress(t1raw[12:32]),
+		Fee:          uint32(new(big.Int).SetBytes(feeraw[29:32]).Uint64()),
+		TickSpacing:  ts,
+		ticks:        make(map[int]*Tick),
+		bitmap:       make(map[int64]*big.Int),
 		bitmapLoaded: make(map[int64]bool),
 	}
 	_ = a.loadSlot0(ctx, p, nil)
@@ -544,6 +780,7 @@ func (a *Adapter) PoolCreatedByTokens(ctx context.Context, token0, token1 common
 // BuildSwap 构建 swap calldata。按 router kind 分支：
 //   - swaprouter: SwapRouter.exactInputSingle
 //   - universal:  UniversalRouter.execute(commands, inputs) 的 V3_SWAP_EXACT_IN (0x08)
+//
 // tokenIn 决定交易方向。
 func (a *Adapter) BuildSwap(p *Pool, tokenIn, recipient common.Address, amountIn, minOut *big.Int, deadline uint64, sqrtPriceLimit *big.Int) ([]byte, error) {
 	tokenOut := p.Token1

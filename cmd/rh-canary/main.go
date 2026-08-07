@@ -58,24 +58,35 @@ const (
 // metricsView 无锁指标视图（snapshot 输出，禁止复制带锁结构）。
 type metricsView struct {
 	startedAt       time.Time
-	eventsTotal     uint64   // 收到的全部 Swap 日志（订阅 + 恢复）
-	eventsNonWeth   uint64   // 本地 WETH 池集过滤掉的事件
-	eventsEvaluated uint64   // 进入评估的事件
-	eventsFresh     uint64   // lag <= maxObsLag 的评估（fresh 样本）
-	eventsStaleSkip uint64   // lag > staleSkipLag 未评估（不制造噪音）
-	evalErrors      uint64   // 基础设施错误（快照/head 失败）
-	evalThrottled   uint64   // 评估节流跳过（min-eval-gap 内的 WETH 事件）
-	disconnects     uint64   // WSS 断线重连次数
-	recoveries      uint64   // 缺口恢复次数
-	recoveredBlocks uint64   // 恢复覆盖的区块数
-	recoveredLogs   uint64   // 恢复拉到的日志数
-	grossPositive   uint64   // gross > 0 候选数
-	netPos          [3]uint64 // net1x/2x/3x > 0 候选数
-	poolsDiscovered uint64   // 运行时新发现的 WETH 池数（自发现模式）
-	crossChecks     uint64   // 公共 RPC head 对照次数
-	crossMismatches uint64   // 公共 RPC 与 Alchemy head 不一致次数
-	lagSamples      []uint64 // state_lag_blocks（全部 WETH 事件）
-	evalMsSamples   []int64  // event_to_evaluation_ms（评估完成 - 事件接收）
+	eventsTotal     uint64     // 收到的全部 Swap 日志（订阅 + 恢复）
+	eventsNonWeth   uint64     // 本地 WETH 池集过滤掉的事件
+	eventsEvaluated uint64     // 进入评估的事件
+	eventsFresh     uint64     // lag <= maxObsLag 的评估（fresh 样本）
+	eventsStaleSkip uint64     // lag > staleSkipLag 未评估（不制造噪音）
+	evalErrors      uint64     // 基础设施错误（快照/head 失败）
+	disconnects     uint64     // WSS 断线重连次数
+	recoveries      uint64     // 缺口恢复次数
+	recoveredBlocks uint64     // 恢复覆盖的区块数
+	recoveredLogs   uint64     // 恢复拉到的日志数
+	grossPositive   uint64     // gross > 0 候选数
+	netPos          [3]uint64  // net1x/2x/3x > 0 候选数
+	poolsDiscovered uint64     // 运行时新发现的 WETH 池数（自发现模式）
+	crossChecks     uint64     // 公共 RPC head 对照次数
+	crossMismatches uint64     // 公共 RPC 与 Alchemy head 不一致次数
+	lagSamples      []uint64   // state_lag_blocks（全部 WETH 事件）
+	evalMsSamples   []int64    // event_to_evaluation_ms（评估完成 - 事件接收）
+	evalStats       []evalStat // 每次 token 组评估的吞吐明细
+}
+
+// evalStat 单次 token-group 评估的吞吐指标（性能验收：p50/p95）。
+type evalStat struct {
+	rpcCalls     int   // 状态读取 RPC 调用数（header + multicall 往返）
+	uniquePools  int   // 组内唯一池数（每池只刷一次）
+	routeCount   int   // 本地报价的 route 数
+	stateFetchMs int64 // 组快照耗时（Multicall3/batch）
+	localQuoteMs int64 // 全部 route 本地报价耗时
+	totalMs      int64 // 引擎评估总耗时
+	fresh        bool  // 本批含 lag<=maxObsLag 的事件
 }
 
 type metrics struct {
@@ -101,6 +112,12 @@ func (m *metrics) recordEvalMs(ms int64) {
 	m.mu.Unlock()
 }
 
+func (m *metrics) recordEvalStat(st evalStat) {
+	m.mu.Lock()
+	m.v.evalStats = append(m.v.evalStats, st)
+	m.mu.Unlock()
+}
+
 func (m *metrics) snapshot() metricsView {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -112,26 +129,34 @@ func (m *metrics) snapshot() metricsView {
 
 // candidateRecord 每个评估候选一行（JSONL，供研究侧直接分析）。
 type candidateRecord struct {
-	TS                   int64  `json:"ts"`
-	Block                uint64 `json:"block"`
-	BlockHash            string `json:"block_hash"`
-	TxHash               string `json:"tx_hash"`
-	LogIndex             uint   `json:"log_index"`
-	Pool                 string `json:"pool"`
-	Head                 uint64 `json:"head"`
-	StateLagBlocks       uint64 `json:"state_lag_blocks"`
-	EventToEvaluationMs  int64  `json:"event_to_evaluation_ms"`
-	Decision             string `json:"decision"`
-	RejectReason         string `json:"reject_reason,omitempty"`
-	Route                string `json:"route"`
-	Rank                 int    `json:"rank"`
-	InputAmountWei       string `json:"input_amount_wei"`
-	GrossProfitWei       string `json:"gross_profit_wei,omitempty"`
-	NetProfitWei         string `json:"net_profit_wei,omitempty"`
-	GasCostWei           string `json:"gas_cost_wei,omitempty"`
-	Net1xWei             string `json:"net1x_wei,omitempty"`
-	Net2xWei             string `json:"net2x_wei,omitempty"`
-	Net3xWei             string `json:"net3x_wei,omitempty"`
+	TS                  int64  `json:"ts"`
+	Block               uint64 `json:"block"`
+	BlockHash           string `json:"block_hash"`
+	TxHash              string `json:"tx_hash"`
+	LogIndex            uint   `json:"log_index"`
+	Pool                string `json:"pool"`
+	Head                uint64 `json:"head"`
+	StateLagBlocks      uint64 `json:"state_lag_blocks"`
+	EventToEvaluationMs int64  `json:"event_to_evaluation_ms"`
+	Decision            string `json:"decision"`
+	RejectReason        string `json:"reject_reason,omitempty"`
+	Route               string `json:"route"`
+	Rank                int    `json:"rank"`
+	Token               string `json:"token,omitempty"`
+	InputAmountWei      string `json:"input_amount_wei"`
+	GrossProfitWei      string `json:"gross_profit_wei,omitempty"`
+	NetProfitWei        string `json:"net_profit_wei,omitempty"`
+	GasCostWei          string `json:"gas_cost_wei,omitempty"`
+	Net1xWei            string `json:"net1x_wei,omitempty"`
+	Net2xWei            string `json:"net2x_wei,omitempty"`
+	Net3xWei            string `json:"net3x_wei,omitempty"`
+	// 本次 token 组评估的吞吐指标（性能验收用）
+	RpcCalls     int   `json:"rpc_calls,omitempty"`
+	UniquePools  int   `json:"unique_pools,omitempty"`
+	RouteCount   int   `json:"route_count,omitempty"`
+	StateFetchMs int64 `json:"state_fetch_ms,omitempty"`
+	LocalQuoteMs int64 `json:"local_quote_ms,omitempty"`
+	TotalEvalMs  int64 `json:"total_eval_ms,omitempty"`
 }
 
 // eventRecord 每个 WETH Swap 事件一行（含被跳过的事件；评估结果由 candidate 行承载）。
@@ -143,6 +168,7 @@ type eventRecord struct {
 	TxHash              string `json:"tx_hash"`
 	LogIndex            uint   `json:"log_index"`
 	Pool                string `json:"pool"`
+	Token               string `json:"token,omitempty"`
 	Head                uint64 `json:"head"`
 	StateLagBlocks      uint64 `json:"state_lag_blocks"`
 	EventToEvaluationMs int64  `json:"event_to_evaluation_ms"`
@@ -161,28 +187,28 @@ type poolRecord struct {
 }
 
 type canary struct {
-	cfg        *config.Config
-	weth       common.Address
-	httpCli    *ethclient.Client // Alchemy HTTP（状态读取 + 恢复）
-	wss        *rpc.Client       // Alchemy WSS（日志订阅）
-	streamURL  string
-	adapter    *v3.Adapter
-	reg        *dex.Registry
-	graph      *dex.Graph
-	searcher   *arbitrage.LocalSearcher
-	engine     *arbitrage.Engine
-	pmu            sync.Mutex                 // 保护 pool 集合（wethPools/nonWeth/notV3/discoverPending）
-	wethPools      map[common.Address]struct{}
-	nonWeth        map[common.Address]struct{} // 已确认非 WETH 池（过滤缓存）
-	notV3          map[common.Address]struct{} // 已确认非本 Factory 池（过滤缓存）
+	cfg             *config.Config
+	weth            common.Address
+	httpCli         *ethclient.Client // Alchemy HTTP（状态读取 + 恢复）
+	wss             *rpc.Client       // Alchemy WSS（日志订阅）
+	streamURL       string
+	adapter         *v3.Adapter
+	reg             *dex.Registry
+	graph           *dex.Graph
+	searcher        *arbitrage.LocalSearcher
+	engine          *arbitrage.Engine
+	pmu             sync.Mutex // 保护 pool 集合（wethPools/nonWeth/notV3/discoverPending）
+	wethPools       map[common.Address]struct{}
+	nonWeth         map[common.Address]struct{} // 已确认非 WETH 池（过滤缓存）
+	notV3           map[common.Address]struct{} // 已确认非本 Factory 池（过滤缓存）
 	discoverPending map[common.Address]struct{} // 发现队列去重
-	discoverCh     chan common.Address          // 异步发现队列（事件循环不阻塞 RPC）
-	engineMu       sync.Mutex                   // 序列化 engine 评估与 reg/graph 写入
-	outMu          sync.Mutex                   // JSONL 写入互斥（bufio.Writer 非线程安全）
-	lastEvalAt     time.Time                    // 评估节流：minEvalGap 内最多一次
-	minEvalGap     time.Duration
-	cursor         chain.LogCursor
-	logFilter      map[string]interface{} // eth_subscribe logs 参数（必须小写 key）
+	discoverCh      chan common.Address         // 异步发现队列（事件循环不阻塞 RPC）
+	engineMu        sync.Mutex                  // 序列化 engine 评估与 reg/graph 写入
+	outMu           sync.Mutex                  // JSONL 写入互斥（bufio.Writer 非线程安全）
+	// 注：无全局评估节流。同 token 连续事件由 (headHash,pool) 快照缓存吸收——
+	// 同一 head 的重复评估零 RPC（rpc_calls p50≈0），无需人为限速。
+	cursor     chain.LogCursor
+	logFilter  map[string]interface{} // eth_subscribe logs 参数（必须小写 key）
 	metrics    *metrics
 	out        *bufio.Writer
 	outFile    *os.File
@@ -192,11 +218,21 @@ type canary struct {
 	maxEvals   int
 	duration   time.Duration
 	startedAt  time.Time
-	startFrom  uint64 // 启动对齐：H0（首次恢复起点）
-	headMu     sync.Mutex // latestHead 由 newHeads 订阅 goroutine 更新
-	headVal    uint64     // 最新 head（WSS 同流推送 → 与日志同延迟，lag 精确）
+	startFrom  uint64        // 启动对齐：H0（首次恢复起点）
+	headMu     sync.Mutex    // latestHead 由 newHeads 订阅 goroutine 更新
+	headVal    uint64        // 最新 head（WSS 同流推送 → 与日志同延迟，lag 精确）
+	headHeader *types.Header // 与 headVal 同锁更新的最新 header（评估 hint 用）
 	publicRPC  string
+	poolFile   string
 	stopCh     chan struct{}
+}
+
+// pendingLog 等待评估的 WETH Swap 事件（token 组批处理单元）。
+type pendingLog struct {
+	l          types.Log
+	head       uint64
+	lag        uint64
+	receivedAt time.Time
 }
 
 func main() {
@@ -206,6 +242,7 @@ func main() {
 	chunk := flag.Uint64("recovery-chunk", 10, "max blocks per getLogs recovery query (Alchemy free limit)")
 	staleSkip := flag.Uint64("stale-skip-lag", 10, "skip evaluation when state_lag > N (no signal, just noise)")
 	outDir := flag.String("out-dir", "data/canary", "output directory for results jsonl")
+	poolFile := flag.String("pools", "data/canary/weth-universe.jsonl", "WETH pool universe file (jsonl/json; PG restore takes precedence)")
 	flag.Parse()
 
 	telemetry.SetupLogging(slog.LevelInfo)
@@ -283,9 +320,24 @@ func main() {
 		}
 	}
 	if len(wethPools) == 0 {
-		slog.Warn("no preloaded WETH pools; running in self-discovery mode",
-			"hint", "pool universe was wiped from postgres (dev DB test cleanup); "+
-				"canary discovers WETH pools from live Swap events")
+		// 文件宇宙回退（PG 不可用/被清）：一次性 bootstrap 产物，静态池保留。
+		if uni, uerr := v3.LoadUniverse(*poolFile); uerr == nil && len(uni) > 0 {
+			for _, u := range uni {
+				addr := common.HexToAddress(u.Address)
+				p := v3.NewPoolFromMetaWithCreated(addr, u.Exchange,
+					common.HexToAddress(u.Token0), common.HexToAddress(u.Token1),
+					u.Fee, u.TickSpacing, u.CreatedBlock,
+					common.HexToHash(u.CreatedBlockHash), u.ProvenanceSource)
+				reg.UpsertPool(v3.State(p))
+				graph.AddPool(p.Pool(), addr)
+				wethPools[addr] = struct{}{}
+			}
+			slog.Info("WETH pool universe loaded from file", "pools", len(uni), "file", *poolFile)
+		} else {
+			slog.Warn("no preloaded WETH pools; running in self-discovery mode",
+				"hint", "run: rh-cli pools bootstrap --out "+*poolFile+" (PG was wiped; "+
+					"self-discovery only sees pools with live Swap events)")
+		}
 	}
 
 	// ---- 评估组件（local_only：零资金、不调合约）----
@@ -361,21 +413,21 @@ func main() {
 	out := bufio.NewWriter(outFile)
 
 	c := &canary{
-		cfg:       cfg,
-		weth:      weth,
-		httpCli:   httpCli,
-		streamURL: streamURL,
-		adapter:   adapter,
-		reg:       reg,
-		graph:     graph,
-		searcher:  searcher,
-		engine:    engine,
+		cfg:             cfg,
+		weth:            weth,
+		httpCli:         httpCli,
+		streamURL:       streamURL,
+		adapter:         adapter,
+		reg:             reg,
+		graph:           graph,
+		searcher:        searcher,
+		engine:          engine,
 		wethPools:       wethPools,
 		nonWeth:         make(map[common.Address]struct{}),
 		notV3:           make(map[common.Address]struct{}),
 		discoverPending: make(map[common.Address]struct{}),
 		discoverCh:      make(chan common.Address, 4096),
-		minEvalGap:      250 * time.Millisecond,
+
 		// 订阅参数必须用小写 key map：go-ethereum 的 ethereum.FilterQuery 没有
 		// json tag，直接传 rpc.EthSubscribe 会把字段序列化成大写（"Topics"），
 		// Nitro 节点忽略未知 key → 订阅退化为全量日志。已验证格式：
@@ -393,6 +445,7 @@ func main() {
 		duration:  *duration,
 		startedAt: startedAt,
 		publicRPC: publicRPC,
+		poolFile:  *poolFile,
 		stopCh:    make(chan struct{}),
 	}
 
@@ -403,7 +456,11 @@ func main() {
 		os.Exit(1)
 	}
 	c.startFrom = h0
-	c.setHead(h0)
+	// 启动 head 的 header 不可得（HTTP 只返回高度）：headVal 直接设置，
+	// header hint 由 newHeads 首帧接管。
+	c.headMu.Lock()
+	c.headVal = h0
+	c.headMu.Unlock()
 	slog.Info("canary starting",
 		"stream", maskKey(streamURL), "alchemy", maskKey(alchemyURL),
 		"start_head", h0, "pools", len(wethPools),
@@ -467,7 +524,7 @@ func (c *canary) run(ctx context.Context) error {
 						if !ok {
 							return
 						}
-						c.setHead(h.Number.Uint64())
+						c.setHead(h)
 					}
 				}
 			}()
@@ -784,11 +841,28 @@ func (c *canary) head() uint64 {
 	return c.headVal
 }
 
-// setHead 更新最新链头（newHeads 订阅 goroutine 调用）。
-func (c *canary) setHead(h uint64) {
+// setHead 更新最新链头与 header（newHeads 订阅 goroutine 调用；原子一致）。
+func (c *canary) setHead(h *types.Header) {
 	c.headMu.Lock()
-	c.headVal = h
+	c.headVal = h.Number.Uint64()
+	c.headHeader = h
 	c.headMu.Unlock()
+	c.searcher.SetHeaderHint(h)
+}
+
+// evalHeader 返回当前 head header（评估用；与 head() 同一锁，保证一致性）。
+func (c *canary) evalHeader() *types.Header {
+	c.headMu.Lock()
+	defer c.headMu.Unlock()
+	return c.headHeader
+}
+
+// headAndHeader 原子读取 (head, header)：评估的区块号与 hint 必须同源，
+// 否则 hint 被订阅 goroutine 推进后 cachedHeaderAt 退化为 header RPC。
+func (c *canary) headAndHeader() (uint64, *types.Header) {
+	c.headMu.Lock()
+	defer c.headMu.Unlock()
+	return c.headVal, c.headHeader
 }
 
 // handleLog 单个 Swap 事件：记录全流量延迟 → WETH 池过滤（异步自发现）→ local_only 评估 → JSONL。
@@ -830,38 +904,110 @@ func (c *canary) handleLog(ctx context.Context, l types.Log) {
 		c.writeEvent(l, head, lag, "stale", "")
 		return // 陈旧事件无即时套利信号，评估只是噪音
 	}
-	if time.Since(c.lastEvalAt) < c.minEvalGap {
-		c.metrics.inc(func(m *metricsView) { m.evalThrottled++ })
-		c.writeEvent(l, head, lag, "eval_throttled", "")
-		return // 评估节流：保护免费档 CU 预算，延迟样本已记录
-	}
-	t0 := time.Now() // 评估起点（event_to_evaluation_ms 基准）
-	c.lastEvalAt = t0
-	ev := arbitrage.SwapEvent{
-		Pool:        l.Address,
-		BlockNumber: l.BlockNumber,
-		BlockHash:   l.BlockHash,
-		TxHash:      l.TxHash,
-		LogIndex:    l.Index,
-		ReceivedAt:  t0.UnixMilli(),
-	}
-	c.engineMu.Lock()
-	res, err := c.engine.ProcessBlockAt(ctx, ev, []common.Address{l.Address}, head)
-	c.engineMu.Unlock()
-	evalMs := time.Since(t0).Milliseconds()
-	if err != nil {
+	// token-group 评估：同一 token 的连续事件由 (headHash,pool) 快照缓存吸收
+	// （同 head 重复评估零 RPC），无需节流或合并窗口。
+	token := c.tokenOf(l.Address)
+	if token == (common.Address{}) {
 		c.metrics.inc(func(m *metricsView) { m.evalErrors++ })
-		slog.Warn("evaluation failed", "block", l.BlockNumber, "pool", l.Address.Hex(), "err", err)
 		c.writeEvent(l, head, lag, "eval_error", "")
 		return
 	}
-	c.metrics.recordEvalMs(evalMs)
-	fresh := lag <= c.maxObsLag
-	c.metrics.inc(func(m *metricsView) {
-		m.eventsEvaluated++
-		if fresh {
-			m.eventsFresh++
+	c.evaluateTokenBatch(ctx, token, []pendingLog{{
+		l: l, head: head, lag: lag, receivedAt: time.Now(),
+	}})
+}
+
+// tokenOf 返回池的另一侧 token（非 WETH 侧）。未知/非 WETH 池返回零地址。
+func (c *canary) tokenOf(pool common.Address) common.Address {
+	c.engineMu.Lock()
+	defer c.engineMu.Unlock()
+	st := c.reg.Pool(pool)
+	if st == nil {
+		return common.Address{}
+	}
+	p := v3.UnwrapState(st)
+	if p == nil {
+		return common.Address{}
+	}
+	if p.Token0 == c.weth {
+		return p.Token1
+	}
+	if p.Token1 == c.weth {
+		return p.Token0
+	}
+	return common.Address{}
+}
+
+// evaluateTokenBatch 评估一个 token 的全部在途事件（token-group/head-batch）：
+// 同一 Head H 下组内所有池状态只刷新一次，全部 route 本地报价。
+func (c *canary) evaluateTokenBatch(ctx context.Context, token common.Address, batch []pendingLog) {
+	if len(batch) == 0 {
+		return
+	}
+	head, hdr := c.headAndHeader()
+	if head == 0 {
+		for _, pe := range batch {
+			c.metrics.inc(func(m *metricsView) { m.evalErrors++ })
+			c.writeEvent(pe.l, pe.head, pe.lag, "head_error", "")
 		}
+		return // newHeads 订阅未就绪
+	}
+	// 固定本批的 header hint：head 与 hint 同锁读取，评估零 header RPC。
+	// （订阅 goroutine 可能在评估期间推进 hint——下一次评估会重新固定。）
+	if hdr != nil {
+		c.searcher.SetHeaderHint(hdr)
+	}
+	triggerPools := make([]common.Address, 0, len(batch))
+	seen := make(map[common.Address]struct{})
+	for _, pe := range batch {
+		if _, dup := seen[pe.l.Address]; dup {
+			continue
+		}
+		seen[pe.l.Address] = struct{}{}
+		triggerPools = append(triggerPools, pe.l.Address)
+	}
+	first := batch[0]
+	t0 := time.Now()
+	ev := arbitrage.SwapEvent{
+		Pool:        first.l.Address,
+		BlockNumber: first.l.BlockNumber,
+		BlockHash:   first.l.BlockHash,
+		TxHash:      first.l.TxHash,
+		LogIndex:    first.l.Index,
+		ReceivedAt:  first.receivedAt.UnixMilli(),
+	}
+	c.engineMu.Lock()
+	res, err := c.engine.ProcessTokenGroupAt(ctx, ev, triggerPools, token, head)
+	c.engineMu.Unlock()
+	totalMs := time.Since(t0).Milliseconds()
+	if err != nil {
+		c.metrics.inc(func(m *metricsView) { m.evalErrors++ })
+		slog.Warn("token group evaluation failed", "token", token.Hex(),
+			"block", first.l.BlockNumber, "pools", len(triggerPools), "err", err)
+		for _, pe := range batch {
+			c.writeEvent(pe.l, pe.head, pe.lag, "eval_error", "")
+		}
+		return
+	}
+	freshCnt := 0
+	for _, pe := range batch {
+		if pe.lag <= c.maxObsLag {
+			freshCnt++
+		}
+	}
+	c.metrics.recordEvalMs(totalMs)
+	c.metrics.recordEvalStat(evalStat{
+		rpcCalls:     res.RpcCalls,
+		uniquePools:  res.UniquePools,
+		routeCount:   res.RouteCount,
+		stateFetchMs: res.StateFetchMs,
+		localQuoteMs: res.LocalQuoteMs,
+		totalMs:      res.TotalEvalMs,
+		fresh:        freshCnt > 0,
+	})
+	c.metrics.inc(func(m *metricsView) {
+		m.eventsEvaluated += uint64(len(batch))
+		m.eventsFresh += uint64(freshCnt)
 	})
 	best := ""
 	for _, cand := range res.Candidates {
@@ -870,8 +1016,10 @@ func (c *canary) handleLog(ctx context.Context, l types.Log) {
 			break
 		}
 	}
-	c.writeEvent(l, head, lag, "", best)
-	c.writeCandidates(l, head, lag, evalMs, res)
+	for _, pe := range batch {
+		c.writeEvent(pe.l, pe.head, pe.lag, "", best)
+	}
+	c.writeCandidates(first.l, head, first.lag, totalMs, res, token)
 }
 
 // writeEvent 事件行落 JSONL（跳过原因 + 延迟；评估结果在 candidate 行）。
@@ -901,7 +1049,7 @@ func (c *canary) writeEvent(l types.Log, head, lag uint64, skipped, best string)
 }
 
 // writeCandidates 候选落 JSONL + 统计 gross/net 正数。
-func (c *canary) writeCandidates(l types.Log, head, lag uint64, evalMs int64, res *arbitrage.BlockResult) {
+func (c *canary) writeCandidates(l types.Log, head, lag uint64, evalMs int64, res *arbitrage.BlockResult, token common.Address) {
 	mult := c.cfg.Arbitrage.LocalGasStressMultiplier
 	if mult <= 0 {
 		mult = 2
@@ -931,6 +1079,13 @@ func (c *canary) writeCandidates(l types.Log, head, lag uint64, evalMs int64, re
 			RejectReason:        cand.RejectReason,
 			Route:               routeStr(cand.Route),
 			Rank:                cand.Rank,
+			Token:               token.Hex(),
+			RpcCalls:            res.RpcCalls,
+			UniquePools:         res.UniquePools,
+			RouteCount:          res.RouteCount,
+			StateFetchMs:        res.StateFetchMs,
+			LocalQuoteMs:        res.LocalQuoteMs,
+			TotalEvalMs:         res.TotalEvalMs,
 		}
 		writeBig := func(s string) string {
 			if s == "" {
@@ -1002,7 +1157,6 @@ func statsLoop(ctx context.Context, c *canary) {
 				"events", m.eventsTotal, "non_weth", m.eventsNonWeth,
 				"evaluated", m.eventsEvaluated, "fresh", m.eventsFresh,
 				"stale_skipped", m.eventsStaleSkip, "eval_errors", m.evalErrors,
-				"eval_throttled", m.evalThrottled,
 				"lag_p50", lagP50, "eval_ms_p50", evalP50,
 				"gross_positive", m.grossPositive,
 				"pools_discovered", m.poolsDiscovered,
@@ -1069,7 +1223,6 @@ func summary(ctx context.Context, c *canary, m metricsView, runErr error) {
 	w("events_fresh (lag<=%d): %d", c.maxObsLag, m.eventsFresh)
 	w("events_stale_skipped (lag>%d): %d", c.staleSkip, m.eventsStaleSkip)
 	w("eval_errors: %d", m.evalErrors)
-	w("eval_throttled: %d", m.evalThrottled)
 	w("wss_disconnects: %d", m.disconnects)
 	w("gap_recoveries: %d", m.recoveries)
 	w("gap_recovered_blocks: %d", m.recoveredBlocks)
@@ -1078,9 +1231,21 @@ func summary(ctx context.Context, c *canary, m metricsView, runErr error) {
 	w("cross_mismatches: %d", m.crossMismatches)
 	w("state_lag_blocks p50/p95/p99: %d/%d/%d", lag50, lag95, lag99)
 	w("event_to_evaluation_ms p50/p95: %d/%d", eval50, eval95)
+	w("eval total_ms p50/p95: %d/%d", evalStatPct(m.evalStats, func(st evalStat) int64 { return st.totalMs }, 50),
+		evalStatPct(m.evalStats, func(st evalStat) int64 { return st.totalMs }, 95))
+	w("eval state_fetch_ms p50/p95: %d/%d", evalStatPct(m.evalStats, func(st evalStat) int64 { return st.stateFetchMs }, 50),
+		evalStatPct(m.evalStats, func(st evalStat) int64 { return st.stateFetchMs }, 95))
+	w("eval local_quote_ms p50/p95: %d/%d", evalStatPct(m.evalStats, func(st evalStat) int64 { return st.localQuoteMs }, 50),
+		evalStatPct(m.evalStats, func(st evalStat) int64 { return st.localQuoteMs }, 95))
+	w("eval rpc_calls p50/p95: %d/%d", evalStatPct(m.evalStats, func(st evalStat) int { return st.rpcCalls }, 50),
+		evalStatPct(m.evalStats, func(st evalStat) int { return st.rpcCalls }, 95))
+	w("eval unique_pools p50/p95: %d/%d", evalStatPct(m.evalStats, func(st evalStat) int { return st.uniquePools }, 50),
+		evalStatPct(m.evalStats, func(st evalStat) int { return st.uniquePools }, 95))
+	w("eval route_count p50/p95: %d/%d", evalStatPct(m.evalStats, func(st evalStat) int { return st.routeCount }, 50),
+		evalStatPct(m.evalStats, func(st evalStat) int { return st.routeCount }, 95))
 	w("gross_positive_candidates: %d", m.grossPositive)
 	w("net_positive 1x/2x/3x: %d/%d/%d", m.netPos[0], m.netPos[1], m.netPos[2])
-	w("threshold: lag p50<=0 p95<=1 p99<=2; event_to_eval p50<250ms p95<750ms")
+	w("acceptance: lag p50<=0 p95<=1 p99<=2; eval total_ms p50<250ms p95<750ms; state_fetch p50<100ms")
 	out := b.String()
 	fmt.Print(out)
 	// 同目录落一份 summary 便于留档
@@ -1107,6 +1272,19 @@ func pctInt64(sorted []int64, p float64) int64 {
 	s := append([]int64(nil), sorted...)
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
 	return s[pctIndex(len(s), p)]
+}
+
+// evalStatPct 对 evalStats 的数值字段取分位数（int64 与 int 统一走 int64）。
+func evalStatPct[T int64 | int](stats []evalStat, get func(evalStat) T, p float64) int64 {
+	if len(stats) == 0 {
+		return 0
+	}
+	vals := make([]int64, 0, len(stats))
+	for _, st := range stats {
+		vals = append(vals, int64(get(st)))
+	}
+	sort.Slice(vals, func(i, j int) bool { return vals[i] < vals[j] })
+	return vals[pctIndex(len(vals), p)]
 }
 
 func pctIndex(n int, p float64) int {

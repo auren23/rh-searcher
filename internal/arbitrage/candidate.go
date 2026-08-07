@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -26,21 +27,32 @@ type LocalSearcher struct {
 	snapshotCacheHead common.Hash
 	snapshotHits      uint64
 	snapshotMisses    uint64
-	maxInputWei  *big.Int // 单笔资金上限（nil = 不限）
-	minInputWei  *big.Int // 单笔下限（nil = 默认 1e-5 WETH）
-	contractBal  *big.Int // 执行合约 WETH 余额（nil = 未知）
+	// headerCache 按区块号缓存 header（hash/baseFee）：实时路径同一 head 的
+	// 多次评估共享；reorg 罕见且浅，canary 研究场景容忍（上限 16 条防膨胀）。
+	headerCache map[uint64]*types.Header
+	// headerHint 流推送的当前 head header（WSS newHeads 同流交付，零 RPC）；
+	// 由上游 goroutine 更新，仅当 block == hint 高度时使用。
+	hintMu      sync.Mutex
+	headerHint  *types.Header
+	maxInputWei *big.Int // 单笔资金上限（nil = 不限）
+	minInputWei *big.Int // 单笔下限（nil = 默认 1e-5 WETH）
+	contractBal *big.Int // 执行合约 WETH 余额（nil = 未知）
 }
 
 // V3Client 报价所需的 v3 客户端能力（抽象以便历史快照测试注入 fake）。
 type V3Client interface {
 	HeaderAt(ctx context.Context, block *big.Int) (*types.Header, error)
 	RefreshPoolStateAt(ctx context.Context, p *v3.Pool, block *big.Int) error
+	// RefreshPoolsStateAt 批量刷新多个池在固定高度的状态（Multicall3/batch），
+	// 返回实际 RPC 调用次数（token-group 快照主路径）。
+	RefreshPoolsStateAt(ctx context.Context, pools []*v3.Pool, block *big.Int) (int, error)
 	QuoteExactIn(p *v3.Pool, tokenIn common.Address, amountIn *big.Int) (*big.Int, error)
 }
 
 func NewLocalSearcher(g *dex.Graph, reg *dex.Registry, a V3Client, weth common.Address) *LocalSearcher {
 	return &LocalSearcher{graph: g, registry: reg, v3: a, weth: weth,
-		snapshotCache: make(map[string]*v3.Pool)}
+		snapshotCache: make(map[string]*v3.Pool),
+		headerCache:   make(map[uint64]*types.Header)}
 }
 
 // SnapshotCacheStats 缓存命中率（吞吐指标用）。
@@ -102,10 +114,11 @@ func (s *LocalSearcher) FindRoutes(ctx context.Context, pool common.Address, wet
 }
 
 // Optimize 最大化净利润的输入量搜索：
-//   1. 由第一跳池的单 tick 可承载量决定搜索上限（深度自适应）
-//   2. 对数网格粗搜（32 点）
-//   3. 最佳点邻域三分搜索细化
-//   4. 记录每跳输入输出
+//  1. 由第一跳池的单 tick 可承载量决定搜索上限（深度自适应）
+//  2. 对数网格粗搜（32 点）
+//  3. 最佳点邻域三分搜索细化
+//  4. 记录每跳输入输出
+//
 // OptimizeAt 在固定 snapshot 上做本地 Top-K 优化（报价/边界全部使用快照池）。
 func (s *LocalSearcher) OptimizeAt(ctx context.Context, r Route, snapshot *RouteSnapshot, block uint64, ts int64) *Candidate {
 	if snapshot == nil {
@@ -211,8 +224,38 @@ func (s *LocalSearcher) OptimizeAt(ctx context.Context, r Route, snapshot *Route
 // 每个 hop 池克隆 + 刷新到该区块（slot0/liquidity/bitmap）。
 // 返回的 snapshot 供 TopKOptimize 的整个本地报价链显式使用——
 // 正式 Registry 只提供静态元数据（含创建高度），评估绝不修改实时池。
+// SetHeaderHint 注入流推送的当前 head header（newHeads 订阅，与日志同延迟）。
+// 评估时 block == hint 高度直接复用，省一次 HTTP header RPC。
+func (s *LocalSearcher) SetHeaderHint(h *types.Header) {
+	s.hintMu.Lock()
+	s.headerHint = h
+	s.hintMu.Unlock()
+}
+
+// cachedHeaderAt 读取区块头：hint（同高）→ 按号缓存 → RPC。
+func (s *LocalSearcher) cachedHeaderAt(ctx context.Context, block uint64) (*types.Header, error) {
+	s.hintMu.Lock()
+	hint := s.headerHint
+	s.hintMu.Unlock()
+	if hint != nil && hint.Number != nil && hint.Number.Uint64() == block {
+		return hint, nil
+	}
+	if h, ok := s.headerCache[block]; ok {
+		return h, nil
+	}
+	h, err := s.v3.HeaderAt(ctx, new(big.Int).SetUint64(block))
+	if err != nil {
+		return nil, err
+	}
+	if len(s.headerCache) >= 16 {
+		s.headerCache = make(map[uint64]*types.Header)
+	}
+	s.headerCache[block] = h
+	return h, nil
+}
+
 func (s *LocalSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64) (*RouteSnapshot, error) {
-	header, err := s.v3.HeaderAt(ctx, new(big.Int).SetUint64(block))
+	header, err := s.cachedHeaderAt(ctx, block)
 	if err != nil {
 		// 历史 header 不可读 = 基础设施/archive 问题（可重试）
 		return nil, fmt.Errorf("%w: header %d: %v", ErrInfra, block, err)
@@ -257,6 +300,85 @@ func (s *LocalSearcher) SnapshotRoute(ctx context.Context, r Route, block uint64
 		}
 		snap.Pools[h.Pool] = cp
 		snap.Hops = append(snap.Hops, SnapshotHop{Pool: cp, TokenIn: h.TokenIn})
+	}
+	return snap, nil
+}
+
+// TokenGroupSnapshot token 组的固定区块不可变视图：一次批量刷新得到该 token
+// 全部 WETH 池的状态（Multicall3/batch，2 次 RPC 往返 + 1 次 header），
+// 组内所有 route 的本地报价共享同一份池状态（禁止 route 级重复 RPC）。
+type TokenGroupSnapshot struct {
+	Block     uint64
+	BlockHash common.Hash
+	BaseFee   *big.Int
+	Pools     map[common.Address]*v3.Pool
+	RpcCalls  int // 本次快照实际 RPC 调用数（含 header）
+}
+
+// SnapshotTokenGroup 刷新 token 的全部 WETH 池到固定区块（一次批量调用），
+// 并写入 (headHash, pool) 快照缓存——后续 per-route SnapshotRoute 全命中。
+// 静态池（长期无 Swap）同样在组内：它们正是两池套利最可能的第二腿。
+func (s *LocalSearcher) SnapshotTokenGroup(ctx context.Context, token common.Address, block uint64) (*TokenGroupSnapshot, error) {
+	// 命中判定必须在读取前（cachedHeaderAt 会填充缓存）
+	_, headerCached := s.headerCache[block]
+	s.hintMu.Lock()
+	if s.headerHint != nil && s.headerHint.Number != nil && s.headerHint.Number.Uint64() == block {
+		headerCached = true // hint 命中：不计 RPC
+	}
+	s.hintMu.Unlock()
+	header, err := s.cachedHeaderAt(ctx, block)
+	if err != nil {
+		return nil, fmt.Errorf("%w: header %d: %v", ErrInfra, block, err)
+	}
+	snap := &TokenGroupSnapshot{
+		Block:     header.Number.Uint64(),
+		BlockHash: header.Hash(),
+		BaseFee:   header.BaseFee,
+		Pools:     make(map[common.Address]*v3.Pool),
+	}
+	if !headerCached {
+		snap.RpcCalls = 1 // header（缓存命中不计数）
+	}
+	if s.snapshotCacheHead != header.Hash() {
+		s.snapshotCache = make(map[string]*v3.Pool)
+		s.snapshotCacheHead = header.Hash()
+	}
+	var toRefresh []*v3.Pool
+	for _, ref := range s.graph.PoolsWithToken(token) {
+		if ref.Token0 != s.weth && ref.Token1 != s.weth {
+			continue // 两跳 WETH 循环只需要 WETH 对
+		}
+		state := s.registry.Pool(ref.Address)
+		if state == nil {
+			continue // 图/注册表不一致：per-route 路径同样会拒绝
+		}
+		p := v3.UnwrapState(state)
+		if p == nil {
+			continue
+		}
+		if p.CreatedBlock > 0 && p.CreatedBlock > block {
+			continue // 未来池（评估区块早于创建）：无资格
+		}
+		key := ref.Address.Hex()
+		if cached, ok := s.snapshotCache[key]; ok {
+			s.snapshotHits++
+			snap.Pools[ref.Address] = cached.Clone()
+			continue
+		}
+		s.snapshotMisses++
+		cp := p.Clone()
+		toRefresh = append(toRefresh, cp)
+		snap.Pools[ref.Address] = cp
+	}
+	if len(toRefresh) > 0 {
+		calls, err := s.v3.RefreshPoolsStateAt(ctx, toRefresh, new(big.Int).SetUint64(block))
+		if err != nil {
+			return nil, fmt.Errorf("%w: token group %s refresh at %d: %v", ErrInfra, token.Hex(), block, err)
+		}
+		for _, cp := range toRefresh {
+			s.snapshotCache[cp.Address.Hex()] = cp
+		}
+		snap.RpcCalls += calls
 	}
 	return snap, nil
 }
@@ -482,16 +604,16 @@ func cloneHops(src []Hop) []Hop {
 // emptyCandidate 字段完整的空候选（无论搜索成败都不允许 nil 字段进入下游）。
 func emptyCandidate(r Route, block uint64, ts int64, weth common.Address) *Candidate {
 	return &Candidate{
-		ObservedBlock:    block,
-		ObservedAt:       ts,
-		Route:            cloneHops(r.Hops),
-		RouteJSON:        MarshalRoute(r.Hops),
-		InputAsset:       weth,
-		InputAmount:      new(big.Int),
-		GrossProfit:      new(big.Int),
-		GasEstimate:      new(big.Int),
-		SwapCost:         new(big.Int),
-		SlippageCost:     new(big.Int),
+		ObservedBlock:     block,
+		ObservedAt:        ts,
+		Route:             cloneHops(r.Hops),
+		RouteJSON:         MarshalRoute(r.Hops),
+		InputAsset:        weth,
+		InputAmount:       new(big.Int),
+		GrossProfit:       new(big.Int),
+		GasEstimate:       new(big.Int),
+		SwapCost:          new(big.Int),
+		SlippageCost:      new(big.Int),
 		ExpectedNetProfit: new(big.Int),
 	}
 }

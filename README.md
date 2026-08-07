@@ -117,20 +117,34 @@ M5 前置实验：验证 Alchemy Robinhood WSS 能否把 Swap 事件以 `state_l
   实时路径不做逐块/批量 getLogs。
 - **恢复 polling-recovery**：断线/启动缺口用 Alchemy HTTP `getLogs` 补齐，每次 ≤10 blocks
   （Alchemy 免费版限制），与订阅事件按 (block, tx, logIndex) 身份去重（`chain.LogCursor`）。
-- **池宇宙**：PG `dex_pools` 预载（可选）+ 运行时自发现（首个事件校验 token 对，
-  WETH 池注册进图并缓存；非 WETH/非 Factory 池缓存后跳过）。
-- **评估**：事件 → 当前 head 快照 → `local_only` 本地报价（复用 arbitrage engine）。
+- **池宇宙**：完整 WETH 池集（一次性 bootstrap 产物，静态池保留——两池套利第二腿
+  往往来自长期无 Swap 的池）。加载顺序：PG `dex_pools` → 宇宙文件 → 运行时自发现。
+  静态池**永不因不活跃删除**；运行时新发现的池照常注册。
+- **评估（token-group / head-batch）**：Swap(pool) → 定位 TOKEN → 一次批量刷新该
+  TOKEN 全部 WETH 池到当前 head（Multicall3 `aggregate3`，slot0+liquidity 一次往返，
+  tickBitmap 一次往返，bitmap word 跨 head 持久缓存）→ 本地一次算完全部 pair 组合。
+  cache key=(headHash, poolAddress)：同一 head 同一池最多刷新一次，禁止 route 级重复 RPC。
+  无 250ms 节流——同 token 连续事件由快照缓存吸收（重复评估零 RPC）。
 - **交叉校验**：公共 Robinhood RPC 仅作 secondary（head 对照，不参与摄取）。
 
 ```bash
+# 一次性：重建完整 WETH 池宇宙（公共 RPC 100k-block 批扫 Factory PoolCreated，
+# 断点续扫 + 增量落盘；~10-30 分钟，视限速）
+go run ./cmd/rh-cli pools bootstrap --out data/canary/weth-universe.jsonl
+go run ./cmd/rh-cli pools count --file data/canary/weth-universe.jsonl   # 宇宙统计
+
 export RH_STREAM_RPC=wss://robinhood-mainnet.g.alchemy.com/v2/{API_KEY}
 export RH_ALCHEMY_RPC=https://robinhood-mainnet.g.alchemy.com/v2/{API_KEY}
 make run-canary            # 默认 2h 或 1000 个 fresh 评估（-duration / -max-evals 可调）
 ```
 
-输出：`data/canary/results-<ts>.jsonl`（事件行 + 候选行）+ 结束时 p50/p95/p99 汇总
-（`data/canary/summary-<ts>.txt`）。门槛：`state_lag_blocks` p50<=0 / p95<=1 / p99<=2；
-`event_to_evaluation_ms` p50<250ms / p95<750ms。
+输出：`data/canary/results-<ts>.jsonl`（事件行 + 候选行，含每次评估的
+`rpc_calls/unique_pools/route_count/state_fetch_ms/local_quote_ms/total_eval_ms`）+
+结束时 p50/p95/p99 汇总（`data/canary/summary-<ts>.txt`）。
+门槛：`state_lag_blocks` p50<=0 / p95<=1 / p99<=2；`event_to_evaluation_ms` p50<250ms /
+p95<750ms；评估 `total_eval_ms` p50<250ms / p95<750ms（实测 p50≈0 / p95≈380ms）。
+Alpha 统计：`python3 scripts/alpha_stats.py data/canary/results-*.jsonl`（仅 lag<=2，
+gross/net_1x..3x，按 token 与 pool-pair 分组）。
 
 ## 安全与运行隔离
 
