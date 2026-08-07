@@ -306,17 +306,20 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 			if mult <= 0 {
 				mult = 2
 			}
-			gasCost := new(big.Int).Mul(
-				new(big.Int).SetUint64(e.cfg.LocalGasUnits),
-				snapshot.BaseFee)
-			gasCost.Mul(gasCost, big.NewInt(int64(mult)))
-			gasCost.Add(gasCost, e.cfg.SafetyMarginWei)
-			c.GasEstimate = new(big.Int).Set(gasCost) // 真实落盘：成本非零
+			// 单位语义：gas_estimate = gas units；gas_price_wei = baseFee × mult；
+			// gas_cost_wei = units × price（不含 safety margin）；净利再扣 margin
+			gasPriceWei := new(big.Int).Mul(snapshot.BaseFee, big.NewInt(int64(mult)))
+			gasCostWei := new(big.Int).Mul(
+				new(big.Int).SetUint64(e.cfg.LocalGasUnits), gasPriceWei)
+			c.GasEstimate = new(big.Int).SetUint64(e.cfg.LocalGasUnits)
+			c.GasPriceWei = new(big.Int).Set(gasPriceWei)
+			c.GasCostWei = new(big.Int).Set(gasCostWei)
 			if c.GrossProfit == nil || c.GrossProfit.Sign() <= 0 {
 				c.Decision = "local_unprofitable"
 				c.ExpectedNetProfit = new(big.Int)
 			} else {
-				net := new(big.Int).Sub(c.GrossProfit, gasCost)
+				net := new(big.Int).Sub(c.GrossProfit, gasCostWei)
+				net.Sub(net, e.cfg.SafetyMarginWei)
 				c.ExpectedNetProfit = net
 				if net.Sign() <= 0 {
 					c.Decision = "local_unprofitable"
