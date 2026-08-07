@@ -43,3 +43,4 @@ arbitrage:
   simulation_mode: local_only
   local_gas_units: 500000
   local_gas_stress_multiplier: 2
+  max_observation_lag_blocks: 2

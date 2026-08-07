@@ -88,6 +88,9 @@ type ArbitrageConfig struct {
 	// local_only 模式的保守 gas 成本：units × head baseFee × stress multiplier
 	LocalGasUnits             uint64 `yaml:"local_gas_units"`
 	LocalGasStressMultiplier  int    `yaml:"local_gas_stress_multiplier"`
+	// MaxObservationLagBlocks 新鲜度阈值：pending 块落后 head 超过该值 →
+	// stale_skipped（不评估、只审计+推进游标）。仅 local_only/latest_observe。
+	MaxObservationLagBlocks uint64 `yaml:"max_observation_lag_blocks"`
 }
 
 // ExecutorConfig 执行合约与热钱包（模拟/发送用）。
@@ -148,6 +151,9 @@ func LoadMerged(paths ...string) (*Config, error) {
 		}
 		if cfg.Arbitrage.LocalGasStressMultiplier > 0 {
 			merged.Arbitrage.LocalGasStressMultiplier = cfg.Arbitrage.LocalGasStressMultiplier
+		}
+		if cfg.Arbitrage.MaxObservationLagBlocks > 0 {
+			merged.Arbitrage.MaxObservationLagBlocks = cfg.Arbitrage.MaxObservationLagBlocks
 		}
 	}
 	return merged, nil

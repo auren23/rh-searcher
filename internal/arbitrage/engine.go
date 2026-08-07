@@ -108,6 +108,10 @@ type Config struct {
 	// local_only 保守成本：units × head baseFee × stress multiplier
 	LocalGasUnits            uint64
 	LocalGasStressMultiplier int
+	// MaxObservationLagBlocks 新鲜度阈值（local_only/latest_observe）：
+	// pending 块落后 head 超过该值 → 不评估、标记 stale（engine 不参与，
+	// 由 cmd 在评估循环中处理）
+	MaxObservationLagBlocks uint64
 }
 
 func NewEngine(cfg Config, sink Sink, searcher Searcher, evaluator Evaluator, executor Executor) *Engine {
@@ -386,6 +390,20 @@ func (e *Engine) evaluateRoute(ctx context.Context, ev SwapEvent, r Route, state
 		"net_profit_wei", best.ExpectedNetProfit.String(), "amount_in", best.InputAmount.String(),
 		"route", routeID(r))
 	return cands, nil
+}
+
+// DecayQuote 机会衰减采样：同一 route + 输入量在指定 head 的重报价。
+// 返回 (毛利, error)。快照缓存保证同一 head 内重复报价零额外 RPC。
+func (e *Engine) DecayQuote(ctx context.Context, r Route, amount *big.Int, stateBlock uint64) (*big.Int, error) {
+	snapshot, err := e.searcher.SnapshotRoute(ctx, r, stateBlock)
+	if err != nil {
+		return nil, err
+	}
+	outs, ok := e.searcher.(*LocalSearcher).quoteRoute(ctx, snapshot, amount)
+	if !ok || len(outs) != 2 {
+		return big.NewInt(0), nil
+	}
+	return new(big.Int).Sub(outs[1], amount), nil
 }
 
 // ErrInfra 标记可重试的基础设施错误（RPC 超时/限流/节点落后/历史状态不可用）。

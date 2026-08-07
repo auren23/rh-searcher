@@ -382,6 +382,15 @@ func (d *DB) CommitEvaluation(ctx context.Context, block uint64, blockHash strin
 			return fmt.Errorf("candidate %s: %w", c.ID, err)
 		}
 	}
+	// 审计：该块已评估（区分"没机会"与"没及时看"）
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO block_evaluations
+			(trigger_block, trigger_hash, state_block, state_lag_blocks, state_age_ms, status, candidate_count)
+		VALUES ($1, $2, $3, $4, $5, 'evaluated', $6)`,
+		block, nullableStr(blockHash), nullableUint64(0), nullableUint64(0), nullableInt64(0),
+		len(candidates)); err != nil {
+		return fmt.Errorf("block audit: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, updated_at)
 		VALUES ('` + CheckpointEvaluate + `', $1, $2, now())
@@ -441,6 +450,47 @@ func (d *DB) LoadPendingAffected(ctx context.Context, fromBlock uint64) ([]Pendi
 	return out, rows.Err()
 }
 
+// SkipStaleBlock 新鲜度优先：落后超过 maxLag 的 pending 块不评估，
+// 只写审计（stale_skipped）并推进观察游标（同事务）。
+func (d *DB) SkipStaleBlock(ctx context.Context, block uint64, blockHash string,
+	lag uint64, reason string) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO block_evaluations
+			(trigger_block, trigger_hash, state_lag_blocks, status, skip_reason)
+		VALUES ($1, $2, $3, 'stale_skipped', $4)`,
+		block, nullableStr(blockHash), lag, reason); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO strategy_checkpoints (strategy, block_number, block_hash, updated_at)
+		VALUES ('` + CheckpointEvaluate + `', $1, $2, now())
+		ON CONFLICT (strategy) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			block_hash = EXCLUDED.block_hash,
+			updated_at = now()`,
+		block, nullableStr(blockHash)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// SaveDecaySample 落库机会衰减采样（T+0/1/2/4 重报价）。
+func (d *DB) SaveDecaySample(ctx context.Context, originBlock uint64, delayBlocks int,
+	routeJSON, inputAmount, gross, net1x, net2x, net3x string) error {
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO opportunity_decay_samples
+			(origin_block, delay_blocks, route_json, input_amount, gross_profit_wei,
+			 net_1x_gas_wei, net_2x_gas_wei, net_3x_gas_wei)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		originBlock, delayBlocks, routeJSON, inputAmount, gross, net1x, net2x, net3x)
+	return err
+}
+
 // SaveThroughputSample 落库吞吐指标采样（60s 周期；Canary 判断用）。
 func (d *DB) SaveThroughputSample(ctx context.Context, ingestBps, evaluateBps float64,
 	ingestLag, evaluateLag uint64, getlogsReqs, rpc429 uint64, cacheHitRatio float64) error {
@@ -458,12 +508,12 @@ func (d *DB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 }
 
 // requiredSchemaVersion 启动要求的最高迁移版本（0014 统一旧 historical 命名）。
-const requiredSchemaVersion = "0017"
+const requiredSchemaVersion = "0018"
 
 // requiredVersions 启动要求的完整迁移版本集合（任何中间缺失都拒绝启动）。
 var requiredVersions = []string{
 	"0001", "0002", "0003", "0004", "0005", "0006", "0007",
-	"0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017",
+	"0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018",
 }
 
 // RollbackToAncestor：reorg 单事务回滚——

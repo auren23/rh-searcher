@@ -285,6 +285,10 @@ func main() {
 		slog.Error("live mode not implemented (signer/nonce/broadcaster/pnl not wired)")
 		os.Exit(1)
 	}
+	maxObsLag := cfg.Arbitrage.MaxObservationLagBlocks
+	if maxObsLag == 0 {
+		maxObsLag = 2
+	}
 	engineCfg := arbitrage.Config{
 		ChainID:         cfg.Chain.ID,
 		WETH:            weth,
@@ -296,6 +300,7 @@ func main() {
 		SimulationMode:  simMode,
 		LocalGasUnits:   cfg.Arbitrage.LocalGasUnits,
 		LocalGasStressMultiplier: cfg.Arbitrage.LocalGasStressMultiplier,
+		MaxObservationLagBlocks: maxObsLag,
 	}
 	engine := arbitrage.NewEngine(
 		engineCfg,
@@ -677,6 +682,19 @@ func main() {
 	// 重启仍能重新评估（双游标，候选不丢失）。
 	// 吞吐指标（每 60s 落库一次，见指标循环）
 	metrics := &throughputMetrics{}
+	// 机会衰减队列：正毛利机会在 T+1/2/4 块重报价（同 head 快照缓存零额外 RPC）
+	type decayEntry struct {
+		originBlock uint64
+		route       []arbitrage.Hop
+		amount      *big.Int
+		delay       int
+	}
+	decayQueue := []decayEntry{}
+	cloneRoute := func(hops []arbitrage.Hop) []arbitrage.Hop {
+		out := make([]arbitrage.Hop, len(hops))
+		copy(out, hops)
+		return out
+	}
 	// 有预算评估（前置声明：backfill 定义在其前，闭包变量先声明后赋值）
 	var evaluateBudgeted func(evalBudget int) error
 	// 自适应批量拉日志：跨块一次 FilterLogs（合并 RPC 请求），按块分组；
@@ -890,6 +908,15 @@ func main() {
 					if head > pb.Block {
 						c.StateLagBlocks = head - pb.Block
 					}
+					// 机会衰减：正毛利候选进入衰减队列（T+1/2/4 重报价）
+					if c.Decision == "local_profitable_observed" && c.InputAmount.Sign() > 0 {
+						decayQueue = append(decayQueue, decayEntry{
+							originBlock: pb.Block,
+							route:       cloneRoute(c.Route),
+							amount:      new(big.Int).Set(c.InputAmount),
+							delay:       0,
+						})
+					}
 				}
 				if err := sink.CommitEvaluation(ctx, pb.Block, pb.Hash, processed.Candidates); err != nil {
 					return fmt.Errorf("evaluate block %d commit: %w", pb.Block, err)
@@ -921,6 +948,46 @@ func main() {
 			}
 			lastEvaluated = pb.Block
 			m.evaluateBlocks++
+		}
+		// 衰减采样：对队列里的机会在当前 head 重报价（仅当 head 前进到
+		// 目标延迟块；同一 head 快照缓存零额外 RPC）
+		if simMode != "historical_strict" && len(decayQueue) > 0 && sink != nil {
+			keep := decayQueue[:0]
+			for _, d := range decayQueue {
+				targetDelay := []int{0, 1, 2, 4}[minInt(d.delay, 3)]
+				if d.delay < 0 {
+					continue
+				}
+				if targetDelay > d.delay {
+					// 未到采样时刻：等到 head 前进
+					d.delay++
+					keep = append(keep, d)
+					continue
+				}
+				gross, qerr := engine.DecayQuote(ctx, arbitrage.Route{Hops: d.route},
+					d.amount, head)
+				if qerr != nil {
+					// 基础设施错误：留待下批重试
+					keep = append(keep, d)
+					continue
+				}
+				// 离线重算 1x/2x/3x 净利（不重新采链）
+				baseFee := big.NewInt(1e8)
+				// gas 成本按当前配置的 units × baseFee × 倍率
+				units := engineCfg.LocalGasUnits
+				cost1x := new(big.Int).Mul(new(big.Int).SetUint64(units), baseFee)
+				net1x := new(big.Int).Sub(gross, cost1x)
+				net2x := new(big.Int).Sub(gross, new(big.Int).Mul(cost1x, big.NewInt(2)))
+				net3x := new(big.Int).Sub(gross, new(big.Int).Mul(cost1x, big.NewInt(3)))
+				_ = sink.SaveDecaySample(ctx, d.originBlock, d.delay,
+					"", d.amount.String(), gross.String(),
+					net1x.String(), net2x.String(), net3x.String())
+				if d.delay < 4 {
+					d.delay++
+					keep = append(keep, d)
+				}
+			}
+			decayQueue = keep
 		}
 		return nil
 	}
@@ -1088,6 +1155,14 @@ func wethBalanceAt(ctx context.Context, cli *ethclient.Client, weth common.Addre
 		return nil, fmt.Errorf("short balance response %d", len(out))
 	}
 	return new(big.Int).SetBytes(out[0:32]), nil
+}
+
+// minInt 取小值（衰减延迟下标用）。
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // round2 保留两位小数（指标日志用）。
