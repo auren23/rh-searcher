@@ -762,8 +762,15 @@ func main() {
 			for _, l := range logs {
 				byBlock[l.BlockNumber] = append(byBlock[l.BlockNumber], l)
 			}
-			// 逐块顺序处理：header 校验 + parent 衔接 + 逐块提交
+			// 逐块处理：只对有日志的块拉 header + 校验 + 逐块提交；
+			// 无日志块无状态副作用 → 只推进内存游标（不逐块提交，省 header RPC）。
+			// chunk 末尾统一拉末块 header 作为游标 hash（reorg 检测在 chunk 边界）。
+			// 崩溃后重扫无日志块 = 无操作（幂等）；有日志块仍逐块 exactly-once。
 			for bn := from; bn <= chunkTo; bn++ {
+				logs := byBlock[bn]
+				if len(logs) == 0 {
+					continue // 无日志块：无需 header/hash/提交
+				}
 				hdr, err := headerAt(bn)
 				if err != nil {
 					return fmt.Errorf("backfill header %d: %w", bn, err)
@@ -774,10 +781,19 @@ func main() {
 					}
 					break // 回退后外层循环重新计算
 				}
-				// 该块日志来自批量拉取（无日志块也提交空 ingest）
-				if err := ingestOne(bn, hdr, byBlock[bn]); err != nil {
+				if err := ingestOne(bn, hdr, logs); err != nil {
 					return err
 				}
+			}
+			// chunk 末尾推进游标（内存；DB checkpoint 停在上次有日志块的提交）
+			{
+				hdr, err := headerAt(chunkTo)
+				if err != nil {
+					return fmt.Errorf("backfill chunk header %d: %w", chunkTo, err)
+				}
+				lastApplied = chunkTo
+				lastAppliedHash = hdr.Hash()
+				metrics.ingestBlocks += chunkTo - from + 1
 			}
 			// 补扫与评估交错（有预算）：每 chunk 评估 ≤8 块
 			if err := evaluateBudgeted(8); err != nil {
