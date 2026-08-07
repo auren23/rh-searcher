@@ -418,11 +418,13 @@ func main() {
 	// skipPoolVerify=true（补扫）：bootstrap 已扫描到 head，补扫范围内不存在
 	// 未发现的新池——未知池直接跳过，不做 PoolByAddress 验证（避免补扫期间
 	// 每池 5 个 RPC 被限速打死）
-	processBlockWithLogs := func(h chain.BlockEvent, logs []types.Log, evaluate, skipPoolVerify bool) (*arbitrage.BlockResult, map[common.Address]struct{}, map[common.Address]*pendingPool, error) {
+	processBlockWithLogs := func(h chain.BlockEvent, logs []types.Log, evaluate, skipPoolVerify, skipHashCheck bool) (*arbitrage.BlockResult, map[common.Address]struct{}, map[common.Address]*pendingPool, error) {
 		res := &arbitrage.BlockResult{Block: h.Number, BlockHash: h.Hash}
-		for _, l := range logs {
-			if l.BlockHash != h.Hash {
-				return nil, nil, nil, fmt.Errorf("block %d hash mismatch: log=%s header=%s", h.Number, l.BlockHash.Hex(), h.Hash.Hex())
+		if !skipHashCheck {
+			for _, l := range logs {
+				if l.BlockHash != h.Hash {
+					return nil, nil, nil, fmt.Errorf("block %d hash mismatch: log=%s header=%s", h.Number, l.BlockHash.Hex(), h.Hash.Hex())
+				}
 			}
 		}
 		sort.Slice(logs, func(i, j int) bool {
@@ -759,7 +761,7 @@ func main() {
 	ingestOne := func(bn uint64, header *types.Header, logs []types.Log) error {
 		ev := chain.BlockEvent{Number: bn, Hash: header.Hash(), Parent: header.ParentHash,
 			ReceivedAtMs: time.Now().UnixMilli()}
-		res, a, pending, err := processBlockWithLogs(ev, logs, false, true)
+		res, a, pending, err := processBlockWithLogs(ev, logs, false, true, true)
 		if err != nil {
 			return fmt.Errorf("backfill block %d: %w", bn, err)
 		}
@@ -804,8 +806,8 @@ func main() {
 					// 伪 reorg 防护：公共 RPC 多节点负载均衡下 hash 可能短暂
 					// 漂移——重拉同一块 2 次，hash 稳定不匹配才视为真 reorg
 					mismatch := true
-					for retry := 0; retry < 2; retry++ {
-						time.Sleep(time.Second)
+					for retry := 0; retry < 3; retry++ {
+						time.Sleep(100 * time.Millisecond)
 						h2, herr := headerAt(bn)
 						if herr != nil {
 							break
